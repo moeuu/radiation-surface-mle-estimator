@@ -37,7 +37,7 @@ def plot_heatmap(q, shape, extent, title, sources=None, vmin=None, vmax=None):
     q_grid = q.reshape(shape)
     plt.figure()
     plt.imshow(q_grid, origin='lower', cmap='Greys', extent=extent, vmin=vmin, vmax=vmax)
-    plt.colorbar(label='[Sv/h]')
+    plt.colorbar(label='[Bq]')
     plt.title(title)
     
     if sources:

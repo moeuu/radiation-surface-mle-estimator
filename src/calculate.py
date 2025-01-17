@@ -15,35 +15,40 @@ def decide_measurement_points(x,y,r):
 
 def shield_blocks_radiation(shield_orientation, source_position, detector_position):
     """
-    放射線源から検出器までの直線がシールドを通過するかを判定する関数。
-    シールドは検出器の周囲に1cmの厚みを持つ球の1/8部分で、中心は検出器と同じ。
+    改善された遮蔽判定関数
     """
-    # 検出器を中心にした放射線源のベクトル
-    source_vector = np.array(source_position) - np.array(detector_position)
+    # 放射線源から検出器への方向ベクトル
+    vector = np.array(source_position) - np.array(detector_position)
     
-    # source_vectorを球座標に変換してシールドの角度範囲に入っているか確認
-    theta, phi = cartesian_to_spherical(source_vector)
+    # 球座標に変換
+    theta, phi = cartesian_to_spherical(vector)
     
-    # シールドの角度範囲 (例: 1/8球として0 ≤ theta, phi ≤ π/2)
+    # シールドの角度範囲
     shield_theta_min, shield_theta_max = shield_orientation['theta']
     shield_phi_min, shield_phi_max = shield_orientation['phi']
     
-    # 角度がシールド内に入っていれば遮蔽あり
-    if shield_theta_min <= theta <= shield_theta_max and shield_phi_min <= phi <= shield_phi_max:
-        return True  # 遮蔽がある
+    # 角度がシールド内に入っているか確認
+    in_theta = shield_theta_min <= theta <= shield_theta_max
+    in_phi = shield_phi_min <= phi <= shield_phi_max
     
-    return False  # 遮蔽がない
-
+    return in_theta and in_phi
 
 def cartesian_to_spherical(vector):
     """
-    デカルト座標 (x, y, z) を球座標 (theta, phi) に変換するヘルパー関数。
-    thetaはz軸からの角度（傾斜角）、phiはx軸からの角度（方位角）。
+    改善されたデカルト座標から球座標への変換
+    Returns: theta (傾斜角), phi (方位角)
     """
     x, y, z = vector
     r = np.sqrt(x**2 + y**2 + z**2)
+    
+    # theta（傾斜角）の計算
     theta = np.arccos(z / r) if r != 0 else 0
+    
+    # phi（方位角）の計算とその正規化
     phi = np.arctan2(y, x)
+    if phi < 0:
+        phi += 2 * np.pi
+    
     return theta, phi
 
 # 減衰計算
@@ -188,3 +193,37 @@ def restore_q(q_optimized, q_shapes):
         restored_q.append(q_optimized[index:index + length].reshape(shape))
         index += length
     return restored_q
+
+def get_grid_position(surface_idx, grid_idx, x, y, z, g=1):
+    """
+    各面のインデックスとグリッドインデックスからグリッドの中心位置 (x, y, z) を取得する関数。
+    surface_idx: 面のインデックス（0-5）
+    grid_idx: グリッドのインデックス
+    x, y, z: 部屋の寸法
+    g: グリッドサイズ（デフォルトは1）
+    """
+    if surface_idx == 0:  # 地面 z=0
+        gx = (grid_idx % x) * g + g / 2 + 0.000001
+        gy = (grid_idx // x) * g + g / 2 + 0.000001
+        gz = 0
+    elif surface_idx == 1:  # 天井 z=z
+        gx = (grid_idx % x) * g + g / 2 + 0.000001
+        gy = (grid_idx // x) * g + g / 2 + 0.000001
+        gz = z
+    elif surface_idx == 2:  # 側面1 x=0
+        gx = 0
+        gy = (grid_idx % y) * g + g / 2 + 0.000001
+        gz = (grid_idx // y) * g + g / 2 + 0.000001
+    elif surface_idx == 3:  # 側面2 y=0
+        gx = (grid_idx % x) * g + g / 2 + 0.000001
+        gy = 0
+        gz = (grid_idx // x) * g + g / 2 + 0.000001
+    elif surface_idx == 4:  # 側面3 x=x
+        gx = x
+        gy = (grid_idx % y) * g + g / 2 + 0.000001
+        gz = (grid_idx // y) * g + g / 2 + 0.000001
+    elif surface_idx == 5:  # 側面4 y=y
+        gx = (grid_idx % x) * g + g / 2 + 0.000001
+        gy = y
+        gz = (grid_idx // x) * g + g / 2 + 0.000001
+    return np.array([gx, gy, gz])
