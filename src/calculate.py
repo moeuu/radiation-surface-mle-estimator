@@ -1,6 +1,13 @@
 import numpy as np
 import random
 
+class radiation_source:
+    def __init__(self, x, y, z, q):
+        self.x = x
+        self.y = y
+        self.z = z
+        self.bq = q
+
 def decide_measurement_points(x,y,r):
     m_p = []
     #z軸は固定
@@ -202,6 +209,10 @@ def get_grid_position(surface_idx, grid_idx, x, y, z, g=1):
     x, y, z: 部屋の寸法
     g: グリッドサイズ（デフォルトは1）
     """
+
+    # **初期値を設定**
+    gx, gy, gz = None, None, None
+
     if surface_idx == 0:  # 地面 z=0
         gx = (grid_idx % x) * g + g / 2 + 0.000001
         gy = (grid_idx // x) * g + g / 2 + 0.000001
@@ -226,4 +237,7 @@ def get_grid_position(surface_idx, grid_idx, x, y, z, g=1):
         gx = (grid_idx % x) * g + g / 2 + 0.000001
         gy = y
         gz = (grid_idx // x) * g + g / 2 + 0.000001
+    else:
+        raise ValueError(f"Invalid surface index: {surface_idx}")
+    
     return np.array([gx, gy, gz])
