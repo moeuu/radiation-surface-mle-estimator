@@ -133,3 +133,43 @@ if __name__ == "__main__":
     estimation.restore_q()
     vmin, vmax = estimation.q.min(), estimation.q.max()
     estimation.plot_results(vmin, vmax)
+
+    def compress_q_by_local_max(q, x, y, z):
+    q = np.array(q).flatten()
+
+    q_shapes = [
+        (y, x), (y, x),
+        (z, y), (z, x),
+        (z, y), (z, x)
+    ]
+
+    q_splitted = []
+    start = 0
+    for shape in q_shapes:
+        size = shape[0] * shape[1]
+        q_part = q[start:start+size].reshape(shape)
+        q_splitted.append(q_part)
+        start += size
+
+    q_compressed = []
+
+    for grid in q_splitted:
+        padded_grid = np.zeros((grid.shape[0]+6, grid.shape[1]+6))
+        padded_grid[3:-3, 3:-3] = grid
+        copy_grid = padded_grid.copy()
+
+        for i in range(3, padded_grid.shape[0]-3):
+            for j in range(3, padded_grid.shape[1]-3):
+                sub_grid = padded_grid[i-3:i+4, j-3:j+4]
+                max_index = np.unravel_index(np.argmax(sub_grid), sub_grid.shape)
+                if padded_grid[i, j] == sub_grid[max_index]:
+                    padded_grid[i, j] += np.sum(sub_grid)
+
+        for i in range(padded_grid.shape[0]):
+            for j in range(padded_grid.shape[1]):
+                padded_grid[i, j] -= copy_grid[i, j]
+
+        restored = padded_grid[3:-3, 3:-3]
+        q_compressed.append(restored.reshape(-1, 1))
+
+    return np.vstack(q_compressed)

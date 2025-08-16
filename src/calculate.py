@@ -110,6 +110,40 @@ def measurement_shield(m_p, source_list, shield_orientations):
 
     return rad_all_measurements
 
+def measurement_mle(m_p, source_list):
+    """
+    各計測点での放射線測定を行い、合計放射線量を求める関数（MLE用）。
+    
+    m_p: 計測点リスト [(x, y, z), ...]（検出器の位置）
+    source_list: 放射線源リスト [(x, y, z, intensity), ...]
+    
+    ※ シールドの回転は利用せず、各計測点での放射線量のみを計算します。
+    """
+    rad_all_measurements = []
+    
+    for detector_position in m_p:
+        total_radiation = 0
+        for source in source_list:
+            source_position = source[:3]
+            intensity = source[3]
+            
+            # 2点間の距離を計算
+            distance = calculate_distance(detector_position[0], detector_position[1], detector_position[2],
+                                          source_position[0], source_position[1], source_position[2])
+            
+            # 逆二乗則による減衰を計算（距離がゼロの場合は寄与をゼロに）
+            if distance != 0:
+                attenuation = 1 / (distance ** 2)
+            else:
+                attenuation = 0
+            
+            # 放射線源からの寄与を加算
+            total_radiation += intensity * attenuation
+        
+        rad_all_measurements.append(total_radiation)
+    
+    return rad_all_measurements
+
 # グリッド生成関数
 def create_grid(axis, position, g=1):
     # 部屋のサイズとグリッドサイズ
@@ -173,6 +207,44 @@ def create_A(l1, l2, m_p, G, shield_orientations):
                 if shield_blocks_radiation(orientation, [G_x, G_y, G_z], [m_x, m_y, m_z]):
                     attenuation = calculate_attenuation(orientation, [G_x, G_y, G_z], [m_x, m_y, m_z])
                     A[row_index, j] *= attenuation
+
+    return A
+
+def create_A_mle(l1, l2, m_p, G):
+    """
+    A行列を生成する関数（遮蔽なしバージョン）。
+    
+    Parameters
+    ----------
+    l1, l2 : int
+        グリッドの辺の長さ（対象面のサイズ）。
+    m_p : list of lists
+        計測点のリスト [(x, y, z), ...]（検出器の位置）
+    G : list of lists
+        グリッド点のリスト [(x, y, z), ...]
+    
+    Returns
+    -------
+    A : numpy.ndarray
+        計測点とグリッド点間の寄与を表すシステム行列（サイズ: 計測点数 x グリッド数）
+    """
+    g = 1
+    d1 = l1 // g  # 横方向のグリッド数
+    d2 = l2 // g  # 縦方向のグリッド数
+    n_m = len(m_p)  # 計測点の数
+    A = np.zeros((n_m, int(d1 * d2)))  # A行列の初期化
+
+    # 各計測点についてループ
+    for i, detector_position in enumerate(m_p):
+        m_x, m_y, m_z = detector_position
+        
+        # 各グリッド点についてループ
+        for j, grid_point in enumerate(G):
+            G_x, G_y, G_z = grid_point
+            distance = calculate_distance(m_x, m_y, m_z, G_x, G_y, G_z)
+            
+            # 逆二乗則に基づく寄与（距離がゼロの場合は0）
+            A[i, j] = 1 / (distance ** 2) if distance != 0 else 0
 
     return A
 
@@ -241,3 +313,119 @@ def get_grid_position(surface_idx, grid_idx, x, y, z, g=1):
         raise ValueError(f"Invalid surface index: {surface_idx}")
     
     return np.array([gx, gy, gz])
+
+def compress_q_by_local_max(q, x, y, z):
+    q = np.array(q).flatten()
+
+    q_shapes = [
+        (y, x), (y, x),
+        (z, y), (z, x),
+        (z, y), (z, x)
+    ]
+
+    q_splitted = []
+    start = 0
+    for shape in q_shapes:
+        size = shape[0] * shape[1]
+        q_part = q[start:start+size].reshape(shape)
+        q_splitted.append(q_part)
+        start += size
+
+    q_compressed = []
+
+    for grid in q_splitted:
+        padded_grid = np.zeros((grid.shape[0]+6, grid.shape[1]+6))
+        padded_grid[3:-3, 3:-3] = grid
+        copy_grid = padded_grid.copy()
+
+        for i in range(3, padded_grid.shape[0]-3):
+            for j in range(3, padded_grid.shape[1]-3):
+                sub_grid = padded_grid[i-3:i+4, j-3:j+4]
+                max_index = np.unravel_index(np.argmax(sub_grid), sub_grid.shape)
+                if padded_grid[i, j] == sub_grid[max_index]:
+                    padded_grid[i, j] += np.sum(sub_grid)
+
+        for i in range(padded_grid.shape[0]):
+            for j in range(padded_grid.shape[1]):
+                padded_grid[i, j] -= copy_grid[i, j]
+
+        restored = padded_grid[3:-3, 3:-3]
+        q_compressed.append(restored.reshape(-1, 1))
+
+    return np.vstack(q_compressed)
+
+
+def get_nonzero_coords_and_values(qs_split, x, y, z, threshold=1e-0):
+    """
+    各面の非ゼロの (x, y, z) 座標と値を返す（各面は固定された x/y/z 面上にある）
+    
+    Parameters:
+        qs_split: 各面の q を分割したリスト（長さ6）
+        x, y, z: 各軸の最大整数グリッド数
+        threshold: この値以下はゼロとみなす（デフォルト 1e-6）
+
+    Returns:
+        results: [(x, y, z, value), ...] のリスト
+    """
+    results = []
+
+    # 面0: z=0（地面）
+    grid = qs_split[0].reshape((y, x))
+    for j in range(y):
+        for i in range(x):
+            val = grid[j, i]
+            if abs(val) > threshold:
+                results.append((i + 0.5, j + 0.5, 0.0, val))
+
+    # 面1: z=10（天井）
+    grid = qs_split[1].reshape((y, x))
+    for j in range(y):
+        for i in range(x):
+            val = grid[j, i]
+            if abs(val) > threshold:
+                results.append((i + 0.5, j + 0.5, float(z), val))
+
+    # 面2: x=0（側面）
+    grid = qs_split[2].reshape((z, y))
+    for k in range(z):
+        for j in range(y):
+            val = grid[k, j]
+            if abs(val) > threshold:
+                results.append((0.0, j + 0.5, k + 0.5, val))
+
+    # 面3: y=0（側面）
+    grid = qs_split[3].reshape((z, x))
+    for k in range(z):
+        for i in range(x):
+            val = grid[k, i]
+            if abs(val) > threshold:
+                results.append((i + 0.5, 0.0, k + 0.5, val))
+
+    # 面4: x=10（側面）
+    grid = qs_split[4].reshape((z, y))
+    for k in range(z):
+        for j in range(y):
+            val = grid[k, j]
+            if abs(val) > threshold:
+                results.append((float(x), j + 0.5, k + 0.5, val))
+
+    # 面5: y=10（側面）
+    grid = qs_split[5].reshape((z, x))
+    for k in range(z):
+        for i in range(x):
+            val = grid[k, i]
+            if abs(val) > threshold:
+                results.append((i + 0.5, float(y), k + 0.5, val))
+
+    return results
+
+
+def split_q_into_faces(q, x, y, z):
+    q = np.array(q).flatten()  # shape = (600,)
+    sizes = [y * x, y * x, z * y, z * x, z * y, z * x]
+    qs = []
+    start = 0
+    for size in sizes:
+        qs.append(q[start:start + size])
+        start += size
+    return qs
