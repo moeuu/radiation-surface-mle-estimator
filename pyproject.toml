@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "three-d-estimation"
+version = "0.1.0"
+description = "Radiation estimation experiments for 3D room surfaces."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "matplotlib>=3.8",
+  "numpy>=1.26",
+]
+
+[project.scripts]
+estimate-radiation = "three_d_estimation.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/three_d_estimation"]
