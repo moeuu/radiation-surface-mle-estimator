@@ -1,0 +1,19 @@
+{
+  "blocked_cells": [
+    [
+      3,
+      3
+    ]
+  ],
+  "blocked_fraction": 0.005,
+  "cell_size": 1.0,
+  "grid_shape": [
+    10,
+    20
+  ],
+  "origin": [
+    0.0,
+    0.0
+  ],
+  "version": 1
+}

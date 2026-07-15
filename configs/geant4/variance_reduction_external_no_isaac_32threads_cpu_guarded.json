@@ -1,0 +1,10 @@
+{
+  "extends": "variance_reduction_external_no_isaac_32threads.json",
+  "use_gpu": false,
+  "thread_count": 16,
+  "python_worker_count": 16,
+  "pose_selection_workers": 16,
+  "ig_workers": 16,
+  "parallel_isotope_workers": 16,
+  "structural_trial_workers": 16
+}

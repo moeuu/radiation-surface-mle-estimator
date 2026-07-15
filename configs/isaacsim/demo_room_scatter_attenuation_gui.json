@@ -1,0 +1,91 @@
+{
+  "backend": "isaacsim",
+  "host": "127.0.0.1",
+  "port": 5555,
+  "timeout_s": 90.0,
+  "keep_sidecar_alive": true,
+  "mode": "real",
+  "headless": false,
+  "renderer": "RayTracedLighting",
+  "usd_path": "demo_room_scatter_attenuation.usda",
+  "detector_height_m": 0.5,
+  "obstacle_height_m": 2.0,
+  "author_obstacle_prims": false,
+  "robot_motion_speed_m_s": 0.5,
+  "robot_animation_dt_s": 0.2,
+  "robot_animation_time_scale": 0.1,
+  "robot_max_animation_steps": 200,
+  "preserve_viewport_on_reset": true,
+  "camera_gesture_bindings": {
+    "TumbleGesture": "LeftButton"
+  },
+  "initial_camera": {
+    "eye_xyz": [5.8, -1.8, 2.4],
+    "target_xyz": [3.4, 3.6, 1.15],
+    "focal_length_mm": 22.0
+  },
+  "lighting": {
+    "dome_intensity": 1800.0,
+    "interior_light_position_xyz": [4.4, 4.0, 4.0],
+    "interior_light_intensity": 95000.0,
+    "interior_light_radius_m": 0.05,
+    "color_rgb": [0.98, 0.99, 1.0]
+  },
+  "stage_visual_rules": [
+    {
+      "path_prefix": "/World/Environment",
+      "color_rgb": [0.78, 0.82, 0.84],
+      "opacity": 1.0,
+      "roughness": 0.72,
+      "emissive_scale": 0.18
+    },
+    {
+      "path_prefix": "/World/Environment/ScatterAttenuationSlab",
+      "color_rgb": [0.14, 0.16, 0.18],
+      "opacity": 0.88,
+      "roughness": 0.8,
+      "emissive_scale": 0.12
+    },
+    {
+      "path_prefix": "/World/SimBridge/Sources",
+      "color_rgb": [1.0, 0.02, 0.0],
+      "opacity": 1.0,
+      "roughness": 0.25,
+      "emissive_scale": 5.0
+    },
+    {
+      "path_prefix": "/World/SimBridge/Robot",
+      "color_rgb": [0.45, 0.52, 0.56],
+      "opacity": 1.0,
+      "roughness": 0.55,
+      "emissive_scale": 0.6
+    },
+    {
+      "path_prefix": "/World/SimBridge/Robot/Detector",
+      "color_rgb": [0.0, 0.95, 1.0],
+      "opacity": 1.0,
+      "roughness": 0.25,
+      "emissive_scale": 2.8
+    },
+    {
+      "path_prefix": "/World/SimBridge/Robot/FeShield",
+      "color_rgb": [0.95, 0.58, 0.08],
+      "opacity": 1.0,
+      "roughness": 0.45,
+      "emissive_scale": 1.0
+    },
+    {
+      "path_prefix": "/World/SimBridge/Robot/PbShield",
+      "color_rgb": [0.7, 0.72, 0.82],
+      "opacity": 1.0,
+      "roughness": 0.45,
+      "emissive_scale": 0.8
+    }
+  ],
+  "stage_material_rules": [
+    {
+      "path_prefix": "/World/Environment",
+      "material": "concrete"
+    }
+  ]
+}

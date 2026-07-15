@@ -1,0 +1,20 @@
+{
+  "name": "demo_sources",
+  "sources": [
+    {
+      "isotope": "Cs-137",
+      "position": [5.0, 10.0, 5.0],
+      "intensity_cps_1m": 50000.0
+    },
+    {
+      "isotope": "Co-60",
+      "position": [7.0, 2.0, 0.0],
+      "intensity_cps_1m": 20000.0
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [7.0, 5.0, 3.0],
+      "intensity_cps_1m": 30000.0
+    }
+  ]
+}

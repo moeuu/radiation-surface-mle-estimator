@@ -1,0 +1,25 @@
+{
+  "name": "ral_no_obstacles_case01_multi_isotope",
+  "metadata": {
+    "purpose": "RAL no-obstacle evaluation case 1: separated multi-isotope localization.",
+    "environment": "no obstacles",
+    "intensity_model": "intensity_cps_1m is expected net detector cps at 1 m"
+  },
+  "sources": [
+    {
+      "isotope": "Cs-137",
+      "position": [2.0, 4.0, 1.1],
+      "intensity_cps_1m": 30000.0
+    },
+    {
+      "isotope": "Co-60",
+      "position": [8.0, 14.5, 6.2],
+      "intensity_cps_1m": 30000.0
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [6.0, 7.5, 8.0],
+      "intensity_cps_1m": 30000.0
+    }
+  ]
+}

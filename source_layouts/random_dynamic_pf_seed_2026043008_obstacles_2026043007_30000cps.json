@@ -1,0 +1,32 @@
+{
+  "name": "random_dynamic_pf_sources_seed_2026043008_obstacles_2026043007_30000cps",
+  "metadata": {
+    "source_seed": 2026043008,
+    "obstacle_seed": 2026043007,
+    "base_layout": "source_layouts/random_dynamic_pf_seed_2026043008_obstacles_2026043007.json",
+    "sampling": "same random positions as the base layout; every source intensity set to 30000 cps@1m",
+    "blocked_fraction": 0.4
+  },
+  "sources": [
+    {
+      "isotope": "Cs-137",
+      "position": [0.305, 16.718, 0.978],
+      "intensity_cps_1m": 30000.0
+    },
+    {
+      "isotope": "Co-60",
+      "position": [5.654, 12.269, 1.179],
+      "intensity_cps_1m": 30000.0
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [4.442, 4.479, 0.725],
+      "intensity_cps_1m": 30000.0
+    },
+    {
+      "isotope": "Cs-137",
+      "position": [3.694, 3.211, 1.822],
+      "intensity_cps_1m": 30000.0
+    }
+  ]
+}

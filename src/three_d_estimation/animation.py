@@ -2,6 +2,7 @@ import numpy as np
 
 
 def build_sphere_mesh(radius, resolution=100):
+    """Return Cartesian arrays for a spherical visualization mesh."""
     azimuth = np.linspace(0, 2 * np.pi, resolution)
     polar = np.linspace(0, np.pi, resolution)
     x = radius * np.outer(np.cos(azimuth), np.sin(polar))
@@ -11,6 +12,7 @@ def build_sphere_mesh(radius, resolution=100):
 
 
 def build_shell_mesh(theta_range, phi_range, radius, resolution=50):
+    """Return Cartesian arrays for one angular shield-shell section."""
     phi = np.linspace(phi_range[0], phi_range[1], resolution)
     theta = np.linspace(theta_range[0], theta_range[1], resolution)
     x = radius * np.outer(np.cos(phi), np.sin(theta))
@@ -29,6 +31,7 @@ def draw_shield(
     base_color="blue",
     shield_color="cyan",
 ):
+    """Render one rotating-shield frame on a Matplotlib 3-D axis."""
     ax.cla()
     x_full, y_full, z_full = build_sphere_mesh(inner_radius)
     ax.plot_surface(x_full, y_full, z_full, color=base_color, alpha=0.6, edgecolor="gray")

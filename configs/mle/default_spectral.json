@@ -1,0 +1,13 @@
+{
+  "mode": "spectral",
+  "isotope_names": ["Cs-137", "Co-60", "Eu-154"],
+  "patch_spacing_m": [1.0, 1.0, 1.0],
+  "quadrature_order": 4,
+  "l1_weight": 0.001,
+  "tv_weight": 0.002,
+  "fit_background_nuisance": true,
+  "fit_scatter_nuisance": true,
+  "debias_refit": true,
+  "max_iterations": 5000,
+  "use_gpu": false
+}

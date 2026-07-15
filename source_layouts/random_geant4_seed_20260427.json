@@ -1,0 +1,55 @@
+{
+  "name": "random_geant4_sources_seed_20260427_obstacles_4277",
+  "metadata": {
+    "source_seed": 20260427,
+    "obstacle_seed": 4277,
+    "sampling": "free 1m obstacle-grid cells; x/y uniform inside cell; z uniform 0.5-8.5m; intensity uniform 20k-80k cps at 1m"
+  },
+  "sources": [
+    {
+      "isotope": "Cs-137",
+      "position": [
+        0.609,
+        17.595,
+        1.122
+      ],
+      "intensity_cps_1m": 40074.9
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [
+        5.632,
+        19.349,
+        0.763
+      ],
+      "intensity_cps_1m": 75202.9
+    },
+    {
+      "isotope": "Cs-137",
+      "position": [
+        1.579,
+        5.767,
+        2.344
+      ],
+      "intensity_cps_1m": 77338.9
+    },
+    {
+      "isotope": "Co-60",
+      "position": [
+        9.75,
+        17.298,
+        0.959
+      ],
+      "intensity_cps_1m": 60969.0
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [
+        7.623,
+        8.617,
+        4.591
+      ],
+      "intensity_cps_1m": 54869.0
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "extends": "variance_reduction_external_no_isaac_32threads.json",
+  "start_isaacsim_sidecar_with_geant4": true,
+  "isaacsim_sidecar_config_path": "configs/isaacsim/demo_room_gui.json",
+  "isaacsim_sidecar_python_env": "ISAACSIM_PYTHON",
+  "isaacsim_sidecar_startup_timeout_s": 240.0,
+  "isaacsim_keep_sidecar_alive": true
+}

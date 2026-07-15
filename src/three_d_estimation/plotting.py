@@ -1,160 +1,105 @@
+"""Visualization helpers for MLE surface maps and spectral residuals."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
 import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import numpy as np
 
-
-def _coerce_source(source):
-    if hasattr(source, "intensity"):
-        return source.x, source.y, source.z, source.intensity
-    if hasattr(source, "bq"):
-        return source.x, source.y, source.z, source.bq
-    return source[0], source[1], source[2], source[3]
+from .types import MLEEstimate
 
 
-def plot_measurement_points(m_points, sources, title, x, y):
-    x_coords, y_coords = zip(*[(point[0], point[1]) for point in m_points])
-    plt.figure()
-    plt.scatter(x_coords, y_coords, color="blue", label="Measurement points")
-
-    for index, source in enumerate(sources or []):
-        source_x, source_y, _, _ = _coerce_source(source)
-        plt.scatter(source_x, source_y, color="red", marker="x", label="Sources" if index == 0 else None)
-
-    plt.xlabel("x [m]")
-    plt.ylabel("y [m]")
-    plt.xlim(0, x)
-    plt.ylim(0, y)
-    plt.grid(True, linestyle="--", linewidth=1, alpha=0.5)
-    plt.legend()
-    plt.title(title)
-    plt.gca().set_aspect("equal", adjustable="box")
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_measurement_points_3d(m_points, title, x, y, z):
-    fig = plt.figure(figsize=(10, 8))
-    ax = fig.add_subplot(111, projection="3d")
-    if m_points:
-        x_coords, y_coords, z_coords = zip(*m_points)
-        ax.scatter(x_coords, y_coords, z_coords, color="blue", label="Measurement points")
-    ax.set_title(title)
-    ax.set_xlim(0, x)
-    ax.set_ylim(0, y)
-    ax.set_zlim(0, z)
-    ax.set_xlabel("X [m]")
-    ax.set_ylabel("Y [m]")
-    ax.set_zlabel("Z [m]")
-    ax.legend()
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_heatmap(q, shape, extent, title, sources=None, vmin=None, vmax=None):
-    q_grid = np.asarray(q).reshape(shape)
-    plt.figure()
-    plt.imshow(q_grid, origin="lower", cmap="Greys", extent=extent, vmin=vmin, vmax=vmax)
-    plt.colorbar(label="[Bq]")
-    plt.title(title)
-
-    if sources:
-        for source in sources:
-            source_x, source_y, _, _ = _coerce_source(source)
-            plt.scatter(source_x, source_y, color="red")
-
-    plt.tight_layout()
-    plt.show()
-
-
-def plot_heatmap_result_no_colorbar(q, shape, extent, sources=None, vmin=None, vmax=None):
-    q_grid = np.asarray(q).reshape(shape)
-    plt.figure()
-    plt.imshow(q_grid, origin="lower", cmap="Greys", extent=extent, vmin=vmin, vmax=vmax)
-    plt.axis("off")
-
-    if sources:
-        for source in sources:
-            source_x, source_y, _, _ = _coerce_source(source)
-            plt.scatter(source_x, source_y, color="red")
-
-    plt.tight_layout()
-    plt.show()
-
-
-def get_transparent_colors(q_values, norm, cmap="Greys", alpha_min=0.1, alpha_max=1.0, threshold=0.2, delta=0.02):
-    color_map = plt.get_cmap(cmap)
-    normalized_values = np.clip(norm(q_values), 0, 1)
-    colors = color_map(normalized_values)
-    alphas = np.where(
-        normalized_values < threshold,
-        alpha_min + (normalized_values / threshold) * (alpha_max - alpha_min),
-        alpha_max - ((normalized_values - threshold) / (1 - threshold)) * delta,
+def plot_surface_map(
+    estimate: MLEEstimate,
+    isotope: str,
+    *,
+    output_path: str | Path | None = None,
+    show: bool = False,
+) -> plt.Figure:
+    """Render one isotope's patch density on the complete 3-D surface model."""
+    if isotope not in estimate.isotope_names:
+        raise KeyError(f"Unknown isotope: {isotope}")
+    isotope_index = estimate.isotope_names.index(isotope)
+    values = estimate.density_by_isotope[isotope_index]
+    vertices = [patch.vertices_xyz for patch in estimate.patches]
+    maximum = max(float(np.max(values, initial=0.0)), 1.0e-12)
+    colors = plt.get_cmap("inferno")(np.clip(values / maximum, 0.0, 1.0))
+    figure = plt.figure(figsize=(9.0, 7.0))
+    axis = figure.add_subplot(111, projection="3d")
+    collection = Poly3DCollection(
+        vertices,
+        facecolors=colors,
+        edgecolors=(0.15, 0.15, 0.15, 0.25),
+        linewidths=0.2,
     )
-    colors[..., -1] = alphas
-    return colors
-
-
-def _plot_surface(ax, face_values, coordinates, norm, cmap):
-    padded_values = np.pad(face_values, ((0, 1), (0, 1)), mode="edge")
-    ax.plot_surface(
-        coordinates[0],
-        coordinates[1],
-        coordinates[2],
-        facecolors=get_transparent_colors(padded_values, norm, cmap=cmap),
-        shade=False,
-        zorder=1,
+    axis.add_collection3d(collection)
+    all_vertices = np.concatenate(vertices, axis=0)
+    lower = np.min(all_vertices, axis=0)
+    upper = np.max(all_vertices, axis=0)
+    axis.set_xlim(float(lower[0]), float(upper[0]))
+    axis.set_ylim(float(lower[1]), float(upper[1]))
+    axis.set_zlim(float(lower[2]), float(upper[2]))
+    axis.set_box_aspect(np.maximum(upper - lower, 1.0e-6))
+    axis.set_xlabel("x [m]")
+    axis.set_ylabel("y [m]")
+    axis.set_zlabel("z [m]")
+    axis.set_title(f"{isotope} surface density [detector cps@1m/m²]")
+    scalar = plt.cm.ScalarMappable(
+        norm=plt.Normalize(vmin=0.0, vmax=maximum), cmap="inferno"
     )
+    figure.colorbar(scalar, ax=axis, shrink=0.65, label="detector cps@1m/m²")
+    figure.tight_layout()
+    if output_path is not None:
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(target, dpi=180, bbox_inches="tight")
+    if show:
+        plt.show()
+    return figure
 
 
-def plot_3d_heatmap_cube(qs, x, y, z, sources=None, vmin=None, vmax=None):
-    fig = plt.figure(figsize=(10, 10))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.view_init(elev=30, azim=30, roll=0)
-
-    norm = plt.Normalize(vmin=vmin, vmax=vmax)
-    cmap = "Reds"
-
-    floor = np.asarray(qs[0])
-    side_yz = np.asarray(qs[2])
-    side_xz = np.asarray(qs[3])
-
-    x_grid, y_grid = np.meshgrid(
-        np.linspace(0, x, floor.shape[1] + 1),
-        np.linspace(0, y, floor.shape[0] + 1),
+def plot_spectral_residuals(
+    observed_spectra: np.ndarray,
+    estimate: MLEEstimate,
+    energy_bin_edges_keV: np.ndarray,
+    *,
+    output_path: str | Path | None = None,
+    show: bool = False,
+) -> plt.Figure:
+    """Plot total observed, predicted, and residual spectra across measurements."""
+    if estimate.predicted_spectra is None:
+        raise ValueError("The estimate does not contain predicted spectra.")
+    observed = np.asarray(observed_spectra, dtype=float)
+    predicted = np.asarray(estimate.predicted_spectra, dtype=float)
+    edges = np.asarray(energy_bin_edges_keV, dtype=float)
+    if observed.shape != predicted.shape or edges.shape != (observed.shape[1] + 1,):
+        raise ValueError("Observed, predicted, and energy-bin shapes do not align.")
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    observed_total = np.sum(observed, axis=0)
+    predicted_total = np.sum(predicted, axis=0)
+    figure, (spectrum_axis, residual_axis) = plt.subplots(
+        2, 1, figsize=(9.0, 6.5), sharex=True, height_ratios=(2.0, 1.0)
     )
-    yz_y, yz_z = np.meshgrid(
-        np.linspace(0, y, side_yz.shape[1] + 1),
-        np.linspace(0, z, side_yz.shape[0] + 1),
+    spectrum_axis.step(centers, observed_total, where="mid", label="Observed")
+    spectrum_axis.step(centers, predicted_total, where="mid", label="Predicted")
+    spectrum_axis.set_ylabel("Counts")
+    spectrum_axis.legend()
+    residual_axis.axhline(0.0, color="0.3", linewidth=0.8)
+    residual_axis.step(
+        centers, observed_total - predicted_total, where="mid", color="tab:red"
     )
-    xz_x, xz_z = np.meshgrid(
-        np.linspace(0, x, side_xz.shape[1] + 1),
-        np.linspace(0, z, side_xz.shape[0] + 1),
-    )
-
-    _plot_surface(ax, floor, (x_grid, y_grid, np.zeros_like(x_grid)), norm, cmap)
-    _plot_surface(ax, np.asarray(qs[1]), (x_grid, y_grid, np.full_like(x_grid, z)), norm, cmap)
-    _plot_surface(ax, side_yz, (np.zeros_like(yz_y), yz_y, yz_z), norm, cmap)
-    _plot_surface(ax, side_xz, (xz_x, np.zeros_like(xz_x), xz_z), norm, cmap)
-    _plot_surface(ax, np.asarray(qs[4]), (np.full_like(yz_y, x), yz_y, yz_z), norm, cmap)
-    _plot_surface(ax, np.asarray(qs[5]), (xz_x, np.full_like(xz_x, y), xz_z), norm, cmap)
-
-    if sources:
-        for source in sources:
-            source_x, source_y, source_z, _ = _coerce_source(source)
-            ax.scatter(source_x, source_y, source_z, color="red", s=50, zorder=20)
-
-    ax.set_xlabel("X [m]")
-    ax.set_ylabel("Y [m]")
-    ax.set_zlabel("Z [m]")
-    ax.set_xlim(0, x)
-    ax.set_ylim(0, y)
-    ax.set_zlim(0, z)
-
-    cbar = plt.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, shrink=0.4, aspect=12)
-    cbar.set_label("[Bq]")
-
-    plt.tight_layout()
-    plt.show()
+    residual_axis.set_xlabel("Energy [keV]")
+    residual_axis.set_ylabel("Residual")
+    figure.tight_layout()
+    if output_path is not None:
+        target = Path(output_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        figure.savefig(target, dpi=180, bbox_inches="tight")
+    if show:
+        plt.show()
+    return figure
 
 
-def plot_3d_heatmap(qs, x, y, z, sources=None, vmin=None, vmax=None):
-    plot_3d_heatmap_cube(qs, x, y, z, sources=sources, vmin=vmin, vmax=vmax)
+__all__ = ["plot_spectral_residuals", "plot_surface_map"]

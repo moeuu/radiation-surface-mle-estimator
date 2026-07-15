@@ -1,0 +1,25 @@
+{
+  "name": "co60_eu154_two_each",
+  "sources": [
+    {
+      "isotope": "Co-60",
+      "position": [1.5, 5.0, 2.0],
+      "intensity_cps_1m": 18000.0
+    },
+    {
+      "isotope": "Co-60",
+      "position": [7.5, 16.0, 6.5],
+      "intensity_cps_1m": 70000.0
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [3.0, 12.0, 1.0],
+      "intensity_cps_1m": 24000.0
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [8.0, 7.0, 4.5],
+      "intensity_cps_1m": 26000.0
+    }
+  ]
+}

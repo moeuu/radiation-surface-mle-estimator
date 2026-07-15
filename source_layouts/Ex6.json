@@ -1,0 +1,40 @@
+{
+  "name": "cs137_co60_eu154_multi_sources",
+  "sources": [
+    {
+      "isotope": "Cs-137",
+      "position": [2.0, 6.5, 0.5],
+      "intensity_cps_1m": 45000.0
+    },
+    {
+      "isotope": "Cs-137",
+      "position": [4.5, 13.0, 2.5],
+      "intensity_cps_1m": 30000.0
+    },
+    {
+      "isotope": "Cs-137",
+      "position": [8.0, 9.0, 6.0],
+      "intensity_cps_1m": 22000.0
+    },
+    {
+      "isotope": "Co-60",
+      "position": [1.5, 17.5, 7.5],
+      "intensity_cps_1m": 18000.0
+    },
+    {
+      "isotope": "Co-60",
+      "position": [6.5, 4.0, 4.0],
+      "intensity_cps_1m": 16000.0
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [7.5, 15.0, 2.0],
+      "intensity_cps_1m": 25000.0
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [3.5, 2.5, 8.0],
+      "intensity_cps_1m": 20000.0
+    }
+  ]
+}

@@ -1,0 +1,35 @@
+{
+  "name": "ral_no_obstacles_case03_mixed_cardinality",
+  "metadata": {
+    "purpose": "RAL no-obstacle evaluation case 3: mixed isotope and source cardinality.",
+    "environment": "no obstacles",
+    "intensity_model": "intensity_cps_1m is expected net detector cps at 1 m"
+  },
+  "sources": [
+    {
+      "isotope": "Cs-137",
+      "position": [2.2, 3.8, 1.1],
+      "intensity_cps_1m": 48000.0
+    },
+    {
+      "isotope": "Cs-137",
+      "position": [8.1, 6.6, 6.4],
+      "intensity_cps_1m": 33000.0
+    },
+    {
+      "isotope": "Co-60",
+      "position": [3.7, 14.8, 3.8],
+      "intensity_cps_1m": 42000.0
+    },
+    {
+      "isotope": "Co-60",
+      "position": [8.5, 15.8, 8.7],
+      "intensity_cps_1m": 28000.0
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [5.7, 10.2, 5.0],
+      "intensity_cps_1m": 36000.0
+    }
+  ]
+}

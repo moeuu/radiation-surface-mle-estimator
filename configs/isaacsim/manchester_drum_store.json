@@ -1,0 +1,19 @@
+{
+  "backend": "isaacsim",
+  "host": "127.0.0.1",
+  "port": 5555,
+  "timeout_s": 10.0,
+  "mode": "real",
+  "headless": true,
+  "renderer": "RayTracedLighting",
+  "usd_path": "../../data/manchester_nuclear_assets/usd/drum_store.usda",
+  "detector_height_m": 0.5,
+  "obstacle_height_m": 2.0,
+  "author_obstacle_prims": false,
+  "stage_material_rules": [
+    {
+      "path_prefix": "/World/Environment",
+      "material": "concrete"
+    }
+  ]
+}

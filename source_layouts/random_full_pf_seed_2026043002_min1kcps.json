@@ -1,0 +1,38 @@
+{
+  "name": "random_full_pf_sources_seed_2026043002_obstacles_2026043001",
+  "metadata": {
+    "source_seed": 2026043002,
+    "obstacle_seed": 2026043001,
+    "sampling": "free 1m random-obstacle-grid cells; x/y uniform inside cell; z uniform 0.65-1.85m; one source per isotope; intensity log-uniform 1000-2000 cps@1m",
+    "blocked_fraction": 0.4
+  },
+  "sources": [
+    {
+      "isotope": "Cs-137",
+      "position": [
+        5.611,
+        8.639,
+        1.743
+      ],
+      "intensity_cps_1m": 1618.6
+    },
+    {
+      "isotope": "Co-60",
+      "position": [
+        7.466,
+        5.597,
+        1.242
+      ],
+      "intensity_cps_1m": 1434.6
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [
+        7.381,
+        7.492,
+        1.368
+      ],
+      "intensity_cps_1m": 1098.9
+    }
+  ]
+}

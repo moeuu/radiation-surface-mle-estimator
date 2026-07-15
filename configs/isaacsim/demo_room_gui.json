@@ -1,0 +1,271 @@
+{
+  "backend": "isaacsim",
+  "host": "127.0.0.1",
+  "port": 5555,
+  "timeout_s": 90.0,
+  "keep_sidecar_alive": true,
+  "mode": "real",
+  "headless": false,
+  "renderer": "RayTracedLighting",
+  "usd_path": "demo_room.usda",
+  "detector_height_m": 0.5,
+  "obstacle_height_m": 2.0,
+  "author_obstacle_prims": true,
+  "spectrum_count_method": "response_poisson",
+  "physics_profile": "python_transport_balanced",
+  "scatter_gain": 0.03,
+  "path_planner": "dss_pp",
+  "orientation_k": 8,
+  "min_rotations_per_pose": 8,
+  "python_worker_count": 32,
+  "ig_workers": 32,
+  "parallel_isotope_updates": true,
+  "parallel_isotope_workers": 32,
+  "dss_pp": {
+    "horizon": 2,
+    "beam_width": 8,
+    "program_length": 8,
+    "residual_program_length": 16,
+    "program_eval_workers": 32,
+    "candidate_preselect_enable": true,
+    "candidate_preselect_min": 64,
+    "candidate_preselect_multiplier": 8,
+    "max_programs": 40,
+    "signature_weight": 1.0,
+    "differential_weight": 1.0,
+    "rotation_weight": 0.15,
+    "coverage_weight": 8.0,
+    "bearing_diversity_weight": 2.0,
+    "frontier_weight": 4.0,
+    "temporal_separation_weight": 2.0,
+    "environment_signature_weight": 0.75,
+    "occlusion_boundary_weight": 1.5,
+    "environment_contrast_threshold": 0.25,
+    "environment_signature_score_clip": 3.0,
+    "occlusion_boundary_step_m": 0.5,
+    "temporal_cover_weight": 1.0,
+    "temporal_logdet_weight": 0.25,
+    "temporal_decorrelation_weight": 0.5,
+    "temporal_pair_contrast_threshold": 0.25,
+    "temporal_cover_programs": 1,
+    "temporal_cover_beam_width": 4,
+    "turn_smoothness_weight": 1.5,
+    "coverage_radius_m": 3.0,
+    "coverage_grid_max_cells": 5000,
+    "revisit_penalty_weight": 6.0,
+    "min_station_separation_m": 4.0,
+    "observation_weight": 1.0,
+    "enforce_min_observation": true,
+    "signature_std_min_counts": 1.0,
+    "augment_candidates": true,
+    "max_augmented_candidates": 256
+  },
+  "pf_max_sources": null,
+  "birth_max_per_update": 5,
+  "birth_min_distinct_poses": 3,
+  "birth_residual_min_support": 4,
+  "birth_residual_support_sigma": 2.0,
+  "birth_residual_gate_p_value": 0.01,
+  "birth_candidate_support_fraction": 0.05,
+  "birth_refit_residual_gate": true,
+  "birth_refit_residual_min_fraction": 0.5,
+  "birth_use_shield_coded_residual": true,
+  "birth_existing_response_corr_max": 0.999,
+  "birth_response_condition_max": 100.0,
+  "birth_residual_always_try": true,
+  "birth_residual_expand_structural_particles": true,
+  "birth_residual_expanded_structural_topk_particles": 256,
+  "birth_residual_acceptance_complexity_scale": 0.0,
+  "birth_residual_suppress_death": true,
+  "birth_matching_pursuit_max_new_sources": 3,
+  "birth_matching_pursuit_topk_candidates": 16,
+  "weak_source_prune_min_expected_count": 3.0,
+  "weak_source_prune_min_fraction": 0.001,
+  "weak_source_prune_min_age": 2,
+  "mode_preserving_resample": true,
+  "mode_preserving_max_modes": 6,
+  "mode_preserving_particles_per_mode": 3,
+  "mode_preserving_radius_m": 1.5,
+  "mode_preserving_min_weight_fraction": 0.0001,
+  "mode_preserving_surface_strata": true,
+  "mode_preserving_height_bin_m": 2.0,
+  "structural_update_min_counts": 100.0,
+  "structural_update_count_min_snr": 3.0,
+  "structural_update_min_snr": 3.0,
+  "converge_cluster_spread_max_m": 1.5,
+  "converge_cluster_min_support_fraction": 0.05,
+  "conditional_strength_refit": true,
+  "conditional_strength_refit_window": 12,
+  "conditional_strength_refit_iters": 5,
+  "report_strength_refit_preserve_cardinality": true,
+  "report_cluster_model_selection": true,
+  "report_cluster_bic_penalty_params": 4,
+  "report_cluster_delta_ll_threshold": 0.0,
+  "detector_model": {
+    "crystal_radius_m": 0.038,
+    "crystal_length_m": 0.076,
+    "housing_thickness_m": 0.0015,
+    "crystal_shape": "sphere",
+    "crystal_material": "cebr3",
+    "housing_material": "aluminum"
+  },
+  "robot_motion_speed_m_s": 0.5,
+  "robot_animation_dt_s": 0.2,
+  "robot_animation_time_scale": 0.1,
+  "robot_max_animation_steps": 200,
+  "show_pf_particles": true,
+  "pf_visual_max_particles_per_isotope": 800,
+  "pf_visual_particle_radius_m": 0.025,
+  "pf_visual_estimate_radius_m": 0.13,
+  "pf_visual_estimate_cross_size_m": 0.35,
+  "preserve_viewport_on_reset": true,
+  "camera_gesture_bindings": {
+    "TumbleGesture": "LeftButton"
+  },
+  "initial_camera": {
+    "eye_xyz": [7.8, -2.8, 2.7],
+    "target_xyz": [5.2, 8.8, 0.75],
+    "focal_length_mm": 20.0
+  },
+  "lighting": {
+    "dome_intensity": 1600.0,
+    "interior_light_position_xyz": [5.0, 9.0, 4.0],
+    "interior_light_intensity": 90000.0,
+    "interior_light_radius_m": 0.05,
+    "color_rgb": [0.98, 0.99, 1.0]
+  },
+  "stage_visual_rules": [
+    {
+      "path_prefix": "/World/Environment",
+      "color_rgb": [0.78, 0.82, 0.84],
+      "opacity": 1.0,
+      "roughness": 0.72,
+      "emissive_scale": 0.18
+    },
+    {
+      "path_prefix": "/World/Environment/Wall",
+      "color_rgb": [0.78, 0.82, 0.84],
+      "opacity": 0.02,
+      "roughness": 0.35,
+      "emissive_scale": 0.05
+    },
+    {
+      "path_prefix": "/World/Environment/Wall/Ceiling",
+      "color_rgb": [0.88, 0.93, 1.0],
+      "opacity": 0.01,
+      "roughness": 0.25,
+      "emissive_scale": 0.05
+    },
+    {
+      "path_prefix": "/World/Environment/World/Environment/NorthWall",
+      "color_rgb": [0.78, 0.82, 0.84],
+      "opacity": 0.02,
+      "roughness": 0.35,
+      "emissive_scale": 0.05
+    },
+    {
+      "path_prefix": "/World/Environment/World/Environment/SouthWall",
+      "color_rgb": [0.78, 0.82, 0.84],
+      "opacity": 0.02,
+      "roughness": 0.35,
+      "emissive_scale": 0.05
+    },
+    {
+      "path_prefix": "/World/Environment/World/Environment/EastWall",
+      "color_rgb": [0.78, 0.82, 0.84],
+      "opacity": 0.02,
+      "roughness": 0.35,
+      "emissive_scale": 0.05
+    },
+    {
+      "path_prefix": "/World/Environment/World/Environment/WestWall",
+      "color_rgb": [0.78, 0.82, 0.84],
+      "opacity": 0.02,
+      "roughness": 0.35,
+      "emissive_scale": 0.05
+    },
+    {
+      "path_prefix": "/World/Environment/Ceiling",
+      "color_rgb": [0.88, 0.93, 1.0],
+      "opacity": 0.01,
+      "roughness": 0.25,
+      "emissive_scale": 0.05
+    },
+    {
+      "path_prefix": "/World/Environment/World/Environment/Ceiling",
+      "color_rgb": [0.88, 0.93, 1.0],
+      "opacity": 0.01,
+      "roughness": 0.25,
+      "emissive_scale": 0.05
+    },
+    {
+      "path_prefix": "/World/SimBridge/Sources",
+      "color_rgb": [1.0, 0.8, 0.05],
+      "opacity": 1.0,
+      "roughness": 0.25,
+      "emissive_scale": 5.0
+    },
+    {
+      "path_prefix": "/World/SimBridge/Sources/Cs_137",
+      "color_rgb": [1.0, 0.05, 0.05],
+      "opacity": 1.0,
+      "roughness": 0.25,
+      "emissive_scale": 5.0
+    },
+    {
+      "path_prefix": "/World/SimBridge/Sources/Co_60",
+      "color_rgb": [0.05, 0.45, 1.0],
+      "opacity": 1.0,
+      "roughness": 0.25,
+      "emissive_scale": 5.0
+    },
+    {
+      "path_prefix": "/World/SimBridge/Sources/Eu_154",
+      "color_rgb": [0.0, 0.75, 0.25],
+      "opacity": 1.0,
+      "roughness": 0.25,
+      "emissive_scale": 5.0
+    },
+    {
+      "path_prefix": "/World/SimBridge/Robot",
+      "color_rgb": [0.45, 0.52, 0.56],
+      "opacity": 1.0,
+      "roughness": 0.55,
+      "emissive_scale": 0.6
+    },
+    {
+      "path_prefix": "/World/SimBridge/Robot/Detector",
+      "color_rgb": [0.0, 0.95, 1.0],
+      "opacity": 1.0,
+      "roughness": 0.25,
+      "emissive_scale": 2.8
+    },
+    {
+      "path_prefix": "/World/SimBridge/Robot/FeShield",
+      "color_rgb": [0.95, 0.58, 0.08],
+      "opacity": 1.0,
+      "roughness": 0.45,
+      "emissive_scale": 1.0
+    },
+    {
+      "path_prefix": "/World/SimBridge/Robot/PbShield",
+      "color_rgb": [0.7, 0.72, 0.82],
+      "opacity": 1.0,
+      "roughness": 0.45,
+      "emissive_scale": 0.8
+    },
+    {
+      "path_prefix": "/World/SimBridge/Obstacles",
+      "color_rgb": [0.54, 0.56, 0.52],
+      "opacity": 0.88,
+      "roughness": 0.72,
+      "emissive_scale": 0.08
+    }
+  ],
+  "stage_material_rules": [
+    {
+      "path_prefix": "/World/Environment",
+      "material": "concrete"
+    }
+  ]
+}

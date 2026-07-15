@@ -1,0 +1,207 @@
+{
+  "backend": "isaacsim",
+  "host": "127.0.0.1",
+  "port": 5555,
+  "timeout_s": 90.0,
+  "keep_sidecar_alive": true,
+  "mode": "real",
+  "headless": false,
+  "renderer": "RayTracedLighting",
+  "usd_path": "../../data/manchester_nuclear_assets/usd/drum_store.usda",
+  "detector_height_m": 0.5,
+  "obstacle_height_m": 2.0,
+  "author_obstacle_prims": false,
+  "robot_motion_speed_m_s": 0.5,
+  "robot_animation_dt_s": 0.2,
+  "robot_animation_time_scale": 0.1,
+  "robot_max_animation_steps": 200,
+  "preserve_viewport_on_reset": true,
+  "camera_gesture_bindings": {
+    "TumbleGesture": "LeftButton"
+  },
+  "initial_camera": {
+    "eye_xyz": [2.8, -2.6, 1.6],
+    "target_xyz": [1.0, 1.0, 0.65],
+    "focal_length_mm": 22.0
+  },
+  "lighting": {
+    "dome_intensity": 3000.0,
+    "interior_light_position_xyz": [2.5, 2.5, 3.0],
+    "interior_light_intensity": 160000.0,
+    "interior_light_radius_m": 0.03,
+    "color_rgb": [0.98, 0.99, 1.0],
+    "interior_lights": [
+      {
+        "position_xyz": [-4.5, -4.0, 3.2],
+        "intensity": 130000.0,
+        "radius_m": 0.03
+      },
+      {
+        "position_xyz": [0.0, -4.0, 3.2],
+        "intensity": 130000.0,
+        "radius_m": 0.03
+      },
+      {
+        "position_xyz": [4.5, -4.0, 3.2],
+        "intensity": 130000.0,
+        "radius_m": 0.03
+      },
+      {
+        "position_xyz": [-4.5, 2.5, 3.2],
+        "intensity": 130000.0,
+        "radius_m": 0.03
+      },
+      {
+        "position_xyz": [0.0, 2.5, 3.2],
+        "intensity": 130000.0,
+        "radius_m": 0.03
+      },
+      {
+        "position_xyz": [4.5, 2.5, 3.2],
+        "intensity": 130000.0,
+        "radius_m": 0.03
+      }
+    ]
+  },
+  "stage_visual_rules": [
+    {
+      "path_prefix": "/World/Environment",
+      "color_rgb": [0.82, 0.85, 0.86],
+      "opacity": 1.0,
+      "roughness": 0.62,
+      "emissive_scale": 0.25
+    },
+    {
+      "path_prefix": "/World/Environment/Drum_Store_Back_Barrels_Back_Barrels",
+      "color_rgb": [0.74, 0.82, 0.84],
+      "opacity": 1.0,
+      "roughness": 0.6,
+      "emissive_scale": 0.55
+    },
+    {
+      "path_prefix": "/World/Environment/Drum_Store_Left_Barrels_Left_Barrels",
+      "color_rgb": [0.74, 0.82, 0.84],
+      "opacity": 1.0,
+      "roughness": 0.6,
+      "emissive_scale": 0.55
+    },
+    {
+      "path_prefix": "/World/Environment/Drum_Store_Right_Barrels_Right_Barrels",
+      "color_rgb": [0.74, 0.82, 0.84],
+      "opacity": 1.0,
+      "roughness": 0.6,
+      "emissive_scale": 0.55
+    },
+    {
+      "path_prefix": "/World/Environment/Drum_Store_Stand_Alone_Barrel_Stand_Alone_Barrel",
+      "color_rgb": [0.74, 0.82, 0.84],
+      "opacity": 1.0,
+      "roughness": 0.6,
+      "emissive_scale": 0.55
+    },
+    {
+      "path_prefix": "/World/Environment/Drum_Store_Back_Pallets_Back_Pallets",
+      "color_rgb": [0.76, 0.66, 0.48],
+      "opacity": 1.0,
+      "roughness": 0.72,
+      "emissive_scale": 0.42
+    },
+    {
+      "path_prefix": "/World/Environment/Drum_Store_Left_Pallets_Left_Pallets",
+      "color_rgb": [0.76, 0.66, 0.48],
+      "opacity": 1.0,
+      "roughness": 0.72,
+      "emissive_scale": 0.42
+    },
+    {
+      "path_prefix": "/World/Environment/Drum_Store_Right_Pallets_Right_Pallets",
+      "color_rgb": [0.76, 0.66, 0.48],
+      "opacity": 1.0,
+      "roughness": 0.72,
+      "emissive_scale": 0.42
+    },
+    {
+      "path_prefix": "/World/Environment/Drum_Store_Stand_Alone_Pallet_Stand_Alone_Pallet",
+      "color_rgb": [0.76, 0.66, 0.48],
+      "opacity": 1.0,
+      "roughness": 0.72,
+      "emissive_scale": 0.42
+    },
+    {
+      "path_prefix": "/World/Environment/Drum_Store_Roof_Roof",
+      "color_rgb": [0.62, 0.70, 0.76],
+      "opacity": 0.015,
+      "roughness": 0.85,
+      "emissive_scale": 0.0
+    },
+    {
+      "path_prefix": "/World/Environment/Drum_Store_Outer_Walls_Outer_Walls",
+      "color_rgb": [0.62, 0.70, 0.76],
+      "opacity": 0.02,
+      "roughness": 0.85,
+      "emissive_scale": 0.0
+    },
+    {
+      "path_prefix": "/World/Environment/Drum_Store_Back_Wall_Back_Wall",
+      "color_rgb": [0.62, 0.70, 0.76],
+      "opacity": 0.02,
+      "roughness": 0.85,
+      "emissive_scale": 0.0
+    },
+    {
+      "path_prefix": "/World/Environment/Drum_Store_Steel_Wall_Steel_Wall",
+      "color_rgb": [0.62, 0.70, 0.76],
+      "opacity": 0.02,
+      "roughness": 0.85,
+      "emissive_scale": 0.0
+    },
+    {
+      "path_prefix": "/World/Environment/Drum_Store_Back_Barrels_Back_Barrels/Steel_Wall",
+      "color_rgb": [0.62, 0.70, 0.76],
+      "opacity": 0.02,
+      "roughness": 0.85,
+      "emissive_scale": 0.0
+    },
+    {
+      "path_prefix": "/World/SimBridge/Sources",
+      "color_rgb": [1.0, 0.02, 0.0],
+      "opacity": 1.0,
+      "roughness": 0.25,
+      "emissive_scale": 5.0
+    },
+    {
+      "path_prefix": "/World/SimBridge/Robot",
+      "color_rgb": [0.45, 0.52, 0.56],
+      "opacity": 1.0,
+      "roughness": 0.55,
+      "emissive_scale": 0.6
+    },
+    {
+      "path_prefix": "/World/SimBridge/Robot/Detector",
+      "color_rgb": [0.0, 0.95, 1.0],
+      "opacity": 1.0,
+      "roughness": 0.25,
+      "emissive_scale": 2.8
+    },
+    {
+      "path_prefix": "/World/SimBridge/Robot/FeShield",
+      "color_rgb": [0.95, 0.58, 0.08],
+      "opacity": 1.0,
+      "roughness": 0.45,
+      "emissive_scale": 1.0
+    },
+    {
+      "path_prefix": "/World/SimBridge/Robot/PbShield",
+      "color_rgb": [0.7, 0.72, 0.82],
+      "opacity": 1.0,
+      "roughness": 0.45,
+      "emissive_scale": 0.8
+    }
+  ],
+  "stage_material_rules": [
+    {
+      "path_prefix": "/World/Environment",
+      "material": "concrete"
+    }
+  ]
+}

@@ -1,20 +1,40 @@
 [build-system]
-requires = ["hatchling>=1.27"]
-build-backend = "hatchling.build"
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "three-d-estimation"
-version = "0.1.0"
-description = "Radiation estimation experiments for 3D room surfaces."
+version = "0.2.0"
+description = "Standalone rotating-shield simulation and surface MLE reconstruction"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-  "matplotlib>=3.8",
-  "numpy>=1.26",
+  "matplotlib>=3.10.7",
+  "numpy>=2.3.5",
+  "pytest>=9.0.1",
+  "scipy>=1.16.3",
+  "torch",
 ]
 
 [project.scripts]
+estimate-radiation-mle = "three_d_estimation.cli:main"
 estimate-radiation = "three_d_estimation.cli:main"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/three_d_estimation"]
+[tool.setuptools]
+package-dir = {"" = "src"}
+py-modules = [
+  "cui_runtime",
+  "evaluation_metrics",
+  "mission_control",
+  "piplup_notify",
+  "realtime_demo",
+  "runtime_defaults",
+  "runtime_environment",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

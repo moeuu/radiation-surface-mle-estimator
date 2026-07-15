@@ -1,0 +1,26 @@
+{
+  "name": "random_geant4_isaacsim_sources_seed_20260429_obstacles_20260429",
+  "metadata": {
+    "source_seed": 20260429,
+    "obstacle_seed": 20260429,
+    "sampling": "free 1m random-obstacle-grid cells; x/y uniform inside cell; z uniform 0.65-1.85m; one source per isotope",
+    "note": "Source intensities define the random test scenario and are not a Geant4 history cap."
+  },
+  "sources": [
+    {
+      "isotope": "Cs-137",
+      "position": [7.432, 0.455, 0.707],
+      "intensity_cps_1m": 260.0
+    },
+    {
+      "isotope": "Co-60",
+      "position": [3.757, 7.597, 1.331],
+      "intensity_cps_1m": 240.0
+    },
+    {
+      "isotope": "Eu-154",
+      "position": [1.236, 16.67, 1.265],
+      "intensity_cps_1m": 280.0
+    }
+  ]
+}

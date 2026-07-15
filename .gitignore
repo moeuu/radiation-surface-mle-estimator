@@ -3,3 +3,7 @@ __pycache__/
 .ipynb_checkpoints/
 .pytest_cache/
 .venv/
+*.egg-info/
+build/
+dist/
+results/
