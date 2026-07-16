@@ -1,0 +1,14 @@
+{
+  "detector_position": [0.8, 0.8, 0.45],
+  "environment_model_id": "shared_small_room_6x6x3.v1",
+  "obstacle_grid": {
+    "blocked_cells": [[2, 2], [2, 3], [3, 2], [3, 3]],
+    "cell_size": 1.0,
+    "grid_shape": [6, 6],
+    "origin": [0.0, 0.0]
+  },
+  "obstacle_model_id": "shared_small_box_grid.v1",
+  "size_x": 6.0,
+  "size_y": 6.0,
+  "size_z": 3.0
+}

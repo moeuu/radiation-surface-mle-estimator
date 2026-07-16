@@ -21,6 +21,12 @@ from runtime.records import (
     MeasurementRecord,
     RunContext,
     canonical_json_bytes,
+    validate_truth_free_estimator_input,
+)
+from runtime.forward_model_manifest import (
+    SOURCE_RATE_SEMANTICS,
+    build_forward_model_manifest,
+    validate_forward_model_manifest,
 )
 
 
@@ -28,10 +34,25 @@ _REQUIRED_FILES = (
     "run_manifest.json",
     "runtime_config.resolved.json",
     "environment.json",
+    "forward_model_manifest.json",
     "observations.npz",
     "observation_metadata.jsonl",
-    "upstream_pf_commit.txt",
+    "repository_commit.txt",
 )
+_LEGACY_COMMIT_FILENAME = "upstream_pf_commit.txt"
+_TRUTH_FILENAME = "truth.json"
+_LEGACY_TRUTH_FILENAME = "truth_sources.json"
+
+
+def _is_forbidden_estimator_artifact(relative_name: str) -> bool:
+    """Return whether any path component names truth or a source layout."""
+    for part in Path(relative_name).parts:
+        normalized = "".join(
+            character for character in part.casefold() if character.isalnum()
+        )
+        if "truth" in normalized or "sourcelayout" in normalized:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -40,6 +61,34 @@ class MeasurementLog:
 
     context: RunContext
     records: tuple[MeasurementRecord, ...]
+    content_sha256: str | None = None
+
+
+def measurement_log_sha256(run_dir: str | Path) -> str:
+    """Hash the complete truth-free regular-file inventory of a log root."""
+    root = Path(run_dir)
+    if not root.is_dir():
+        raise FileNotFoundError(f"Measurement log directory does not exist: {root}")
+    inventory: dict[str, str] = {}
+    for path in sorted(root.rglob("*")):
+        relative = path.relative_to(root).as_posix()
+        if path.is_symlink():
+            raise ValueError(f"MeasurementLog must not contain symlinks: {relative}")
+        if _is_forbidden_estimator_artifact(relative):
+            raise ValueError(
+                "Truth or source-layout artifacts are forbidden inside an "
+                "estimator-input MeasurementLog."
+            )
+        if path.is_dir():
+            continue
+        if not path.is_file():
+            raise ValueError(
+                f"MeasurementLog contains a non-regular artifact: {relative}"
+            )
+        inventory[relative] = sha256(path.read_bytes()).hexdigest()
+    if not inventory:
+        raise ValueError("MeasurementLog contains no regular artifacts.")
+    return sha256(canonical_json_bytes(inventory)).hexdigest()
 
 
 def _write_bytes(path: Path, payload: bytes) -> None:
@@ -68,7 +117,9 @@ def _write_deterministic_npz(
 ) -> None:
     """Write an ``np.load`` compatible archive without wall-clock timestamps."""
     with path.open("xb") as raw_handle:
-        with zipfile.ZipFile(raw_handle, mode="w", compression=zipfile.ZIP_STORED) as archive:
+        with zipfile.ZipFile(
+            raw_handle, mode="w", compression=zipfile.ZIP_STORED
+        ) as archive:
             for name, array in arrays.items():
                 if not name or "/" in name or "\\" in name:
                     raise ValueError(f"Invalid NPZ member name: {name!r}.")
@@ -99,13 +150,35 @@ def _validate_records(
     bin_count = records[0].spectrum_counts.size
     known_isotopes = set(context.isotopes)
     seen_steps: set[int] = set()
+    seen_actions: set[int] = set()
+    previous_step_id: int | None = None
+    previous_station_id: int | None = None
+    count_presence: list[bool] = []
+    covariance_presence: list[bool] = []
 
     for index, record in enumerate(records):
         if not isinstance(record, MeasurementRecord):
             raise TypeError(f"records[{index}] is not a MeasurementRecord.")
         if record.step_id in seen_steps:
-            raise ValueError(f"Duplicate finalized step_id {record.step_id} in measurement log.")
+            raise ValueError(
+                f"Duplicate finalized step_id {record.step_id} in measurement log."
+            )
+        if previous_step_id is not None and record.step_id <= previous_step_id:
+            raise ValueError(
+                "Measurement records must be stored in strictly increasing causal step_id order."
+            )
         seen_steps.add(record.step_id)
+        previous_step_id = record.step_id
+        if record.action_id in seen_actions:
+            raise ValueError(
+                f"Duplicate action_id {record.action_id} in measurement log."
+            )
+        seen_actions.add(int(record.action_id))
+        if previous_station_id is not None and record.station_id < previous_station_id:
+            raise ValueError(
+                "station_id values must be nondecreasing in causal file order."
+            )
+        previous_station_id = record.station_id
         if record.spectrum_counts.shape != (bin_count,):
             raise ValueError(
                 f"records[{index}].spectrum_counts has shape "
@@ -119,18 +192,74 @@ def _validate_records(
 
         record_isotopes: set[str] = set()
         if record.counts_by_isotope is not None:
+            count_presence.append(True)
             record_isotopes.update(record.counts_by_isotope)
+            if set(record.counts_by_isotope) != known_isotopes:
+                raise ValueError(
+                    f"records[{index}] isotope counts must contain every manifest isotope."
+                )
+        else:
+            count_presence.append(False)
         if record.count_covariance_by_isotope is not None:
+            covariance_presence.append(True)
             record_isotopes.update(record.count_covariance_by_isotope)
             for row in record.count_covariance_by_isotope.values():
                 record_isotopes.update(row)
+            covariance = record.count_covariance_by_isotope
+            if set(covariance) != known_isotopes or any(
+                set(covariance.get(isotope, {})) != known_isotopes
+                for isotope in context.isotopes
+            ):
+                raise ValueError(
+                    f"records[{index}] isotope covariance must be a complete square matrix."
+                )
+            matrix = np.asarray(
+                [
+                    [covariance[row][column] for column in context.isotopes]
+                    for row in context.isotopes
+                ],
+                dtype=float,
+            )
+            eigenvalues = np.linalg.eigvalsh(matrix)
+            scale = max(float(np.max(np.abs(eigenvalues))), 1.0)
+            if np.any(eigenvalues < -1.0e-9 * scale):
+                raise ValueError(
+                    f"records[{index}] isotope covariance must be positive semidefinite."
+                )
+        else:
+            covariance_presence.append(False)
         unknown = record_isotopes - known_isotopes
         if unknown:
             raise ValueError(
                 f"records[{index}] contains isotopes absent from RunContext: "
                 f"{sorted(unknown)}."
             )
+    if any(count_presence) and not all(count_presence):
+        raise ValueError("All records must either contain isotope counts or omit them.")
+    if any(covariance_presence) and not all(covariance_presence):
+        raise ValueError(
+            "All records must either contain isotope covariance or omit it."
+        )
+    if any(covariance_presence) and not all(count_presence):
+        raise ValueError("Isotope covariance requires corresponding isotope counts.")
     return len(records), bin_count
+
+
+def _normalize_truth_sources(
+    truth_sources: Iterable[Mapping[str, object]] | None,
+) -> tuple[dict[str, object], ...] | None:
+    """Validate a separate evaluation-only truth payload for persistence."""
+    if truth_sources is None:
+        return None
+    normalized: list[dict[str, object]] = []
+    for index, item in enumerate(truth_sources):
+        if not isinstance(item, Mapping):
+            raise TypeError(f"truth_sources[{index}] must be a mapping.")
+        value = json.loads(canonical_json_bytes(dict(item)).decode("utf-8"))
+        if not isinstance(value, dict):
+            raise TypeError(f"truth_sources[{index}] must normalize to an object.")
+        normalized.append(value)
+    return tuple(normalized)
 
 
 def _arrays_for_records(
@@ -171,7 +300,10 @@ def _arrays_for_records(
                 isotope_counts_present[row_index, column_index] = True
         if record.count_covariance_by_isotope is not None:
             isotope_covariance_record_present[row_index] = True
-            for row_isotope, covariance_row in record.count_covariance_by_isotope.items():
+            for (
+                row_isotope,
+                covariance_row,
+            ) in record.count_covariance_by_isotope.items():
                 covariance_row_index = isotope_index[row_isotope]
                 for column_isotope, value in covariance_row.items():
                     covariance_column_index = isotope_index[column_isotope]
@@ -189,6 +321,10 @@ def _arrays_for_records(
     # Insertion order is part of the deterministic archive representation.
     return {
         "step_id": np.asarray([record.step_id for record in records], dtype=np.int64),
+        "action_id": np.asarray(
+            [record.action_id for record in records],
+            dtype=np.int64,
+        ),
         "station_id": np.asarray(
             [record.station_id for record in records],
             dtype=np.int64,
@@ -245,13 +381,27 @@ def _manifest(
     *,
     record_count: int,
     energy_bin_count: int,
+    forward_model_manifest: Mapping[str, object],
+    forward_model_manifest_sha256: str,
+    artifact_hashes: Mapping[str, str],
 ) -> dict[str, object]:
     """Build the public, versioned manifest for one finalized log."""
     return {
         "schema_version": context.schema_version,
-        "upstream_pf_commit": context.upstream_pf_commit,
-        "runtime_config_sha256": context.runtime_config_sha256,
+        "run_id": context.run_id,
+        "repository_commit": context.repository_commit,
+        "resolved_config_sha256": context.runtime_config_sha256,
+        "forward_model_manifest_sha256": forward_model_manifest_sha256,
         "source_rate_model": context.source_rate_model,
+        "source_rate_semantics": context.source_rate_semantics,
+        "model_identifiers": forward_model_manifest["model_identifiers"],
+        "index_conventions": {
+            "record_order": "causal_step_order",
+            "step_id": "zero_based_strictly_increasing",
+            "action_id": "zero_based_unique_measurement_action",
+            "station_id": "zero_based_nondecreasing_station_group",
+        },
+        "artifact_hashes": dict(artifact_hashes),
         "isotopes": list(context.isotopes),
         "environment": context.environment,
         "obstacle_layout_path": context.obstacle_layout_path,
@@ -277,13 +427,37 @@ def save_measurement_log(
     """
     if not isinstance(context, RunContext):
         raise TypeError("context must be a RunContext.")
-    current_config_hash = sha256(canonical_json_bytes(context.runtime_config)).hexdigest()
+    current_config_hash = sha256(
+        canonical_json_bytes(context.runtime_config)
+    ).hexdigest()
     if current_config_hash != context.runtime_config_sha256:
         raise ValueError(
             "RunContext.runtime_config changed after its runtime_config_sha256 was computed."
         )
     record_tuple = tuple(records)
     record_count, bin_count = _validate_records(context, record_tuple)
+    expected_forward_manifest = build_forward_model_manifest(
+        runtime_config=context.runtime_config,
+        environment=context.environment,
+        obstacle_layout_path=context.obstacle_layout_path,
+        isotopes=context.isotopes,
+        repository_commit=str(context.repository_commit),
+        resolved_config_sha256=str(context.runtime_config_sha256),
+        source_rate_model=context.source_rate_model,
+    )
+    if context.forward_model_manifest is None:
+        forward_manifest = expected_forward_manifest
+    else:
+        forward_manifest = validate_forward_model_manifest(
+            context.forward_model_manifest,
+            runtime_config=context.runtime_config,
+            environment=context.environment,
+            obstacle_layout_path=context.obstacle_layout_path,
+            isotopes=context.isotopes,
+            repository_commit=str(context.repository_commit),
+            resolved_config_sha256=str(context.runtime_config_sha256),
+            source_rate_model=context.source_rate_model,
+        )
 
     target = Path(run_dir)
     if target.exists():
@@ -295,18 +469,16 @@ def save_measurement_log(
 
     try:
         _write_bytes(
-            temporary / "run_manifest.json",
-            canonical_json_bytes(
-                _manifest(context, record_count=record_count, energy_bin_count=bin_count)
-            ),
-        )
-        _write_bytes(
             temporary / "runtime_config.resolved.json",
             canonical_json_bytes(context.runtime_config),
         )
         _write_bytes(
             temporary / "environment.json",
             canonical_json_bytes(context.environment),
+        )
+        _write_bytes(
+            temporary / "forward_model_manifest.json",
+            canonical_json_bytes(forward_manifest),
         )
         _write_deterministic_npz(
             temporary / "observations.npz",
@@ -317,6 +489,9 @@ def save_measurement_log(
             (
                 json.dumps(
                     {
+                        "run_id": context.run_id,
+                        "array_index": record_index,
+                        "action_id": record.action_id,
                         "station_id": record.station_id,
                         "step_id": record.step_id,
                         "metadata": record.metadata,
@@ -328,18 +503,39 @@ def save_measurement_log(
                 )
                 + "\n"
             ).encode("utf-8")
-            for record in record_tuple
+            for record_index, record in enumerate(record_tuple)
         )
         _write_bytes(temporary / "observation_metadata.jsonl", metadata_lines)
         _write_bytes(
-            temporary / "upstream_pf_commit.txt",
-            (context.upstream_pf_commit + "\n").encode("utf-8"),
+            temporary / "repository_commit.txt",
+            (str(context.repository_commit) + "\n").encode("utf-8"),
         )
-        if context.truth_sources is not None:
-            _write_bytes(
-                temporary / "truth_sources.json",
-                canonical_json_bytes(list(context.truth_sources)),
-            )
+        artifact_names = (
+            "runtime_config.resolved.json",
+            "environment.json",
+            "forward_model_manifest.json",
+            "observations.npz",
+            "observation_metadata.jsonl",
+            "repository_commit.txt",
+        )
+        artifact_hashes = {
+            name: sha256((temporary / name).read_bytes()).hexdigest()
+            for name in artifact_names
+        }
+        forward_manifest_sha256 = artifact_hashes["forward_model_manifest.json"]
+        _write_bytes(
+            temporary / "run_manifest.json",
+            canonical_json_bytes(
+                _manifest(
+                    context,
+                    record_count=record_count,
+                    energy_bin_count=bin_count,
+                    forward_model_manifest=forward_manifest,
+                    forward_model_manifest_sha256=forward_manifest_sha256,
+                    artifact_hashes=artifact_hashes,
+                )
+            ),
+        )
 
         _fsync_directory(temporary)
         os.replace(temporary, target)
@@ -349,6 +545,50 @@ def save_measurement_log(
             shutil.rmtree(temporary)
         raise
     return target
+
+
+def save_evaluation_truth(
+    evaluation_dir: str | Path,
+    truth_sources: Iterable[Mapping[str, object]],
+    *,
+    overwrite: bool = False,
+) -> Path:
+    """Persist truth in an explicit evaluation directory outside a log root."""
+    normalized = _normalize_truth_sources(truth_sources)
+    if normalized is None:
+        raise ValueError("truth_sources must not be None.")
+    root = Path(evaluation_dir)
+    target = root / _TRUTH_FILENAME
+    root.mkdir(parents=True, exist_ok=True)
+    if target.exists() and not overwrite:
+        raise FileExistsError(f"Evaluation truth already exists: {target}")
+    temporary = root / f".{_TRUTH_FILENAME}.tmp-{os.getpid()}"
+    if temporary.exists():
+        temporary.unlink()
+    try:
+        _write_bytes(temporary, canonical_json_bytes(list(normalized)))
+        os.replace(temporary, target)
+        _fsync_directory(root)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    return target
+
+
+def load_evaluation_truth(evaluation_dir: str | Path) -> tuple[dict[str, object], ...]:
+    """Load evaluation-only truth without exposing it through MeasurementLog."""
+    root = Path(evaluation_dir)
+    canonical = root / _TRUTH_FILENAME
+    legacy = root / _LEGACY_TRUTH_FILENAME
+    target = canonical if canonical.is_file() else legacy
+    if not target.is_file():
+        raise FileNotFoundError(f"Evaluation truth does not exist below {root}.")
+    payload = _read_json(target)
+    if not isinstance(payload, list) or not all(
+        isinstance(item, dict) for item in payload
+    ):
+        raise ValueError(f"{target.name} must contain a JSON array of objects.")
+    return tuple(dict(item) for item in payload)
 
 
 class MeasurementLogRecorder:
@@ -363,7 +603,11 @@ class MeasurementLogRecorder:
     is not lost.
     """
 
-    def __init__(self, run_dir: str | Path, context: RunContext) -> None:
+    def __init__(
+        self,
+        run_dir: str | Path,
+        context: RunContext,
+    ) -> None:
         """Create an empty durable recorder for a target that does not exist."""
         if not isinstance(context, RunContext):
             raise TypeError("context must be a RunContext.")
@@ -388,8 +632,9 @@ class MeasurementLogRecorder:
             canonical_json_bytes(
                 {
                     "schema_version": context.schema_version,
-                    "upstream_pf_commit": context.upstream_pf_commit,
-                    "runtime_config_sha256": context.runtime_config_sha256,
+                    "run_id": context.run_id,
+                    "repository_commit": context.repository_commit,
+                    "resolved_config_sha256": context.runtime_config_sha256,
                     "runtime_config": context.runtime_config,
                     "environment": context.environment,
                     "sim_backend": context.sim_backend,
@@ -398,7 +643,7 @@ class MeasurementLogRecorder:
                     "isotopes": list(context.isotopes),
                     "obstacle_layout_path": context.obstacle_layout_path,
                     "source_layout_path": context.source_layout_path,
-                    "truth_sources": context.truth_sources,
+                    "source_rate_semantics": context.source_rate_semantics,
                     "metadata": context.metadata,
                 }
             ),
@@ -450,6 +695,11 @@ class MeasurementLogRecorder:
                 temporary / "metadata.json",
                 canonical_json_bytes(
                     {
+                        "schema_version": self._context.schema_version,
+                        "run_id": self._context.run_id,
+                        "record_index": len(self._records),
+                        "array_index": len(self._records),
+                        "action_id": record.action_id,
                         "station_id": record.station_id,
                         "step_id": record.step_id,
                         "metadata": record.metadata,
@@ -521,24 +771,72 @@ def _array(
     return np.array(value, copy=True)
 
 
+def _validate_masked_numeric_storage(
+    values: NDArray[np.float64],
+    entry_presence: NDArray[np.bool_],
+    *,
+    name: str,
+    nonnegative: bool,
+) -> None:
+    """Require finite present entries and canonical NaN absent storage."""
+    expanded_presence = np.broadcast_to(entry_presence, values.shape)
+    present_values = values[expanded_presence]
+    absent_values = values[~expanded_presence]
+    if np.any(~np.isfinite(present_values)):
+        raise ValueError(f"observations.npz {name} has non-finite present values.")
+    if nonnegative and np.any(present_values < 0.0):
+        raise ValueError(f"observations.npz {name} has negative present values.")
+    if absent_values.size and np.any(~np.isnan(absent_values)):
+        raise ValueError(
+            f"observations.npz {name} must store NaN exactly where presence is false."
+        )
+
+
 def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
     """Validate and reconstruct a measurement log saved by this module."""
     root = Path(run_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Measurement log directory does not exist: {root}")
-    missing = [name for name in _REQUIRED_FILES if not (root / name).is_file()]
+    content_digest = measurement_log_sha256(root)
+    required_without_commit = tuple(
+        name for name in _REQUIRED_FILES if name != "repository_commit.txt"
+    )
+    missing = [name for name in required_without_commit if not (root / name).is_file()]
+    canonical_commit_path = root / "repository_commit.txt"
+    legacy_commit_path = root / _LEGACY_COMMIT_FILENAME
+    if not canonical_commit_path.is_file() and not legacy_commit_path.is_file():
+        missing.append("repository_commit.txt")
     if missing:
         raise ValueError(f"Measurement log is missing required files: {missing}.")
 
     manifest = _read_json(root / "run_manifest.json")
     runtime_config = _read_json(root / "runtime_config.resolved.json")
     environment = _read_json(root / "environment.json")
+    forward_model_manifest = _read_json(root / "forward_model_manifest.json")
     if not isinstance(manifest, dict):
         raise ValueError("run_manifest.json must contain a JSON object.")
     if not isinstance(runtime_config, dict):
         raise ValueError("runtime_config.resolved.json must contain a JSON object.")
     if not isinstance(environment, dict):
         raise ValueError("environment.json must contain a JSON object.")
+    if not isinstance(forward_model_manifest, dict):
+        raise ValueError("forward_model_manifest.json must contain a JSON object.")
+    if manifest.get("source_layout_path") is not None:
+        raise ValueError(
+            "run_manifest.json source_layout_path must be null for estimator input."
+        )
+    truth_free_manifest = dict(manifest)
+    truth_free_manifest.pop("source_layout_path", None)
+    validate_truth_free_estimator_input(
+        truth_free_manifest,
+        path="run_manifest",
+    )
+    validate_truth_free_estimator_input(runtime_config, path="runtime_config")
+    validate_truth_free_estimator_input(environment, path="environment")
+    validate_truth_free_estimator_input(
+        forward_model_manifest,
+        path="forward_model_manifest",
+    )
 
     schema_version = manifest.get("schema_version")
     if schema_version != MEASUREMENT_LOG_SCHEMA_VERSION:
@@ -546,30 +844,101 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
             f"Unsupported measurement-log schema_version {schema_version!r}; "
             f"expected {MEASUREMENT_LOG_SCHEMA_VERSION}."
         )
-    expected_hash = str(manifest.get("runtime_config_sha256", ""))
-    actual_hash = sha256((root / "runtime_config.resolved.json").read_bytes()).hexdigest()
+    expected_hash = str(
+        manifest.get(
+            "resolved_config_sha256",
+            manifest.get("runtime_config_sha256", ""),
+        )
+    )
+    actual_hash = sha256(
+        (root / "runtime_config.resolved.json").read_bytes()
+    ).hexdigest()
     if actual_hash != expected_hash:
-        raise ValueError("runtime_config.resolved.json does not match runtime_config_sha256.")
+        raise ValueError(
+            "runtime_config.resolved.json does not match resolved_config_sha256."
+        )
     if manifest.get("environment") != environment:
         raise ValueError("environment.json does not match the run manifest.")
 
-    upstream_commit = (root / "upstream_pf_commit.txt").read_text(encoding="utf-8").strip()
-    if upstream_commit != manifest.get("upstream_pf_commit"):
-        raise ValueError("upstream_pf_commit.txt does not match the run manifest.")
+    commit_path = (
+        canonical_commit_path if canonical_commit_path.is_file() else legacy_commit_path
+    )
+    repository_commit = commit_path.read_text(encoding="utf-8").strip()
+    manifest_commit = manifest.get(
+        "repository_commit",
+        manifest.get("upstream_pf_commit"),
+    )
+    if repository_commit != manifest_commit:
+        raise ValueError(f"{commit_path.name} does not match the run manifest.")
 
-    truth_sources = None
-    truth_path = root / "truth_sources.json"
-    if truth_path.exists():
-        truth_payload = _read_json(truth_path)
-        if not isinstance(truth_payload, list) or not all(
-            isinstance(item, dict) for item in truth_payload
-        ):
-            raise ValueError("truth_sources.json must contain a list of objects.")
-        truth_sources = tuple(dict(item) for item in truth_payload)
+    run_id = manifest.get("run_id")
+    if not isinstance(run_id, str) or not run_id.strip():
+        raise ValueError("run_manifest.json run_id must be a non-empty string.")
+    source_rate_semantics = manifest.get("source_rate_semantics")
+    if source_rate_semantics != SOURCE_RATE_SEMANTICS:
+        raise ValueError("run_manifest.json source_rate_semantics is incompatible.")
+    forward_manifest_digest = sha256(
+        (root / "forward_model_manifest.json").read_bytes()
+    ).hexdigest()
+    if forward_manifest_digest != manifest.get("forward_model_manifest_sha256"):
+        raise ValueError(
+            "forward_model_manifest.json does not match forward_model_manifest_sha256."
+        )
+
+    artifact_hashes = manifest.get("artifact_hashes")
+    if not isinstance(artifact_hashes, dict):
+        raise ValueError("run_manifest.json artifact_hashes must be an object.")
+    required_artifact_names = {
+        name for name in required_without_commit if name != "run_manifest.json"
+    } | {commit_path.name}
+    actual_artifact_names = {
+        path.relative_to(root).as_posix()
+        for path in root.rglob("*")
+        if path.is_file() and path.name != "run_manifest.json"
+    }
+    if not required_artifact_names.issubset(actual_artifact_names):
+        raise ValueError("Measurement log is missing a required hashed artifact.")
+    if set(artifact_hashes) != actual_artifact_names:
+        raise ValueError(
+            "run_manifest.json artifact_hashes must name every estimator input artifact."
+        )
+    for artifact_name in sorted(actual_artifact_names):
+        digest = sha256((root / artifact_name).read_bytes()).hexdigest()
+        if artifact_hashes.get(artifact_name) != digest:
+            raise ValueError(
+                f"Measurement-log artifact {artifact_name!r} does not match its SHA-256."
+            )
+
+    validated_forward_manifest = validate_forward_model_manifest(
+        forward_model_manifest,
+        runtime_config=runtime_config,
+        environment=environment,
+        obstacle_layout_path=manifest.get("obstacle_layout_path"),
+        isotopes=tuple(manifest.get("isotopes", ())),
+        repository_commit=repository_commit,
+        resolved_config_sha256=expected_hash,
+        source_rate_model=str(manifest.get("source_rate_model", "")),
+        run_root=root,
+    )
+    if manifest.get("model_identifiers") != validated_forward_manifest.get(
+        "model_identifiers"
+    ):
+        raise ValueError(
+            "run_manifest.json model_identifiers do not match the forward-model manifest."
+        )
+    index_conventions = manifest.get("index_conventions")
+    expected_index_conventions = {
+        "record_order": "causal_step_order",
+        "step_id": "zero_based_strictly_increasing",
+        "action_id": "zero_based_unique_measurement_action",
+        "station_id": "zero_based_nondecreasing_station_group",
+    }
+    if index_conventions != expected_index_conventions:
+        raise ValueError("run_manifest.json index_conventions are incompatible.")
 
     try:
         context = RunContext(
-            upstream_pf_commit=upstream_commit,
+            repository_commit=repository_commit,
             runtime_config=runtime_config,
             environment=environment,
             sim_backend=str(manifest["sim_backend"]),
@@ -578,8 +947,10 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
             obstacle_layout_path=manifest.get("obstacle_layout_path"),
             source_layout_path=manifest.get("source_layout_path"),
             source_rate_model=str(manifest["source_rate_model"]),
-            truth_sources=truth_sources,
             metadata=dict(manifest.get("metadata", {})),
+            run_id=run_id,
+            source_rate_semantics=dict(source_rate_semantics),
+            forward_model_manifest=validated_forward_manifest,
             runtime_config_sha256=expected_hash,
             schema_version=int(schema_version),
         )
@@ -600,8 +971,39 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
         raise ValueError("Could not read a valid observations.npz archive.") from exc
 
+    expected_array_names = {
+        "step_id",
+        "action_id",
+        "station_id",
+        "detector_pose_xyz",
+        "detector_quat_wxyz",
+        "fe_orientation_index",
+        "pb_orientation_index",
+        "live_time_s",
+        "travel_time_s",
+        "shield_actuation_time_s",
+        "energy_bin_edges_keV",
+        "spectrum_counts",
+        "spectrum_variance",
+        "spectrum_variance_present",
+        "isotope_counts",
+        "isotope_counts_present",
+        "isotope_counts_record_present",
+        "isotope_count_covariance",
+        "isotope_count_covariance_present",
+        "isotope_count_covariance_record_present",
+    }
+    if set(archive) != expected_array_names:
+        missing_arrays = sorted(expected_array_names - set(archive))
+        extra_arrays = sorted(set(archive) - expected_array_names)
+        raise ValueError(
+            "observations.npz schema mismatch; "
+            f"missing={missing_arrays}, extra={extra_arrays}."
+        )
+
     isotope_count = len(context.isotopes)
     step_ids = _array(archive, "step_id", shape=(record_count,), dtype=np.int64)
+    action_ids = _array(archive, "action_id", shape=(record_count,), dtype=np.int64)
     station_ids = _array(archive, "station_id", shape=(record_count,), dtype=np.int64)
     poses = _array(
         archive,
@@ -705,10 +1107,40 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
         shape=(record_count,),
         dtype=np.bool_,
     )
+    _validate_masked_numeric_storage(
+        variances,
+        variance_present[:, None],
+        name="spectrum_variance",
+        nonnegative=True,
+    )
+    _validate_masked_numeric_storage(
+        isotope_counts,
+        isotope_counts_present,
+        name="isotope_counts",
+        nonnegative=True,
+    )
+    _validate_masked_numeric_storage(
+        isotope_covariances,
+        isotope_covariance_present,
+        name="isotope_count_covariance",
+        nonnegative=False,
+    )
+    if np.any(np.any(isotope_counts_present, axis=1) != isotope_counts_record_present):
+        raise ValueError(
+            "isotope_counts_record_present does not match per-entry presence masks."
+        )
+    covariance_row_presence = np.any(
+        isotope_covariance_present,
+        axis=(1, 2),
+    )
+    if np.any(covariance_row_presence != isotope_covariance_record_present):
+        raise ValueError(
+            "isotope_count_covariance_record_present does not match entry masks."
+        )
 
-    metadata_lines = (root / "observation_metadata.jsonl").read_text(
-        encoding="utf-8"
-    ).splitlines()
+    metadata_lines = (
+        (root / "observation_metadata.jsonl").read_text(encoding="utf-8").splitlines()
+    )
     if len(metadata_lines) != record_count:
         raise ValueError(
             "observation_metadata.jsonl line count does not match record_count."
@@ -721,16 +1153,45 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
             raise ValueError(
                 f"observation_metadata.jsonl line {index + 1} is invalid JSON."
             ) from exc
-        if not isinstance(payload, dict) or not isinstance(payload.get("metadata"), dict):
+        if not isinstance(payload, dict) or not isinstance(
+            payload.get("metadata"), dict
+        ):
             raise ValueError(
                 f"observation_metadata.jsonl line {index + 1} has an invalid payload."
             )
+        expected_metadata_fields = {
+            "action_id",
+            "array_index",
+            "metadata",
+            "run_id",
+            "station_id",
+            "step_id",
+        }
+        if set(payload) != expected_metadata_fields:
+            raise ValueError(
+                "observation_metadata.jsonl lines must contain exactly "
+                f"{sorted(expected_metadata_fields)}."
+            )
+        validate_truth_free_estimator_input(
+            payload["metadata"],
+            path=f"observation_metadata[{index}].metadata",
+        )
         if payload.get("step_id") != int(step_ids[index]) or payload.get(
             "station_id"
         ) != int(station_ids[index]):
             raise ValueError(
                 "observation_metadata.jsonl identifiers do not match observations.npz."
             )
+        canonical_metadata = {
+            "run_id": context.run_id,
+            "array_index": index,
+            "action_id": int(action_ids[index]),
+        }
+        for name, expected_value in canonical_metadata.items():
+            if payload.get(name) != expected_value:
+                raise ValueError(
+                    f"observation_metadata.jsonl line {index + 1} {name} is incompatible."
+                )
         metadata_by_record.append(dict(payload["metadata"]))
 
     records: list[MeasurementRecord] = []
@@ -766,10 +1227,9 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
             MeasurementRecord(
                 station_id=int(station_ids[record_index]),
                 step_id=int(step_ids[record_index]),
+                action_id=int(action_ids[record_index]),
                 detector_pose_xyz=tuple(float(v) for v in poses[record_index]),
-                detector_quat_wxyz=tuple(
-                    float(v) for v in quaternions[record_index]
-                ),
+                detector_quat_wxyz=tuple(float(v) for v in quaternions[record_index]),
                 fe_orientation_index=int(fe_indices[record_index]),
                 pb_orientation_index=int(pb_indices[record_index]),
                 live_time_s=float(live_times[record_index]),
@@ -789,4 +1249,8 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
         )
 
     _validate_records(context, tuple(records))
-    return MeasurementLog(context=context, records=tuple(records))
+    return MeasurementLog(
+        context=context,
+        records=tuple(records),
+        content_sha256=content_digest,
+    )

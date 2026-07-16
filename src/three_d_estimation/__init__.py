@@ -1,6 +1,12 @@
 """Standalone surface maximum-likelihood radiation estimation."""
 
 from .config import MLEConfig, build_default_config
+from .conformance import (
+    ForwardConformanceResult,
+    compute_forward_conformance,
+    load_forward_conformance_axes,
+    save_forward_conformance,
+)
 from .estimator import SurfaceMLEEstimator, fit_surface_mle
 from .estimator_backend import SurfaceMLEBackend
 from .observation_batch import (
@@ -50,6 +56,7 @@ __all__ = [
     "SurfacePatch",
     "SurfacePatchSet",
     "CountResponseMatrices",
+    "ForwardConformanceResult",
     "SpectralResponseResult",
     "build_count_response",
     "build_count_responses",
@@ -61,6 +68,8 @@ __all__ = [
     "evaluate_surface_map_objective",
     "fit_surface_map_poisson",
     "fit_surface_mle",
+    "compute_forward_conformance",
+    "load_forward_conformance_axes",
     "load_mle_estimate",
     "observation_batch_from_log",
     "observation_batch_from_records",
@@ -68,4 +77,5 @@ __all__ = [
     "run_replay",
     "refine_surface_patches",
     "save_mle_estimate",
+    "save_forward_conformance",
 ]

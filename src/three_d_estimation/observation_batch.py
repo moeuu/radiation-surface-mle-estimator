@@ -12,6 +12,27 @@ from runtime.records import MeasurementRecord
 from .types import ObservationBatch
 
 
+def _shield_program_block_id(record: MeasurementRecord) -> str:
+    """Return an explicit shield-program block ID or the station fallback."""
+    for key in (
+        "shield_program_block_id",
+        "shield_program_id",
+        "shield_block_id",
+    ):
+        value = record.metadata.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (str, int, np.integer)):
+            raise ValueError(
+                f"MeasurementRecord metadata {key} must be a string or integer."
+            )
+        normalized = str(value).strip()
+        if not normalized:
+            raise ValueError(f"MeasurementRecord metadata {key} must be non-empty.")
+        return normalized
+    return f"station:{record.station_id}"
+
+
 def _stack_optional_spectrum_variances(
     records: Sequence[MeasurementRecord],
 ) -> np.ndarray | None:
@@ -20,7 +41,9 @@ def _stack_optional_spectrum_variances(
     if not any(present):
         return None
     if not all(present):
-        raise ValueError("All records must either contain spectrum variance or omit it.")
+        raise ValueError(
+            "All records must either contain spectrum variance or omit it."
+        )
     return np.vstack([record.spectrum_variance for record in records])
 
 
@@ -55,7 +78,9 @@ def _stack_isotope_covariances(
     if not any(present):
         return None
     if not all(present):
-        raise ValueError("All records must either contain isotope covariance or omit it.")
+        raise ValueError(
+            "All records must either contain isotope covariance or omit it."
+        )
     expected = set(isotope_names)
     matrices: list[np.ndarray] = []
     for index, record in enumerate(records):
@@ -90,7 +115,10 @@ def observation_batch_from_records(
         raise TypeError("records must contain only MeasurementRecord objects.")
     names = tuple(str(value) for value in isotope_names)
     first_edges = rows[0].energy_bin_edges_keV
-    if any(not np.array_equal(record.energy_bin_edges_keV, first_edges) for record in rows[1:]):
+    if any(
+        not np.array_equal(record.energy_bin_edges_keV, first_edges)
+        for record in rows[1:]
+    ):
         raise ValueError("All records must use identical energy-bin edges.")
     return ObservationBatch(
         detector_positions_xyz=np.asarray(
@@ -113,6 +141,19 @@ def observation_batch_from_records(
         isotope_covariances=_stack_isotope_covariances(rows, names),
         station_ids=np.asarray([record.station_id for record in rows], dtype=np.int64),
         isotope_names=names,
+        step_ids=np.asarray([record.step_id for record in rows], dtype=np.int64),
+        action_ids=np.asarray([record.action_id for record in rows], dtype=np.int64),
+        travel_times_s=np.asarray(
+            [record.travel_time_s for record in rows],
+            dtype=float,
+        ),
+        shield_actuation_times_s=np.asarray(
+            [record.shield_actuation_time_s for record in rows],
+            dtype=float,
+        ),
+        shield_program_block_ids=tuple(
+            _shield_program_block_id(record) for record in rows
+        ),
     )
 
 
@@ -141,7 +182,9 @@ def subset_observation_batch(
         live_times_s=batch.live_times_s[selected],
         spectrum_counts=batch.spectrum_counts[selected],
         spectrum_variances=(
-            None if batch.spectrum_variances is None else batch.spectrum_variances[selected]
+            None
+            if batch.spectrum_variances is None
+            else batch.spectrum_variances[selected]
         ),
         energy_bin_edges_keV=batch.energy_bin_edges_keV,
         isotope_counts=(
@@ -154,4 +197,11 @@ def subset_observation_batch(
         ),
         station_ids=batch.station_ids[selected],
         isotope_names=batch.isotope_names,
+        step_ids=batch.step_ids[selected],
+        action_ids=batch.action_ids[selected],
+        travel_times_s=batch.travel_times_s[selected],
+        shield_actuation_times_s=batch.shield_actuation_times_s[selected],
+        shield_program_block_ids=tuple(
+            batch.shield_program_block_ids[int(index)] for index in selected
+        ),
     )

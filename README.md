@@ -89,16 +89,17 @@ uv run python main.py \
 
 `--geant4-cui` uses the checked-in `configs/geant4/variance_reduction_external_no_isaac_32threads.json` configuration and auto-starts `build/geant4_sidecar`. Running `main.py` without a mode also defaults to `geant4-cui`, but the explicit flag is recommended in scripts.
 
-Each observation is finalized after adaptive-dwell merging and spectrum processing, then durably staged before the local live-estimator update. On successful completion the staging data is consolidated and atomically published. The log contains raw spectra, processed isotope counts and covariance when available, detector and shield state, timing, resolved runtime/environment data, optional truth for evaluation, and snapshot provenance. See [measurement-log format](docs/mle/measurement_log.md) for the exact schema and failure behavior.
+Each observation is finalized after adaptive-dwell merging and spectrum processing, then durably staged before the local live-estimator update. On successful completion the staging data is consolidated and atomically published. The log contains raw spectra, processed isotope counts and covariance when available, detector and shield state, timing, resolved runtime/environment data, forward-model identity, and repository provenance. Truth is stored only in a separate evaluation directory. See [measurement-log format](docs/mle/measurement_log.md) for the exact schema and failure behavior.
 
 ## Replay with surface MLE
 
-The installed CLI has three subcommands:
+The installed CLI has four subcommands:
 
 ```text
 estimate-radiation-mle replay
 estimate-radiation-mle fit-spectrum
 estimate-radiation-mle report
+estimate-radiation-mle forward-conformance
 ```
 
 ### Count-domain replay
@@ -142,6 +143,21 @@ uv run estimate-radiation-mle report \
 
 `report` validates and summarizes an existing result; it does not refit the data.
 
+### Generate forward-response conformance output
+
+The provider-neutral axes exercise three isotopes, three detector poses, all 64
+Fe/Pb pairs, four source surfaces, and two obstacle conditions:
+
+```bash
+uv run estimate-radiation-mle forward-conformance \
+  --axes fixtures/forward_response_conformance.json \
+  --output results/mle_forward_response.npz
+```
+
+The deterministic NPZ contains exactly `case_ids` and `unit_response` for 4,608
+unit-strength cases. The versioned manifest registry is accepted only because
+this local implementation is bound by that full numerical conformance test.
+
 ## Model in brief
 
 The environment is tiled into exact rectangular floor, ceiling, wall, obstacle-top, and exposed obstacle-side patches. Covered floor areas and internal obstacle faces are excluded. Each patch carries exact vertices and area, one-point centroid or four-point Gauss quadrature, a stable ID, and physical shared-edge adjacency.
@@ -165,7 +181,7 @@ The convex objective combines Poisson negative log likelihood with optional:
 
 Optional coarse-to-fine levels refine strong patches into four children and transfer density as a warm start. The default debias stage selects support from the regularized map, fixes all other response columns to zero, and refits without L1, TV, or group shrinkage.
 
-Diagnostics include objective terms and history, convergence changes, KKT residual, Poisson deviance, full residuals, optional deterministic held-out deviance, response rank/conditioning/correlation checks, and connected surface hotspot clusters.
+Diagnostics include objective terms and history, convergence changes, KKT residual, Poisson deviance, full residuals, grouped held-out deviance, response rank/conditioning/correlation checks, connected surface hotspot clusters, and complete estimator/log/config provenance. Held-out grouping defaults to whole stations and can instead preserve same-XY height stacks or shield-program blocks; individual-row splitting is explicit diagnostic mode only.
 
 ## CPU and GPU
 

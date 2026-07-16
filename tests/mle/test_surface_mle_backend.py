@@ -39,7 +39,7 @@ def _context(
             "blocked_cells": [[2, 3]],
         }
     return RunContext(
-        upstream_pf_commit="standalone-snapshot",
+        repository_commit="standalone-snapshot",
         runtime_config={
             "source_rate_model": "detector_cps_1m",
             "pf_line_resolved_shield_attenuation": False,

@@ -1,0 +1,43 @@
+{
+  "candidate_isotopes": [
+    "Cs-137",
+    "Co-60",
+    "Eu-154"
+  ],
+  "detector_model": {
+    "crystal_radius_m": 0.038,
+    "housing_thickness_m": 0.0015
+  },
+  "detector_model_id": "shared_small_detector.v1",
+  "fe_shield_thickness_cm": 1.0,
+  "measurement_design": "fixed_same_log",
+  "obstacle_height_m": 1.2,
+  "obstacle_model_id": "shared_small_box_grid.v1",
+  "pb_shield_thickness_cm": 0.5,
+  "pf_buildup": {
+    "fe_coeff": 0.0,
+    "obstacle_coeff": 0.0,
+    "pb_coeff": 0.0
+  },
+  "pf_detector_aperture_radius_m": 0.0,
+  "pf_detector_aperture_samples": 1,
+  "pf_detector_count_radius_m": 0.0,
+  "pf_line_resolved_shield_attenuation": true,
+  "pf_obstacle_mu_by_isotope": {
+    "Co-60": 0.0,
+    "Cs-137": 0.0,
+    "Eu-154": 0.0
+  },
+  "random_seed": 20260716,
+  "shield_model_id": "shared_small_fe_pb_octants.v1",
+  "sim_backend": "analytic_conformance",
+  "source_rate_model": "detector_cps_1m",
+  "source_rate_semantics": {
+    "normalization_distance_m": 1.0,
+    "quantity": "expected_net_detector_count_rate",
+    "unit": "cps"
+  },
+  "spectrum_count_method": "response_poisson",
+  "spectrum_model_id": "shared_small_line_response.v1",
+  "transport_model_id": "shared_small_continuous_kernel.v1"
+}

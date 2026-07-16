@@ -22,18 +22,19 @@ estimate-radiation = "three_d_estimation.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = [
-  "cui_runtime",
-  "evaluation_metrics",
-  "mission_control",
-  "piplup_notify",
-  "realtime_demo",
-  "runtime_defaults",
-  "runtime_environment",
-]
+py-modules = []
 
 [tool.setuptools.packages.find]
 where = ["src"]
+include = [
+  "counts*",
+  "measurement*",
+  "runtime*",
+  "sim*",
+  "spectrum*",
+  "three_d_estimation*",
+]
+exclude = ["pf", "pf.*", "planning", "planning.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -11,8 +13,9 @@ import numpy as np
 
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.observation_model import RuntimeObservationModel
+from runtime.forward_model_manifest import build_forward_model_manifest
 from runtime.measurement_log import save_measurement_log
-from runtime.records import MeasurementRecord, RunContext
+from runtime.records import MeasurementRecord, RunContext, canonical_json_bytes
 from three_d_estimation.config import MLEConfig
 from three_d_estimation.replay import prepare_replay, run_replay
 
@@ -47,7 +50,7 @@ def _write_log(
 ) -> Path:
     """Write a minimal versioned replay log below a temporary root."""
     context = RunContext(
-        upstream_pf_commit="standalone-snapshot",
+        repository_commit="standalone-snapshot",
         runtime_config={
             "source_rate_model": source_rate_model,
             "pf_line_resolved_shield_attenuation": False,
@@ -75,6 +78,39 @@ def _config() -> MLEConfig:
         max_iterations=2,
         debias_refit=False,
     )
+
+
+def _bind_run_local_obstacle(run_dir: Path, relative_path: str) -> None:
+    """Rebuild manifest hashes after packaging one run-local obstacle asset."""
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    runtime_config = json.loads(
+        (run_dir / "runtime_config.resolved.json").read_text(encoding="utf-8")
+    )
+    environment = json.loads(
+        (run_dir / "environment.json").read_text(encoding="utf-8")
+    )
+    forward = build_forward_model_manifest(
+        runtime_config=runtime_config,
+        environment=environment,
+        obstacle_layout_path=relative_path,
+        isotopes=tuple(manifest["isotopes"]),
+        repository_commit=str(manifest["repository_commit"]),
+        resolved_config_sha256=str(manifest["resolved_config_sha256"]),
+        source_rate_model=str(manifest["source_rate_model"]),
+        run_root=run_dir,
+    )
+    forward_path = run_dir / "forward_model_manifest.json"
+    forward_path.write_bytes(canonical_json_bytes(forward))
+    manifest["obstacle_layout_path"] = relative_path
+    manifest["model_identifiers"] = forward["model_identifiers"]
+    forward_digest = sha256(forward_path.read_bytes()).hexdigest()
+    manifest["forward_model_manifest_sha256"] = forward_digest
+    manifest["artifact_hashes"]["forward_model_manifest.json"] = forward_digest
+    manifest["artifact_hashes"][relative_path] = sha256(
+        (run_dir / relative_path).read_bytes()
+    ).hexdigest()
+    manifest_path.write_bytes(canonical_json_bytes(manifest))
 
 
 class ReplayContextTests(unittest.TestCase):
@@ -108,7 +144,7 @@ class ReplayContextTests(unittest.TestCase):
         """A relative layout persisted beside a run should be replayed in place."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            run_dir = _write_log(root, obstacle_layout_path="assets/layout.json")
+            run_dir = _write_log(root)
             layout = run_dir / "assets" / "layout.json"
             layout.parent.mkdir(parents=True)
             layout.write_text(
@@ -120,6 +156,7 @@ class ReplayContextTests(unittest.TestCase):
 }\n""",
                 encoding="utf-8",
             )
+            _bind_run_local_obstacle(run_dir, "assets/layout.json")
 
             replay = prepare_replay(run_dir, config=_config())
 
@@ -145,29 +182,26 @@ class ReplayContextTests(unittest.TestCase):
         """Persisted layouts must never escape the run or local asset root."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            absolute_run = _write_log(
-                root / "absolute",
-                obstacle_layout_path=str(root / "outside.json"),
-            )
             with self.assertRaisesRegex(ValueError, "absolute paths are forbidden"):
-                prepare_replay(absolute_run, config=_config())
+                _write_log(
+                    root / "absolute",
+                    obstacle_layout_path=str(root / "outside.json"),
+                )
 
-            traversal_run = _write_log(
-                root / "traversal",
-                obstacle_layout_path="../outside.json",
-            )
             with self.assertRaisesRegex(ValueError, "parent-directory traversal"):
-                prepare_replay(traversal_run, config=_config())
+                _write_log(
+                    root / "traversal",
+                    obstacle_layout_path="../outside.json",
+                )
 
     def test_wrong_source_rate_semantics_are_rejected_before_fit(self) -> None:
         """Replay must never reinterpret gamma-rate input as detector cps at 1 m."""
         with tempfile.TemporaryDirectory() as temporary:
-            run_dir = _write_log(
-                Path(temporary),
-                source_rate_model="gamma_per_second",
-            )
             with self.assertRaisesRegex(ValueError, "source_rate_model"):
-                prepare_replay(run_dir, config=_config())
+                _write_log(
+                    Path(temporary),
+                    source_rate_model="gamma_per_second",
+                )
 
     def test_run_replay_invokes_estimator_and_optional_save_hook(self) -> None:
         """run_replay should fit resolved objects and pass results to a save hook."""

@@ -1,0 +1,114 @@
+{
+  "line_mu_by_isotope": {
+    "Co-60": [
+      {
+        "energy_keV": 1173.0,
+        "fe": 0.436679542,
+        "pb": 0.7091591472,
+        "weight": 0.5
+      },
+      {
+        "energy_keV": 1332.0,
+        "fe": 0.4089900488,
+        "pb": 0.6420127392,
+        "weight": 0.5
+      }
+    ],
+    "Cs-137": [
+      {
+        "energy_keV": 662.0,
+        "fe": 0.5817858149999999,
+        "pb": 1.28832606,
+        "weight": 1.0
+      }
+    ],
+    "Eu-154": [
+      {
+        "energy_keV": 723.3,
+        "fe": 0.55754365725,
+        "pb": 1.162852929,
+        "weight": 0.24752475247524752
+      },
+      {
+        "energy_keV": 873.2,
+        "fe": 0.5069331432,
+        "pb": 0.9324782208,
+        "weight": 0.13861386138613863
+      },
+      {
+        "energy_keV": 996.3,
+        "fe": 0.4728314888000001,
+        "pb": 0.8090758872000001,
+        "weight": 0.13861386138613863
+      },
+      {
+        "energy_keV": 1274.5,
+        "fe": 0.4174432158,
+        "pb": 0.6590703672,
+        "weight": 0.44554455445544555
+      },
+      {
+        "energy_keV": 1494.0,
+        "fe": 0.3851741696,
+        "pb": 0.5939547264,
+        "weight": 0.009900990099009901
+      },
+      {
+        "energy_keV": 1596.5,
+        "fe": 0.3749052362,
+        "pb": 0.5786929008,
+        "weight": 0.019801980198019802
+      }
+    ]
+  },
+  "model_identifiers": {
+    "detector": {
+      "id": "shared_small_detector.v1",
+      "sha256": "c22e5c1c3feee1d4eca9f3fbab7adf3b6d670d8ad82c40f9dc84cfd1f9a65924"
+    },
+    "environment": {
+      "id": "shared_small_room_6x6x3.v1",
+      "sha256": "780c2763d1815f6468c722eb747de0161fd94165eebe39c5d5b723332f54d494"
+    },
+    "obstacle": {
+      "id": "shared_small_box_grid.v1",
+      "sha256": "68ba8aa0fb7aca77f04d47087ff5ec7926db650a8bccb691669141690a608ad0"
+    },
+    "shield": {
+      "id": "shared_small_fe_pb_octants.v1",
+      "sha256": "c5e24ded41d8f15b59cbcb08d37c41d281a3867aa39e5fde4bf1bfb6004160f3"
+    },
+    "spectrum": {
+      "id": "shared_small_line_response.v1",
+      "sha256": "49cc8ee41dea713ed6dcae459d676ffe78e6b70cacbfea2eba6df2eb732ace73"
+    },
+    "transport": {
+      "id": "shared_small_continuous_kernel.v1",
+      "sha256": "65090091e435e279dc98bf5d2fae0689720fdf41dfd0bf53e28fff807f037982"
+    }
+  },
+  "repository_commit": "87961934add7aec893f41782e7488ddc50f2c636",
+  "resolved_config_sha256": "164c9254f7482edfe9a1c0ecc361d8b7350812e323d8480b748307428608ff1e",
+  "response_semantics": {
+    "detector_geometry": "model_identifier_bound",
+    "distance_attenuation": "inverse_square_with_modelled_near_field",
+    "line_resolved_response": "energy_bin_integrated_isotope_line_response",
+    "live_time_scaling": "expected_counts_linear_in_live_time_s",
+    "obstacle_attenuation": "line_segment_material_attenuation",
+    "shield_attenuation": "fe_pb_orientation_pair_8x8"
+  },
+  "schema_version": 1,
+  "source_rate_model": "detector_cps_1m",
+  "source_rate_semantics": {
+    "normalization_distance_m": 1.0,
+    "quantity": "expected_net_detector_count_rate",
+    "unit": "cps"
+  },
+  "units": {
+    "distance": "m",
+    "energy": "keV",
+    "linear_attenuation": "cm^-1",
+    "source_strength": "detector_cps_1m",
+    "time": "s"
+  }
+}

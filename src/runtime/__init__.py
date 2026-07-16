@@ -13,7 +13,10 @@ from runtime.estimator_backend import (
 from runtime.measurement_log import (
     MeasurementLog,
     MeasurementLogRecorder,
+    load_evaluation_truth,
     load_measurement_log,
+    measurement_log_sha256,
+    save_evaluation_truth,
     save_measurement_log,
 )
 from runtime.records import (
@@ -41,7 +44,10 @@ __all__ = [
     "StationCompleteEstimatorBackend",
     "SurfaceMapSnapshot",
     "canonical_json_sha256",
+    "load_evaluation_truth",
     "load_measurement_log",
+    "measurement_log_sha256",
     "measurement_record_from_observation",
+    "save_evaluation_truth",
     "save_measurement_log",
 ]

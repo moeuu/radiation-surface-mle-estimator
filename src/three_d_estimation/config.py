@@ -47,6 +47,13 @@ class MLEConfig:
     cluster_threshold_fraction: float = 0.1
     cluster_min_strength_cps_1m: float = 0.0
     held_out_fraction: float = 0.0
+    held_out_grouping: Literal[
+        "station_id",
+        "same_xy_height",
+        "shield_program_block",
+        "row",
+    ] = "station_id"
+    held_out_xy_tolerance_m: float = 1.0e-6
     random_seed: int = 0
 
     def __post_init__(self) -> None:
@@ -54,11 +61,19 @@ class MLEConfig:
         if self.mode not in {"count", "spectral"}:
             raise ValueError("mode must be 'count' or 'spectral'.")
         names = tuple(str(value).strip() for value in self.isotope_names)
-        if not names or any(not value for value in names) or len(set(names)) != len(names):
+        if (
+            not names
+            or any(not value for value in names)
+            or len(set(names)) != len(names)
+        ):
             raise ValueError("isotope_names must contain unique non-empty names.")
         spacing = tuple(float(value) for value in self.patch_spacing_m)
-        if len(spacing) != 3 or any(not np.isfinite(value) or value <= 0.0 for value in spacing):
-            raise ValueError("patch_spacing_m must contain three finite positive values.")
+        if len(spacing) != 3 or any(
+            not np.isfinite(value) or value <= 0.0 for value in spacing
+        ):
+            raise ValueError(
+                "patch_spacing_m must contain three finite positive values."
+            )
         if int(self.quadrature_order) not in {1, 4}:
             raise ValueError("quadrature_order must be 1 or 4.")
         nonnegative = {
@@ -76,9 +91,12 @@ class MLEConfig:
             "cluster_threshold_fraction": self.cluster_threshold_fraction,
             "cluster_min_strength_cps_1m": self.cluster_min_strength_cps_1m,
             "held_out_fraction": self.held_out_fraction,
+            "held_out_xy_tolerance_m": self.held_out_xy_tolerance_m,
         }
         if any(not np.isfinite(value) or value < 0.0 for value in nonnegative.values()):
-            raise ValueError("MLE weights, tolerances, and fractions must be finite and non-negative.")
+            raise ValueError(
+                "MLE weights, tolerances, and fractions must be finite and non-negative."
+            )
         if int(self.max_iterations) < 1 or int(self.check_interval) < 1:
             raise ValueError("Iteration counts must be positive.")
         if int(self.response_chunk_size) < 1:
@@ -92,9 +110,26 @@ class MLEConfig:
         if not 0.0 <= float(self.refinement_fraction) <= 1.0:
             raise ValueError("refinement_fraction must lie between zero and one.")
         if not 0.0 <= float(self.response_correlation_threshold) <= 1.0:
-            raise ValueError("response_correlation_threshold must lie between zero and one.")
+            raise ValueError(
+                "response_correlation_threshold must lie between zero and one."
+            )
         if not 0.0 <= float(self.held_out_fraction) < 1.0:
             raise ValueError("held_out_fraction must lie in [0, 1).")
+        if self.held_out_grouping not in {
+            "station_id",
+            "same_xy_height",
+            "shield_program_block",
+            "row",
+        }:
+            raise ValueError(
+                "held_out_grouping must be station_id, same_xy_height, "
+                "shield_program_block, or row."
+            )
+        if (
+            not np.isfinite(self.held_out_xy_tolerance_m)
+            or float(self.held_out_xy_tolerance_m) <= 0.0
+        ):
+            raise ValueError("held_out_xy_tolerance_m must be finite and positive.")
         if int(self.coarse_to_fine_levels) < 0:
             raise ValueError("coarse_to_fine_levels must be non-negative.")
         if self.gpu_dtype not in {"float32", "float64"}:
@@ -114,7 +149,9 @@ class MLEConfig:
                 raw_spacing = (float(raw_spacing),) * 3
             values["patch_spacing_m"] = tuple(float(value) for value in raw_spacing)
         if "isotope_names" in values:
-            values["isotope_names"] = tuple(str(value) for value in values["isotope_names"])
+            values["isotope_names"] = tuple(
+                str(value) for value in values["isotope_names"]
+            )
         return cls(**values)
 
     @classmethod
@@ -134,7 +171,10 @@ class MLEConfig:
         """Write deterministic JSON configuration output."""
         target = Path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        target.write_text(
+            json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
 
 
 def build_default_config(
@@ -143,5 +183,9 @@ def build_default_config(
     isotopes: Sequence[str] | None = None,
 ) -> MLEConfig:
     """Return a default configuration for programmatic callers."""
-    names = MLEConfig().isotope_names if isotopes is None else tuple(str(value) for value in isotopes)
+    names = (
+        MLEConfig().isotope_names
+        if isotopes is None
+        else tuple(str(value) for value in isotopes)
+    )
     return MLEConfig(mode=mode, isotope_names=names)

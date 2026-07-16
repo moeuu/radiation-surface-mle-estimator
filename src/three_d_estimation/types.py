@@ -184,7 +184,9 @@ class SurfacePatch:
         if quadrature_points.ndim != 2 or quadrature_points.shape[1] != 3:
             raise ValueError("quadrature_points_xyz must have shape (Q, 3).")
         if quadrature_points.shape[0] not in {1, 4}:
-            raise ValueError("Each rectangular patch must use 1 or 4 quadrature points.")
+            raise ValueError(
+                "Each rectangular patch must use 1 or 4 quadrature points."
+            )
         quadrature_weights = _readonly_float_array(
             self.quadrature_weights,
             name="quadrature_weights",
@@ -228,7 +230,9 @@ class SurfacePatch:
             raise ValueError("neighbor_patch_ids must not contain duplicates.")
         if any(not np.isfinite(value) or value <= 0.0 for value in edge_lengths):
             raise ValueError("Shared-edge lengths must be finite and positive.")
-        sorted_neighbors = sorted(zip(neighbor_ids, edge_lengths), key=lambda item: item[0])
+        sorted_neighbors = sorted(
+            zip(neighbor_ids, edge_lengths), key=lambda item: item[0]
+        )
         neighbor_ids = tuple(item[0] for item in sorted_neighbors)
         edge_lengths = tuple(item[1] for item in sorted_neighbors)
 
@@ -315,7 +319,9 @@ class SurfacePatchSet:
             raise ValueError("shared_edge_lengths_m must be finite and positive.")
         if edges.size:
             if np.any(edges < 0) or np.any(edges >= len(patches)):
-                raise ValueError("adjacency_edges must reference existing patch indices.")
+                raise ValueError(
+                    "adjacency_edges must reference existing patch indices."
+                )
             if np.any(edges[:, 0] == edges[:, 1]):
                 raise ValueError("adjacency_edges cannot contain self edges.")
             canonical = np.sort(edges, axis=1)
@@ -431,7 +437,9 @@ class SurfacePatchSet:
     @property
     def adjacency_index_edges(self) -> NDArray[np.int64]:
         """Return adjacency endpoints as dense indices into :attr:`patches`."""
-        result = np.array(self.adjacency_edges, dtype=np.int64, copy=True).reshape(-1, 2)
+        result = np.array(self.adjacency_edges, dtype=np.int64, copy=True).reshape(
+            -1, 2
+        )
         result.setflags(write=False)
         return result
 
@@ -507,6 +515,11 @@ class ObservationBatch:
     isotope_covariances: NDArray[np.float64] | None
     station_ids: NDArray[np.int64]
     isotope_names: tuple[str, ...]
+    step_ids: NDArray[np.int64] | None = None
+    action_ids: NDArray[np.int64] | None = None
+    travel_times_s: NDArray[np.float64] | None = None
+    shield_actuation_times_s: NDArray[np.float64] | None = None
+    shield_program_block_ids: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         """Validate row alignment, spectra, isotope channels, and covariance."""
@@ -537,6 +550,8 @@ class ObservationBatch:
             name="pb_indices",
             length=measurement_count,
         )
+        if np.any(fe_indices > 7) or np.any(pb_indices > 7):
+            raise ValueError("Fe/Pb orientation indices must lie in [0, 7].")
         station_ids = _readonly_integer_vector(
             self.station_ids,
             name="station_ids",
@@ -549,6 +564,58 @@ class ObservationBatch:
         )
         if np.any(live_times <= 0.0):
             raise ValueError("live_times_s must be strictly positive.")
+        step_ids = _readonly_integer_vector(
+            (
+                np.arange(measurement_count, dtype=np.int64)
+                if self.step_ids is None
+                else self.step_ids
+            ),
+            name="step_ids",
+            length=measurement_count,
+        )
+        if measurement_count > 1 and np.any(np.diff(step_ids) <= 0):
+            raise ValueError(
+                "step_ids must be strictly increasing in causal row order."
+            )
+        action_ids = _readonly_integer_vector(
+            step_ids if self.action_ids is None else self.action_ids,
+            name="action_ids",
+            length=measurement_count,
+        )
+        if np.unique(action_ids).size != measurement_count:
+            raise ValueError("action_ids must be unique measurement-action IDs.")
+        if measurement_count > 1 and np.any(np.diff(station_ids) < 0):
+            raise ValueError("station_ids must be nondecreasing in causal row order.")
+        travel_times = _readonly_float_array(
+            (
+                np.zeros(measurement_count, dtype=float)
+                if self.travel_times_s is None
+                else self.travel_times_s
+            ),
+            name="travel_times_s",
+            shape=(measurement_count,),
+        )
+        shield_actuation_times = _readonly_float_array(
+            (
+                np.zeros(measurement_count, dtype=float)
+                if self.shield_actuation_times_s is None
+                else self.shield_actuation_times_s
+            ),
+            name="shield_actuation_times_s",
+            shape=(measurement_count,),
+        )
+        if np.any(travel_times < 0.0) or np.any(shield_actuation_times < 0.0):
+            raise ValueError("Travel and shield-actuation times must be non-negative.")
+        if self.shield_program_block_ids is None:
+            block_ids = tuple(f"station:{int(value)}" for value in station_ids)
+        else:
+            block_ids = tuple(
+                str(value).strip() for value in self.shield_program_block_ids
+            )
+        if len(block_ids) != measurement_count or any(not value for value in block_ids):
+            raise ValueError(
+                "shield_program_block_ids must contain one non-empty ID per row."
+            )
 
         spectrum = np.asarray(self.spectrum_counts, dtype=float)
         if spectrum.ndim != 2 or spectrum.shape[0] != measurement_count:
@@ -630,6 +697,15 @@ class ObservationBatch:
         object.__setattr__(self, "isotope_covariances", covariances)
         object.__setattr__(self, "station_ids", station_ids)
         object.__setattr__(self, "isotope_names", isotope_names)
+        object.__setattr__(self, "step_ids", step_ids)
+        object.__setattr__(self, "action_ids", action_ids)
+        object.__setattr__(self, "travel_times_s", travel_times)
+        object.__setattr__(
+            self,
+            "shield_actuation_times_s",
+            shield_actuation_times,
+        )
+        object.__setattr__(self, "shield_program_block_ids", block_ids)
 
     @property
     def measurement_count(self) -> int:
@@ -686,7 +762,9 @@ class MLEEstimate:
             shape=(isotope_count, patch_count),
         )
         if np.any(density < 0.0) or np.any(strength < 0.0):
-            raise ValueError("Estimated densities and patch strengths must be non-negative.")
+            raise ValueError(
+                "Estimated densities and patch strengths must be non-negative."
+            )
         areas = np.asarray([patch.area_m2 for patch in patches], dtype=float)
         if not np.allclose(
             strength,
@@ -715,7 +793,10 @@ class MLEEstimate:
             raw_counts = np.asarray(self.predicted_isotope_counts)
             if raw_counts.ndim != 2 or raw_counts.shape[1] != isotope_count:
                 raise ValueError("predicted_isotope_counts must have shape (M, I).")
-            if measurement_count is not None and raw_counts.shape[0] != measurement_count:
+            if (
+                measurement_count is not None
+                and raw_counts.shape[0] != measurement_count
+            ):
                 raise ValueError("Predicted spectrum and isotope rows must align.")
             predicted_counts = _readonly_float_array(
                 raw_counts,

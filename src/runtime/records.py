@@ -24,6 +24,80 @@ if TYPE_CHECKING:
 
 MEASUREMENT_LOG_SCHEMA_VERSION = 1
 
+_FORBIDDEN_REALIZED_SOURCE_MARKERS = (
+    "truth",
+    "sourcelayout",
+    "sourceposition",
+    "sourcelist",
+    "sourcelocation",
+    "sourcecoordinate",
+)
+
+
+def _normalized_estimator_input_field(name: str) -> str:
+    """Collapse field-name punctuation and case for truth-hygiene checks."""
+    return "".join(character for character in name.casefold() if character.isalnum())
+
+
+def _is_forbidden_estimator_input_field(name: str, value: object) -> bool:
+    """Return whether a field can disclose realized source truth to an estimator."""
+    normalized = _normalized_estimator_input_field(name)
+    if any(marker in normalized for marker in _FORBIDDEN_REALIZED_SOURCE_MARKERS):
+        return True
+    if normalized == "sources":
+        return True
+    return (
+        normalized.endswith("sources")
+        and normalized != "resources"
+        and isinstance(value, (Mapping, list, tuple, str))
+    )
+
+
+def _is_forbidden_estimator_input_pointer(value: str) -> bool:
+    """Return whether a string points at a realized source/truth artifact."""
+    normalized = _normalized_estimator_input_field(value)
+    markers = ("truth", "sourcelayout", "sourceposition", "pointsource")
+    if not any(marker in normalized for marker in markers):
+        return False
+    lowered = value.casefold().strip()
+    path_like = "/" in value or "\\" in value or lowered.endswith(
+        (".json", ".jsonl", ".yaml", ".yml", ".toml", ".csv", ".npz", ".txt")
+    )
+    return path_like
+
+
+def validate_truth_free_estimator_input(
+    value: object,
+    *,
+    path: str,
+) -> None:
+    """Recursively reject realized truth/source fields from estimator inputs.
+
+    Source-rate, source-strength, and source-extent physics remain valid model
+    configuration. Only realized layouts, positions, coordinates, locations,
+    source lists, and fields explicitly named as truth are forbidden.
+    """
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            if not isinstance(key, str):
+                raise TypeError(f"{path} contains a non-string mapping key: {key!r}.")
+            child_path = f"{path}.{key}"
+            if _is_forbidden_estimator_input_field(key, child):
+                raise ValueError(
+                    f"{child_path} is a forbidden realized-truth/source field in "
+                    "estimator input."
+                )
+            validate_truth_free_estimator_input(child, path=child_path)
+        return
+    if isinstance(value, (list, tuple)):
+        for index, child in enumerate(value):
+            validate_truth_free_estimator_input(child, path=f"{path}[{index}]")
+        return
+    if isinstance(value, str) and _is_forbidden_estimator_input_pointer(value):
+        raise ValueError(
+            f"{path} points to a forbidden realized-truth/source artifact."
+        )
+
 
 def _json_value(value: object, *, path: str = "value") -> object:
     """Return a deterministic JSON-compatible copy or raise a clear error."""
@@ -165,13 +239,17 @@ def _isotope_covariance(
         normalized_row: dict[str, float] = {}
         for column_name, value in sorted(row.items()):
             if not isinstance(column_name, str) or not column_name.strip():
-                raise ValueError("Covariance column keys must be non-empty isotope names.")
+                raise ValueError(
+                    "Covariance column keys must be non-empty isotope names."
+                )
             normalized_row[column_name] = _finite_float(
                 value,
                 name=f"count_covariance_by_isotope[{row_name!r}][{column_name!r}]",
             )
         if row_name in normalized_row and normalized_row[row_name] < 0.0:
-            raise ValueError(f"Covariance diagonal for {row_name!r} must be nonnegative.")
+            raise ValueError(
+                f"Covariance diagonal for {row_name!r} must be nonnegative."
+            )
         result[row_name] = normalized_row
 
     for row_name, row in result.items():
@@ -194,7 +272,7 @@ def _isotope_covariance(
 class RunContext:
     """Immutable, estimator-independent description of one acquisition run."""
 
-    upstream_pf_commit: str
+    repository_commit: str
     runtime_config: dict[str, object]
     environment: dict[str, object]
     sim_backend: str
@@ -203,8 +281,19 @@ class RunContext:
     obstacle_layout_path: str | None = None
     source_layout_path: str | None = None
     source_rate_model: str = "detector_cps_1m"
-    truth_sources: tuple[dict[str, object], ...] | None = None
     metadata: dict[str, object] = field(default_factory=dict)
+    run_id: str | None = None
+    source_rate_semantics: dict[str, object] = field(
+        default_factory=lambda: {
+            "quantity": "expected_net_detector_count_rate",
+            "unit": "cps",
+            "normalization_distance_m": 1.0,
+        }
+    )
+    forward_model_manifest: dict[str, object] | None = field(
+        default=None,
+        compare=False,
+    )
     runtime_config_sha256: str | None = None
     schema_version: int = MEASUREMENT_LOG_SCHEMA_VERSION
 
@@ -215,8 +304,11 @@ class RunContext:
                 f"schema_version must be {MEASUREMENT_LOG_SCHEMA_VERSION}; "
                 f"got {self.schema_version}."
             )
-        if not isinstance(self.upstream_pf_commit, str) or not self.upstream_pf_commit.strip():
-            raise ValueError("upstream_pf_commit must be a non-empty provenance string.")
+        if (
+            not isinstance(self.repository_commit, str)
+            or not self.repository_commit.strip()
+        ):
+            raise ValueError("repository_commit must be a non-empty provenance string.")
         for name in ("sim_backend", "spectrum_count_method", "source_rate_model"):
             value = getattr(self, name)
             if not isinstance(value, str) or not value.strip():
@@ -225,12 +317,44 @@ class RunContext:
         runtime_config = _json_value(self.runtime_config, path="runtime_config")
         environment = _json_value(self.environment, path="environment")
         metadata = _json_value(self.metadata, path="metadata")
+        source_rate_semantics = _json_value(
+            self.source_rate_semantics,
+            path="source_rate_semantics",
+        )
+        forward_model_manifest = _json_value(
+            self.forward_model_manifest,
+            path="forward_model_manifest",
+        )
         if not isinstance(runtime_config, dict):
             raise TypeError("runtime_config must be a mapping.")
         if not isinstance(environment, dict):
             raise TypeError("environment must be a mapping.")
         if not isinstance(metadata, dict):
             raise TypeError("metadata must be a mapping.")
+        if not isinstance(source_rate_semantics, dict):
+            raise TypeError("source_rate_semantics must be a mapping.")
+        expected_semantics = {
+            "quantity": "expected_net_detector_count_rate",
+            "unit": "cps",
+            "normalization_distance_m": 1.0,
+        }
+        if source_rate_semantics != expected_semantics:
+            raise ValueError(
+                "source_rate_semantics must describe expected net detector cps at 1 m."
+            )
+        if forward_model_manifest is not None and not isinstance(
+            forward_model_manifest,
+            dict,
+        ):
+            raise TypeError("forward_model_manifest must be a mapping or None.")
+        validate_truth_free_estimator_input(runtime_config, path="runtime_config")
+        validate_truth_free_estimator_input(environment, path="environment")
+        validate_truth_free_estimator_input(metadata, path="metadata")
+        if self.source_layout_path is not None:
+            raise ValueError(
+                "source_layout_path is evaluation truth and must be None in "
+                "MeasurementLog schema v1 estimator inputs."
+            )
 
         isotopes = tuple(self.isotopes)
         if not isotopes:
@@ -240,35 +364,44 @@ class RunContext:
         if len(set(isotopes)) != len(isotopes):
             raise ValueError("isotopes must not contain duplicates.")
 
-        truth_sources: tuple[dict[str, object], ...] | None = None
-        if self.truth_sources is not None:
-            normalized_truth = _json_value(self.truth_sources, path="truth_sources")
-            if not isinstance(normalized_truth, list) or not all(
-                isinstance(item, dict) for item in normalized_truth
-            ):
-                raise TypeError("truth_sources must be a sequence of mappings or None.")
-            truth_sources = tuple(dict(item) for item in normalized_truth)
-
         computed_hash = canonical_json_sha256(runtime_config)
         if self.runtime_config_sha256 is not None:
             supplied_hash = str(self.runtime_config_sha256).lower()
-            if supplied_hash != computed_hash:
+            if len(supplied_hash) != 64 or any(
+                character not in "0123456789abcdef" for character in supplied_hash
+            ):
                 raise ValueError(
-                    "runtime_config_sha256 does not match the canonical resolved runtime config."
+                    "runtime_config_sha256 must be a lowercase 64-character SHA-256."
                 )
         else:
             supplied_hash = computed_hash
 
+        repository_commit = str(self.repository_commit).strip()
+        if not repository_commit:
+            raise ValueError("repository_commit must be a non-empty provenance string.")
+        run_id = (
+            str(self.run_id).strip()
+            if self.run_id is not None
+            else f"run-{supplied_hash[:16]}"
+        )
+        if not run_id:
+            raise ValueError("run_id must be a non-empty string.")
+
         object.__setattr__(self, "runtime_config", runtime_config)
         object.__setattr__(self, "environment", environment)
         object.__setattr__(self, "metadata", metadata)
+        object.__setattr__(self, "source_rate_semantics", source_rate_semantics)
+        object.__setattr__(self, "forward_model_manifest", forward_model_manifest)
         object.__setattr__(self, "isotopes", isotopes)
-        object.__setattr__(self, "truth_sources", truth_sources)
+        object.__setattr__(self, "run_id", run_id)
+        object.__setattr__(self, "repository_commit", repository_commit)
         object.__setattr__(self, "runtime_config_sha256", supplied_hash)
-        for path_name in ("obstacle_layout_path", "source_layout_path"):
-            path_value = getattr(self, path_name)
-            if path_value is not None:
-                object.__setattr__(self, path_name, str(path_value))
+        if self.obstacle_layout_path is not None:
+            object.__setattr__(
+                self,
+                "obstacle_layout_path",
+                str(self.obstacle_layout_path),
+            )
 
 
 @dataclass(frozen=True, eq=False)
@@ -296,11 +429,16 @@ class MeasurementRecord:
     count_covariance_by_isotope: dict[str, dict[str, float]] | None
 
     metadata: dict[str, object]
+    action_id: int | None = None
 
     def __post_init__(self) -> None:
         """Validate and freeze one complete finalized measurement record."""
         station_id = _nonnegative_int(self.station_id, name="station_id")
         step_id = _nonnegative_int(self.step_id, name="step_id")
+        action_id = _nonnegative_int(
+            self.step_id if self.action_id is None else self.action_id,
+            name="action_id",
+        )
         fe_index = _nonnegative_int(
             self.fe_orientation_index,
             name="fe_orientation_index",
@@ -309,6 +447,8 @@ class MeasurementRecord:
             self.pb_orientation_index,
             name="pb_orientation_index",
         )
+        if fe_index > 7 or pb_index > 7:
+            raise ValueError("Fe/Pb orientation indices must lie in [0, 7].")
 
         pose_array = _vector(self.detector_pose_xyz, name="detector_pose_xyz", length=3)
         quat_array = _vector(
@@ -316,8 +456,9 @@ class MeasurementRecord:
             name="detector_quat_wxyz",
             length=4,
         )
-        if np.linalg.norm(quat_array) <= 0.0:
-            raise ValueError("detector_quat_wxyz must not be the zero quaternion.")
+        quaternion_norm = float(np.linalg.norm(quat_array))
+        if not np.isclose(quaternion_norm, 1.0, rtol=1.0e-9, atol=1.0e-12):
+            raise ValueError("detector_quat_wxyz must be a normalized quaternion.")
 
         spectrum = _vector(
             self.spectrum_counts,
@@ -352,10 +493,14 @@ class MeasurementRecord:
         metadata = _json_value(self.metadata, path="metadata")
         if not isinstance(metadata, dict):
             raise TypeError("metadata must be a mapping.")
+        validate_truth_free_estimator_input(metadata, path="metadata")
 
         object.__setattr__(self, "station_id", station_id)
         object.__setattr__(self, "step_id", step_id)
-        object.__setattr__(self, "detector_pose_xyz", tuple(float(v) for v in pose_array))
+        object.__setattr__(self, "action_id", action_id)
+        object.__setattr__(
+            self, "detector_pose_xyz", tuple(float(v) for v in pose_array)
+        )
         object.__setattr__(
             self,
             "detector_quat_wxyz",
@@ -363,11 +508,14 @@ class MeasurementRecord:
         )
         object.__setattr__(self, "fe_orientation_index", fe_index)
         object.__setattr__(self, "pb_orientation_index", pb_index)
-        object.__setattr__(
-            self,
-            "live_time_s",
-            _finite_float(self.live_time_s, name="live_time_s", nonnegative=True),
+        live_time_s = _finite_float(
+            self.live_time_s,
+            name="live_time_s",
+            nonnegative=True,
         )
+        if live_time_s <= 0.0:
+            raise ValueError("live_time_s must be strictly positive.")
+        object.__setattr__(self, "live_time_s", live_time_s)
         object.__setattr__(
             self,
             "travel_time_s",
@@ -402,12 +550,16 @@ class MeasurementRecord:
         counts_by_isotope: Mapping[str, float] | None,
         count_covariance_by_isotope: Mapping[str, Mapping[str, float]] | None,
         metadata: Mapping[str, object] | None = None,
+        action_id: int | None = None,
+        include_observation_metadata: bool = True,
     ) -> "MeasurementRecord":
         """Build a record from finalized simulator and spectrum-processing output.
 
         Processed isotope counts, covariance, variance, and timing are explicit
         keyword-only inputs.  They are deliberately not reconstructed from PF
-        state or inferred from simulator metadata.
+        state or inferred from simulator metadata. Acquisition callers should
+        set ``include_observation_metadata=False`` and supply an explicit
+        allowlist mapping when simulator metadata can contain scene truth.
         """
         # Import lazily so replay-only consumers can read persisted records
         # without initializing simulator backends.
@@ -415,7 +567,11 @@ class MeasurementRecord:
 
         if not isinstance(observation, LocalSimulationObservation):
             raise TypeError("observation must be a sim.protocol.SimulationObservation.")
-        merged_metadata = dict(observation.metadata)
+        if not isinstance(include_observation_metadata, bool):
+            raise TypeError("include_observation_metadata must be a boolean.")
+        merged_metadata = (
+            dict(observation.metadata) if include_observation_metadata else {}
+        )
         if metadata is not None:
             merged_metadata.update(dict(metadata))
         return cls(
@@ -450,6 +606,7 @@ class MeasurementRecord:
                 }
             ),
             metadata=merged_metadata,
+            action_id=action_id,
         )
 
 
@@ -458,4 +615,6 @@ def measurement_record_from_observation(
     **finalized_fields: Any,
 ) -> MeasurementRecord:
     """Functional alias for :meth:`MeasurementRecord.from_simulation_observation`."""
-    return MeasurementRecord.from_simulation_observation(observation, **finalized_fields)
+    return MeasurementRecord.from_simulation_observation(
+        observation, **finalized_fields
+    )

@@ -1,0 +1,23 @@
+{
+  "check_interval": 5,
+  "debias_refit": false,
+  "fit_background_nuisance": false,
+  "fit_scatter_nuisance": false,
+  "held_out_fraction": 0.0,
+  "isotope_names": [
+    "Cs-137",
+    "Co-60",
+    "Eu-154"
+  ],
+  "max_iterations": 30,
+  "mode": "count",
+  "obstacle_height_m": 1.2,
+  "patch_spacing_m": [
+    6.0,
+    6.0,
+    3.0
+  ],
+  "quadrature_order": 1,
+  "random_seed": 19,
+  "use_gpu": false
+}

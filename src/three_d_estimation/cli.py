@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+from hashlib import sha256
 import json
 from pathlib import Path
 from typing import Sequence
 
 from runtime.measurement_log import load_measurement_log
 
+from .conformance import compute_forward_conformance, save_forward_conformance
 from .config import MLEConfig
 from .replay import run_replay
 from .reporting import load_mle_estimate, save_mle_estimate
@@ -20,15 +22,39 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def _add_fit_arguments(parser: argparse.ArgumentParser) -> None:
     """Add arguments shared by count and spectral replay commands."""
-    parser.add_argument("--run-dir", type=Path, required=True, help="Versioned measurement-log directory.")
-    parser.add_argument("--mle-config", type=Path, default=None, help="MLE JSON configuration file.")
-    parser.add_argument("--output-dir", type=Path, default=None, help="Result directory (default: RUN_DIR/mle_count or mle_spectral).")
-    parser.add_argument("--overwrite", action="store_true", help="Replace an existing result directory.")
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        required=True,
+        help="Versioned measurement-log directory.",
+    )
+    parser.add_argument(
+        "--mle-config", type=Path, default=None, help="MLE JSON configuration file."
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Result directory (default: RUN_DIR/mle_count or mle_spectral).",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Replace an existing result directory."
+    )
     device = parser.add_mutually_exclusive_group()
-    device.add_argument("--gpu", action="store_true", help="Use the local CUDA kernel when available.")
-    device.add_argument("--cpu", action="store_true", help="Force CPU response construction.")
-    parser.add_argument("--no-debias", action="store_true", help="Disable the support-selected unregularized refit.")
-    parser.add_argument("--json", action="store_true", help="Print the fit summary as JSON.")
+    device.add_argument(
+        "--gpu", action="store_true", help="Use the local CUDA kernel when available."
+    )
+    device.add_argument(
+        "--cpu", action="store_true", help="Force CPU response construction."
+    )
+    parser.add_argument(
+        "--no-debias",
+        action="store_true",
+        help="Disable the support-selected unregularized refit.",
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="Print the fit summary as JSON."
+    )
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -52,8 +78,34 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "report",
         help="Read a saved MLE estimate and print its summary.",
     )
-    report_parser.add_argument("--estimate", type=Path, required=True, help="Result directory or mle_estimate.npz.")
+    report_parser.add_argument(
+        "--estimate",
+        type=Path,
+        required=True,
+        help="Result directory or mle_estimate.npz.",
+    )
     report_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    conformance_parser = subparsers.add_parser(
+        "forward-conformance",
+        help="Generate canonical unit-strength forward-response cases.",
+    )
+    conformance_parser.add_argument(
+        "--axes",
+        type=Path,
+        default=ROOT / "fixtures" / "forward_response_conformance.json",
+        help="Provider-neutral forward-response axes JSON.",
+    )
+    conformance_parser.add_argument(
+        "--output",
+        type=Path,
+        required=True,
+        help="Destination NPZ containing case_ids and unit_response.",
+    )
+    conformance_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace an existing conformance NPZ.",
+    )
     return parser
 
 
@@ -74,11 +126,21 @@ def _config_for_command(args: argparse.Namespace, mode: str) -> MLEConfig:
     return config
 
 
-def _estimate_summary(estimate: object, output_dir: Path | None = None) -> dict[str, object]:
+def _estimate_summary(
+    estimate: object, output_dir: Path | None = None
+) -> dict[str, object]:
     """Return a compact JSON-safe estimate summary."""
     diagnostics = dict(getattr(estimate, "diagnostics"))
     clusters = diagnostics.get("hotspot_clusters", [])
+    provenance = diagnostics.get("provenance", {})
     return {
+        "schema_version": 1,
+        "estimator_family": diagnostics.get("estimator_family"),
+        "estimator_variant": diagnostics.get("estimator_variant"),
+        "candidate_domain": diagnostics.get("candidate_domain"),
+        "uses_pf_state": diagnostics.get("uses_pf_state"),
+        "uses_pf_candidates": diagnostics.get("uses_pf_candidates"),
+        "provenance": provenance if isinstance(provenance, dict) else {},
         "mode": diagnostics.get("mode"),
         "isotopes": list(getattr(estimate, "isotope_names")),
         "patch_count": len(getattr(estimate, "patches")),
@@ -94,7 +156,16 @@ def _estimate_summary(estimate: object, output_dir: Path | None = None) -> dict[
 def _run_fit(args: argparse.Namespace, mode: str) -> int:
     """Run one replay command, save all outputs, and print a summary."""
     config = _config_for_command(args, mode)
-    replay_result = run_replay(args.run_dir, config=config)
+    config_source_sha256 = (
+        None
+        if args.mle_config is None
+        else sha256(args.mle_config.read_bytes()).hexdigest()
+    )
+    replay_result = run_replay(
+        args.run_dir,
+        config=config,
+        config_source_sha256=config_source_sha256,
+    )
     estimate = replay_result.estimate
     output_dir = args.output_dir or args.run_dir / f"mle_{mode}"
     save_mle_estimate(
@@ -131,6 +202,19 @@ def _run_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_forward_conformance(args: argparse.Namespace) -> int:
+    """Generate all canonical local forward responses and report their count."""
+    result = compute_forward_conformance(args.axes)
+    output = save_forward_conformance(
+        args.output,
+        result,
+        overwrite=bool(args.overwrite),
+    )
+    print(f"cases: {result.case_ids.size}")
+    print(f"output: {output}")
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Parse CLI arguments and execute the requested standalone operation."""
     parser = build_argument_parser()
@@ -141,6 +225,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_fit(args, "spectral")
     if args.command == "report":
         return _run_report(args)
+    if args.command == "forward-conformance":
+        return _run_forward_conformance(args)
     parser.error(f"Unknown command: {args.command}")
     return 2
 

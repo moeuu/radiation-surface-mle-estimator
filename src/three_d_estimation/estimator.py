@@ -13,12 +13,12 @@ from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
 
 from .config import MLEConfig
-from .observation_batch import subset_observation_batch
 from .postprocess import (
     cluster_surface_hotspots,
     poisson_deviance,
     response_identifiability_diagnostics,
 )
+from .provenance import estimator_provenance
 from .response_builder import build_count_responses
 from .solver import SurfaceMapConfig, SurfaceMapResult, fit_surface_map_poisson
 from .spectral_response_builder import SpectralResponseResult, build_spectral_response
@@ -40,7 +40,9 @@ class _FitState:
     spectral_details: SpectralResponseResult | None
 
 
-def _surface_map_config(config: MLEConfig, *, regularized: bool = True) -> SurfaceMapConfig:
+def _surface_map_config(
+    config: MLEConfig, *, regularized: bool = True
+) -> SurfaceMapConfig:
     """Translate public MLE settings into the numerical solver contract."""
     return SurfaceMapConfig(
         l1_weight=float(config.l1_weight) if regularized else 0.0,
@@ -60,21 +62,124 @@ def _surface_map_config(config: MLEConfig, *, regularized: bool = True) -> Surfa
     )
 
 
+def _union_group_labels(
+    batch: ObservationBatch, grouping: str, tolerance: float
+) -> tuple[int, ...]:
+    """Return row component labels while keeping every station intact."""
+    measurement_count = batch.measurement_count
+    if grouping == "row":
+        return tuple(range(measurement_count))
+    parent = list(range(measurement_count))
+
+    def find(index: int) -> int:
+        """Return one disjoint-set root with path compression."""
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(first: int, second: int) -> None:
+        """Merge two deterministic disjoint-set components."""
+        first_root = find(first)
+        second_root = find(second)
+        if first_root == second_root:
+            return
+        lower, upper = sorted((first_root, second_root))
+        parent[upper] = lower
+
+    station_first: dict[int, int] = {}
+    for row, station_id in enumerate(batch.station_ids):
+        station = int(station_id)
+        if station in station_first:
+            union(row, station_first[station])
+        else:
+            station_first[station] = row
+
+    if grouping == "same_xy_height":
+        xy = np.asarray(batch.detector_positions_xyz[:, :2], dtype=float)
+        for first in range(measurement_count):
+            distances = np.linalg.norm(xy[first + 1 :] - xy[first], axis=1)
+            for offset in np.flatnonzero(distances <= float(tolerance)):
+                union(first, first + 1 + int(offset))
+    elif grouping == "shield_program_block":
+        block_first: dict[str, int] = {}
+        for row, block_id in enumerate(batch.shield_program_block_ids):
+            if block_id in block_first:
+                union(row, block_first[block_id])
+            else:
+                block_first[block_id] = row
+    elif grouping != "station_id":
+        raise ValueError(f"Unsupported held-out grouping: {grouping!r}.")
+
+    canonical_roots: dict[int, int] = {}
+    labels: list[int] = []
+    for row in range(measurement_count):
+        root = find(row)
+        canonical_roots.setdefault(root, len(canonical_roots))
+        labels.append(canonical_roots[root])
+    return tuple(labels)
+
+
 def _split_fit_indices(
-    measurement_count: int,
+    batch: ObservationBatch,
     fraction: float,
     seed: int,
-) -> tuple[NDArray[np.int64], NDArray[np.int64]]:
-    """Return deterministic train and held-out measurement row indices."""
-    all_indices = np.arange(int(measurement_count), dtype=np.int64)
-    held_out_count = int(np.floor(float(fraction) * int(measurement_count)))
-    if held_out_count <= 0:
-        return all_indices, np.zeros(0, dtype=np.int64)
-    held_out_count = min(held_out_count, int(measurement_count) - 1)
+    *,
+    grouping: str,
+    xy_tolerance_m: float,
+) -> tuple[NDArray[np.int64], NDArray[np.int64], tuple[int, ...]]:
+    """Return a deterministic whole-group fit/held-out split.
+
+    A small subset-sum search chooses the group combination closest to the
+    requested row fraction. The randomized group order is seed-controlled and
+    only resolves equally good choices; rows within a related group never split.
+    """
+    measurement_count = batch.measurement_count
+    all_indices = np.arange(measurement_count, dtype=np.int64)
+    group_labels = _union_group_labels(batch, grouping, xy_tolerance_m)
+    held_out_target = int(np.floor(float(fraction) * measurement_count))
+    groups: dict[int, list[int]] = {}
+    for row, label in enumerate(group_labels):
+        groups.setdefault(label, []).append(row)
+    if held_out_target <= 0 or len(groups) < 2:
+        return all_indices, np.zeros(0, dtype=np.int64), group_labels
+
+    ordered_labels = list(groups)
     rng = np.random.default_rng(int(seed))
-    held_out = np.sort(rng.choice(all_indices, size=held_out_count, replace=False))
+    shuffled_labels = [
+        ordered_labels[int(index)] for index in rng.permutation(len(ordered_labels))
+    ]
+    possibilities: dict[int, tuple[int, ...]] = {0: ()}
+    for label in shuffled_labels:
+        size = len(groups[label])
+        additions: dict[int, tuple[int, ...]] = {}
+        for row_count, selected in possibilities.items():
+            candidate_count = row_count + size
+            if candidate_count >= measurement_count:
+                continue
+            additions.setdefault(candidate_count, (*selected, label))
+        for row_count, selected in additions.items():
+            possibilities.setdefault(row_count, selected)
+    feasible_counts = [
+        count for count in possibilities if 0 < count < measurement_count
+    ]
+    if not feasible_counts:
+        return all_indices, np.zeros(0, dtype=np.int64), group_labels
+    selected_count = min(
+        feasible_counts,
+        key=lambda count: (
+            abs(count - held_out_target),
+            count > held_out_target,
+            count,
+        ),
+    )
+    selected_labels = set(possibilities[selected_count])
+    held_out = np.asarray(
+        [row for row, label in enumerate(group_labels) if label in selected_labels],
+        dtype=np.int64,
+    )
     fit = np.setdiff1d(all_indices, held_out, assume_unique=True)
-    return fit.astype(np.int64), held_out.astype(np.int64)
+    return fit, held_out, group_labels
 
 
 def _count_solver_response(
@@ -115,7 +220,9 @@ def _fit_problem(
     """Build the configured forward model and solve one patch resolution."""
     if config.mode == "count":
         if batch.isotope_counts is None:
-            raise ValueError("Count-domain MLE requires response_poisson isotope counts.")
+            raise ValueError(
+                "Count-domain MLE requires response_poisson isotope counts."
+            )
         count_details = build_count_responses(
             batch,
             patches,
@@ -123,9 +230,7 @@ def _fit_problem(
             kernel,
             kernel_chunk_size=int(config.response_chunk_size),
         )
-        response = _count_solver_response(
-            count_details.response_by_integrated_strength
-        )
+        response = _count_solver_response(count_details.response_by_integrated_strength)
         nuisance_response, nuisance_names = _count_nuisance_response(
             batch.live_times_s,
             batch.isotope_count,
@@ -187,7 +292,9 @@ def _warm_start_refined(
     }
     result = np.zeros((new_patches.patch_count, old_densities.shape[1]), dtype=float)
     for index, patch in enumerate(new_patches.patches):
-        source_id = patch.patch_id if patch.patch_id in old_by_id else patch.parent_patch_id
+        source_id = (
+            patch.patch_id if patch.patch_id in old_by_id else patch.parent_patch_id
+        )
         if source_id is not None and source_id in old_by_id:
             result[index] = old_by_id[source_id]
     return result
@@ -382,7 +489,9 @@ class SurfaceMLEEstimator:
     ) -> MLEEstimate:
         """Fit all history, optionally warm-starting from a prior surface map."""
         if tuple(batch.isotope_names) != tuple(self.config.isotope_names):
-            raise ValueError("Observation isotope order must match MLEConfig.isotope_names.")
+            raise ValueError(
+                "Observation isotope order must match MLEConfig.isotope_names."
+            )
         kernel.use_gpu = bool(self.config.use_gpu)
         kernel.gpu_device = str(self.config.gpu_device)
         kernel.gpu_dtype = str(self.config.gpu_dtype)
@@ -393,10 +502,14 @@ class SurfaceMLEEstimator:
             obstacle_height_m=float(self.config.obstacle_height_m),
             quadrature_points_per_patch=int(self.config.quadrature_order),
         )
-        fit_indices, held_out_indices = _split_fit_indices(
-            batch.measurement_count,
+        base_patch_ids = patches.patch_ids.astype(int).tolist()
+        base_patch_count = patches.patch_count
+        fit_indices, held_out_indices, held_out_group_labels = _split_fit_indices(
+            batch,
             self.config.held_out_fraction,
             self.config.random_seed,
+            grouping=self.config.held_out_grouping,
+            xy_tolerance_m=self.config.held_out_xy_tolerance_m,
         )
         initial_densities = _initial_density_for_patches(
             initial_estimate,
@@ -440,7 +553,9 @@ class SurfaceMLEEstimator:
             )
 
         observed = (
-            batch.isotope_counts if self.config.mode == "count" else batch.spectrum_counts
+            batch.isotope_counts
+            if self.config.mode == "count"
+            else batch.spectrum_counts
         )
         if observed is None:  # guarded by _fit_problem; keeps static typing explicit
             raise ValueError("Configured observation domain is unavailable.")
@@ -469,14 +584,40 @@ class SurfaceMLEEstimator:
         )
         residual = observed - predicted
         diagnostics: dict[str, object] = {
+            "provenance": estimator_provenance(variant=self.config.mode),
+            "estimator_family": "surface_mle",
+            "estimator_variant": self.config.mode,
+            "candidate_domain": "complete_surface_dictionary",
+            "uses_pf_state": False,
+            "uses_pf_candidates": False,
             "mode": self.config.mode,
             "warm_started": initial_estimate is not None,
             "density_unit": "detector_cps_1m_per_m2",
             "patch_strength_unit": "detector_cps_1m",
             "patch_count": state.patches.patch_count,
+            "base_surface_dictionary_patch_count": base_patch_count,
+            "base_surface_dictionary_patch_ids": base_patch_ids,
+            "full_surface_dictionary_used": True,
             "response_shape": [int(value) for value in state.response.shape],
+            "observation_step_ids": batch.step_ids.astype(int).tolist(),
+            "observation_action_ids": batch.action_ids.astype(int).tolist(),
+            "observation_station_ids": batch.station_ids.astype(int).tolist(),
+            "detector_positions_xyz": batch.detector_positions_xyz.tolist(),
+            "detector_heights_m": batch.detector_positions_xyz[:, 2].tolist(),
+            "live_times_s": batch.live_times_s.tolist(),
+            "travel_times_s": batch.travel_times_s.tolist(),
+            "shield_actuation_times_s": batch.shield_actuation_times_s.tolist(),
+            "shield_program_block_ids": list(batch.shield_program_block_ids),
             "fit_measurement_indices": state.fit_indices.astype(int).tolist(),
             "held_out_measurement_indices": state.held_out_indices.astype(int).tolist(),
+            "held_out_grouping": self.config.held_out_grouping,
+            "held_out_group_labels": list(held_out_group_labels),
+            "held_out_group_ids": sorted(
+                {
+                    int(held_out_group_labels[int(index)])
+                    for index in state.held_out_indices
+                }
+            ),
             "held_out_poisson_deviance": held_out_deviance,
             "residual_l2": float(np.linalg.norm(residual)),
             "residual_by_observation": np.asarray(residual, dtype=float).tolist(),
@@ -489,9 +630,7 @@ class SurfaceMLEEstimator:
             "group_penalty": float(state.result.group_penalty),
             "nuisance_penalty": float(state.result.nuisance_penalty),
             "relative_change": float(state.result.relative_change),
-            "relative_objective_change": float(
-                state.result.relative_objective_change
-            ),
+            "relative_objective_change": float(state.result.relative_objective_change),
             "kkt_residual": float(state.result.kkt_residual),
             "nuisance_names": list(state.nuisance_names),
             "isotope_covariance_preserved": batch.isotope_covariances is not None,

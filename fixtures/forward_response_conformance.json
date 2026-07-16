@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "fixture_id": "forward-response-conformance-v1",
+  "units": {
+    "distance": "m",
+    "live_time": "s",
+    "source_strength": "detector_cps_1m"
+  },
+  "isotopes": ["Cs-137", "Co-60", "Eu-154"],
+  "detector_poses": [
+    {"pose_id": "low-corner", "xyz": [0.75, 0.75, 0.4], "live_time_s": 1.0},
+    {"pose_id": "mid-center", "xyz": [3.0, 1.0, 1.5], "live_time_s": 10.0},
+    {"pose_id": "high-far", "xyz": [5.25, 5.0, 2.6], "live_time_s": 3.0}
+  ],
+  "shield_program": {
+    "fe_orientation_indices": [0, 1, 2, 3, 4, 5, 6, 7],
+    "pb_orientation_indices": [0, 1, 2, 3, 4, 5, 6, 7],
+    "pairing": "cartesian_product"
+  },
+  "source_points": [
+    {"source_id": "floor", "xyz": [1.0, 1.0, 0.0], "surface_kind": "floor"},
+    {"source_id": "wall", "xyz": [0.0, 4.0, 1.4], "surface_kind": "wall"},
+    {"source_id": "ceiling", "xyz": [5.0, 4.5, 3.0], "surface_kind": "ceiling"},
+    {"source_id": "obstacle-top", "xyz": [3.0, 3.0, 1.2], "surface_kind": "obstacle_top"}
+  ],
+  "obstacles": [
+    {"obstacle_id": "none", "boxes": []},
+    {
+      "obstacle_id": "one-box",
+      "boxes": [
+        {"min_xyz": [2.4, 2.4, 0.0], "max_xyz": [3.6, 3.6, 1.2], "material": "concrete"}
+      ]
+    }
+  ],
+  "required_case_order": ["isotope", "detector_pose", "fe_orientation", "pb_orientation", "source_point", "obstacle"]
+}

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,14 +9,14 @@ import unittest
 import numpy as np
 
 from runtime.measurement_log import load_measurement_log, save_measurement_log
-from runtime.records import MeasurementRecord, RunContext
+from runtime.records import MeasurementRecord, RunContext, canonical_json_bytes
 from sim.protocol import SimulationObservation
 
 
 class MeasurementLogTests(unittest.TestCase):
     def build_context(self) -> RunContext:
         return RunContext(
-            upstream_pf_commit="ec414e6d828b5213ae94f7adfc2e249e380d601e",
+            repository_commit="3d-estimation-test-commit",
             runtime_config={
                 "detector": {"height_m": 1.5},
                 "spectrum": {"count_method": "response_poisson"},
@@ -24,15 +25,7 @@ class MeasurementLogTests(unittest.TestCase):
             sim_backend="analytic",
             spectrum_count_method="response_poisson",
             isotopes=("Cs-137", "Co-60"),
-            obstacle_layout_path="obstacle_layouts/holdout.json",
-            source_layout_path="source_layouts/two_sources.json",
-            truth_sources=(
-                {
-                    "isotope": "Cs-137",
-                    "position_xyz": [1.0, 2.0, 0.0],
-                    "intensity_cps_1m": 12.5,
-                },
-            ),
+            obstacle_layout_path=None,
             metadata={"run_label": "round-trip"},
         )
 
@@ -91,8 +84,8 @@ class MeasurementLogTests(unittest.TestCase):
                     "environment.json",
                     "observations.npz",
                     "observation_metadata.jsonl",
-                    "truth_sources.json",
-                    "upstream_pf_commit.txt",
+                    "forward_model_manifest.json",
+                    "repository_commit.txt",
                 },
             )
 
@@ -191,7 +184,7 @@ class MeasurementLogTests(unittest.TestCase):
                 '{"tampered":true}\n',
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(ValueError, "runtime_config_sha256"):
+            with self.assertRaisesRegex(ValueError, "resolved_config_sha256"):
                 load_measurement_log(run_dir)
 
     def test_loader_rejects_noncanonical_npz_dtypes(self) -> None:
@@ -218,9 +211,81 @@ class MeasurementLogTests(unittest.TestCase):
 
                 with self.assertRaisesRegex(
                     ValueError,
-                    rf"array '{array_name}'.*invalid dtype",
+                    "observations.npz.*SHA-256",
                 ):
                     load_measurement_log(run_dir)
+
+    def test_source_layout_and_nested_realized_truth_fields_are_rejected(self) -> None:
+        """Estimator inputs must fail closed on layout, position, and list truth."""
+        context = self.build_context()
+        with self.assertRaisesRegex(ValueError, "source_layout_path"):
+            replace(
+                context,
+                source_layout_path="source_layouts/two_sources.json",
+            )
+
+        cases = (
+            (
+                "runtime_config",
+                {
+                    "source_rate_model": "detector_cps_1m",
+                    "nested": {"sourcePositions": [[1.0, 2.0, 3.0]]},
+                },
+            ),
+            (
+                "environment",
+                {"scene": [{"candidate_sources": [{"x": 1.0}]}]},
+            ),
+            (
+                "metadata",
+                {"audit": {"note": "external/ground-truth.json"}},
+            ),
+        )
+        for field_name, payload in cases:
+            with self.subTest(field_name=field_name), self.assertRaisesRegex(
+                ValueError,
+                "forbidden",
+            ):
+                changes: dict[str, object] = {field_name: payload}
+                if field_name == "runtime_config":
+                    changes["runtime_config_sha256"] = None
+                replace(context, **changes)
+
+        with self.assertRaisesRegex(ValueError, "forbidden"):
+            replace(
+                self.build_record(),
+                metadata={"outer": [{"source-list": [{"isotope": "Cs-137"}]}]},
+            )
+
+    def test_source_rate_strength_and_extent_physics_remain_allowed(self) -> None:
+        """Truth hygiene must not reject non-realized source-model parameters."""
+        context = replace(
+            self.build_context(),
+            runtime_config={
+                "source_rate_model": "detector_cps_1m",
+                "source_strength_unit": "cps",
+                "source_extent_radius_m": 0.25,
+                "source_extent_samples": 4,
+            },
+            runtime_config_sha256=None,
+        )
+        self.assertEqual(context.runtime_config["source_extent_samples"], 4)
+
+    def test_loader_rejects_non_null_source_layout_sentinel(self) -> None:
+        """A schema-v1 manifest can serialize only a null source-layout sentinel."""
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = save_measurement_log(
+                Path(temporary) / "source-layout",
+                self.build_context(),
+                [self.build_record()],
+            )
+            manifest_path = run_dir / "run_manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["source_layout_path"] = "source_layouts/hidden.json"
+            manifest_path.write_bytes(canonical_json_bytes(manifest))
+
+            with self.assertRaisesRegex(ValueError, "source_layout_path must be null"):
+                load_measurement_log(run_dir)
 
 
 if __name__ == "__main__":

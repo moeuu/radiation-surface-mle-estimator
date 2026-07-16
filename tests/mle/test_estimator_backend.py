@@ -20,7 +20,7 @@ from runtime.session import LiveEstimationSession, SessionState
 
 def build_context() -> RunContext:
     return RunContext(
-        upstream_pf_commit="standalone-snapshot",
+        repository_commit="standalone-snapshot",
         runtime_config={"mode": "analytic"},
         environment={"size_x": 4.0, "size_y": 5.0, "size_z": 3.0},
         sim_backend="analytic",

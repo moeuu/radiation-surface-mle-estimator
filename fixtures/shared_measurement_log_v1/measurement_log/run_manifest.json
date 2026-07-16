@@ -1,0 +1,80 @@
+{
+  "artifact_hashes": {
+    "environment.json": "000d8ed2a5547b7f571423b39fb22a64fb450d0681bfbd6660b67a3d854500da",
+    "forward_model_manifest.json": "95527d7d3e57023b84fb948d9db3bc2fd72dbf33eae156049ce0f85704a623c8",
+    "observation_metadata.jsonl": "9a00628fcfbb25f2494eb9dd1a1cce11fc93b4c67efa26224d7ad4c5eb04ca81",
+    "observations.npz": "03fa28f1d6652dd675e0d763cafd7ebef41699a0cfe99be4e4fdb73f6e88e12c",
+    "repository_commit.txt": "2e8d2f2020f327d1133fe76942e9452a83f15a100e6b134ba8ef55913b332c0d",
+    "runtime_config.resolved.json": "164c9254f7482edfe9a1c0ecc361d8b7350812e323d8480b748307428608ff1e"
+  },
+  "energy_bin_count": 16,
+  "environment": {
+    "detector_position": [0.8, 0.8, 0.45],
+    "environment_model_id": "shared_small_room_6x6x3.v1",
+    "obstacle_grid": {
+      "blocked_cells": [[2, 2], [2, 3], [3, 2], [3, 3]],
+      "cell_size": 1.0,
+      "grid_shape": [6, 6],
+      "origin": [0.0, 0.0]
+    },
+    "obstacle_model_id": "shared_small_box_grid.v1",
+    "size_x": 6.0,
+    "size_y": 6.0,
+    "size_z": 3.0
+  },
+  "forward_model_manifest_sha256": "95527d7d3e57023b84fb948d9db3bc2fd72dbf33eae156049ce0f85704a623c8",
+  "index_conventions": {
+    "action_id": "zero_based_unique_measurement_action",
+    "record_order": "causal_step_order",
+    "station_id": "zero_based_nondecreasing_station_group",
+    "step_id": "zero_based_strictly_increasing"
+  },
+  "isotopes": ["Cs-137", "Co-60", "Eu-154"],
+  "metadata": {
+    "closed_loop": false,
+    "estimator_independent": true,
+    "evaluation_bundle": "external",
+    "fixture": "shared_small_run"
+  },
+  "model_identifiers": {
+    "detector": {
+      "id": "shared_small_detector.v1",
+      "sha256": "c22e5c1c3feee1d4eca9f3fbab7adf3b6d670d8ad82c40f9dc84cfd1f9a65924"
+    },
+    "environment": {
+      "id": "shared_small_room_6x6x3.v1",
+      "sha256": "780c2763d1815f6468c722eb747de0161fd94165eebe39c5d5b723332f54d494"
+    },
+    "obstacle": {
+      "id": "shared_small_box_grid.v1",
+      "sha256": "68ba8aa0fb7aca77f04d47087ff5ec7926db650a8bccb691669141690a608ad0"
+    },
+    "shield": {
+      "id": "shared_small_fe_pb_octants.v1",
+      "sha256": "c5e24ded41d8f15b59cbcb08d37c41d281a3867aa39e5fde4bf1bfb6004160f3"
+    },
+    "spectrum": {
+      "id": "shared_small_line_response.v1",
+      "sha256": "49cc8ee41dea713ed6dcae459d676ffe78e6b70cacbfea2eba6df2eb732ace73"
+    },
+    "transport": {
+      "id": "shared_small_continuous_kernel.v1",
+      "sha256": "65090091e435e279dc98bf5d2fae0689720fdf41dfd0bf53e28fff807f037982"
+    }
+  },
+  "obstacle_layout_path": null,
+  "record_count": 12,
+  "repository_commit": "87961934add7aec893f41782e7488ddc50f2c636",
+  "resolved_config_sha256": "164c9254f7482edfe9a1c0ecc361d8b7350812e323d8480b748307428608ff1e",
+  "run_id": "shared-small-run-v1",
+  "schema_version": 1,
+  "sim_backend": "analytic_conformance",
+  "source_layout_path": null,
+  "source_rate_model": "detector_cps_1m",
+  "source_rate_semantics": {
+    "normalization_distance_m": 1.0,
+    "quantity": "expected_net_detector_count_rate",
+    "unit": "cps"
+  },
+  "spectrum_count_method": "response_poisson"
+}

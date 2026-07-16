@@ -34,6 +34,7 @@ from spectrum.runtime_config import spectrum_config_from_runtime_config
 from spectrum.runtime_counts import RuntimeCountExtractor, RuntimeCountResult
 
 from .config import MLEConfig
+from .provenance import repository_commit
 from .response_builder import build_count_response
 from .surface_patches import build_surface_patches
 from .types import SurfacePatch, SurfacePatchSet
@@ -408,6 +409,10 @@ def _sample_measurement_records(
                         (_ISOTOPE,),
                     ),
                     metadata={
+                        "backend": str(observation.metadata.get("backend", "analytic")),
+                        "transport_backend": str(
+                            observation.metadata.get("transport_backend", "python")
+                        ),
                         "count_method": "response_poisson",
                         "detected_isotopes": sorted(
                             set(count_result.detected) & {_ISOTOPE}
@@ -417,6 +422,7 @@ def _sample_measurement_records(
                         ),
                         "spectrum_variance_available": False,
                     },
+                    include_observation_metadata=False,
                 )
             )
     finally:
@@ -424,28 +430,16 @@ def _sample_measurement_records(
     return tuple(records)
 
 
-def _upstream_snapshot_commit() -> str:
-    """Read provenance from the repository-local vendored snapshot marker."""
-    provenance_path = _REPOSITORY_ROOT / "UPSTREAM_PF_COMMIT"
-    value = provenance_path.read_text(encoding="utf-8").strip()
-    if not value:
-        raise ValueError(f"Local provenance marker is empty: {provenance_path}")
-    return value
-
-
 def _run_context(
     *,
     runtime_config: dict[str, object],
     environment: EnvironmentConfig,
     obstacle_grid: ObstacleGrid,
-    source_patch: SurfacePatch,
-    source_patch_index: int,
     mle_config: MLEConfig,
     response_rank: int,
     response_condition_number: float,
 ) -> RunContext:
     """Build the self-contained context persisted beside demo observations."""
-    source_position = [float(value) for value in source_patch.centroid_xyz]
     environment_payload: dict[str, object] = {
         "size_x": float(environment.size_x),
         "size_y": float(environment.size_y),
@@ -456,31 +450,19 @@ def _run_context(
         "obstacle_grid": obstacle_grid.to_dict(),
     }
     return RunContext(
-        upstream_pf_commit=_upstream_snapshot_commit(),
+        repository_commit=repository_commit(),
         runtime_config=runtime_config,
         environment=environment_payload,
         sim_backend="analytic",
         spectrum_count_method="response_poisson",
         isotopes=(_ISOTOPE,),
         obstacle_layout_path=None,
-        source_layout_path=None,
         source_rate_model="detector_cps_1m",
-        truth_sources=(
-            {
-                "isotope": _ISOTOPE,
-                "position_xyz": source_position,
-                "intensity_cps_1m": _SOURCE_STRENGTH_CPS_1M,
-                "surface_patch_index": int(source_patch_index),
-                "surface_patch_id": int(source_patch.patch_id),
-                "surface_object_id": source_patch.object_id,
-                "surface_kind": source_patch.surface_kind,
-            },
-        ),
+        run_id="analytic-surface-mle-demo",
         metadata={
             "demo_name": "analytic_surface_mle",
             "demo_schema_version": 1,
             "runtime_repository": "3D_estimation",
-            "vendored_runtime_snapshot": True,
             "observation_generation": (
                 "AnalyticSimulationRuntime -> RuntimeCountExtractor"
             ),
@@ -493,7 +475,6 @@ def _run_context(
             "route_response_condition_number": float(
                 response_condition_number
             ),
-            "source_patch_id": int(source_patch.patch_id),
             "recommended_mle_config": mle_config.to_dict(),
         },
     )
@@ -543,8 +524,6 @@ def build_analytic_mle_demo() -> AnalyticMLEDemoScenario:
         runtime_config=runtime_config,
         environment=environment,
         obstacle_grid=obstacle_grid,
-        source_patch=source_patch,
-        source_patch_index=source_patch_index,
         mle_config=mle_config,
         response_rank=response_rank,
         response_condition_number=response_condition_number,

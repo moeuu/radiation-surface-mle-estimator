@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from hashlib import sha256
 from importlib import import_module
 import json
 import math
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.model import EnvironmentConfig
@@ -18,17 +21,24 @@ from measurement.observation_model import (
     build_runtime_observation_model,
     continuous_kernel_from_observation_model,
 )
+from measurement.obstacle_assets import (
+    ObstacleComponent,
+    line_transport_model_from_components,
+    transport_model_from_components,
+)
 from measurement.obstacles import ObstacleGrid
+from runtime.forward_model_manifest import resolve_file_backed_model_asset
 from runtime.measurement_log import MeasurementLog, load_measurement_log
+from runtime.records import canonical_json_bytes, canonical_json_sha256
 
 from .config import MLEConfig
 from .estimator import SurfaceMLEEstimator
 from .observation_batch import observation_batch_from_log
+from .provenance import estimator_provenance
 from .types import MLEEstimate, ObservationBatch
 
 
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-_LOCAL_OBSTACLE_ROOT = (_REPOSITORY_ROOT / "obstacle_layouts").resolve()
 _SOURCE_RATE_MODEL = "detector_cps_1m"
 
 
@@ -48,6 +58,8 @@ class ReplayContext:
     resolved_obstacle_path: Path | None
     observation_model: RuntimeObservationModel
     kernel: ContinuousKernel
+    config_sha256: str
+    resolved_estimator_config_sha256: str
 
 
 @dataclass(frozen=True)
@@ -64,8 +76,7 @@ def _normalized_source_rate_model(value: object, *, origin: str) -> str:
     normalized = str(value).strip().lower()
     if normalized != _SOURCE_RATE_MODEL:
         raise ValueError(
-            f"{origin} source_rate_model must be {_SOURCE_RATE_MODEL!r}; "
-            f"got {value!r}."
+            f"{origin} source_rate_model must be {_SOURCE_RATE_MODEL!r}; got {value!r}."
         )
     return normalized
 
@@ -90,12 +101,21 @@ def _sequence_of_floats(
     return parsed
 
 
-def _environment_dimensions(payload: Mapping[str, object]) -> tuple[float, float, float] | None:
+def _environment_dimensions(
+    payload: Mapping[str, object],
+) -> tuple[float, float, float] | None:
     """Extract room dimensions from one environment/runtime mapping."""
     if all(key in payload for key in ("size_x", "size_y", "size_z")):
         return _sequence_of_floats(
             [payload["size_x"], payload["size_y"], payload["size_z"]],
             name="environment size_x/size_y/size_z",
+            length=3,
+            positive=True,
+        )
+    if all(key in payload for key in ("size_x_m", "size_y_m", "size_z_m")):
+        return _sequence_of_floats(
+            [payload["size_x_m"], payload["size_y_m"], payload["size_z_m"]],
+            name="environment size_x_m/size_y_m/size_z_m",
             length=3,
             positive=True,
         )
@@ -128,7 +148,9 @@ def _environment_mappings(
 
 def _resolve_environment_config(log: MeasurementLog) -> EnvironmentConfig:
     """Construct EnvironmentConfig from persisted environment/runtime payloads."""
-    mappings = _environment_mappings(log.context.environment, log.context.runtime_config)
+    mappings = _environment_mappings(
+        log.context.environment, log.context.runtime_config
+    )
     dimensions = None
     for payload in mappings:
         dimensions = _environment_dimensions(payload)
@@ -161,8 +183,120 @@ def _resolve_environment_config(log: MeasurementLog) -> EnvironmentConfig:
     )
 
 
-def _embedded_obstacle_grid(environment_payload: Mapping[str, object]) -> ObstacleGrid | None:
-    """Return an obstacle grid embedded directly in environment.json, if present."""
+def _axis_aligned_obstacle_grid(
+    payloads: Sequence[object],
+    *,
+    environment_payload: Mapping[str, object],
+    isotopes: tuple[str, ...],
+) -> ObstacleGrid | None:
+    """Convert neutral axis-aligned boxes into local surface/transport geometry."""
+    if not payloads:
+        return None
+    components: list[ObstacleComponent] = []
+    footprints: list[tuple[float, float, float, float]] = []
+    for index, raw_payload in enumerate(payloads):
+        if not isinstance(raw_payload, Mapping):
+            raise ValueError(f"environment obstacles[{index}] must be an object.")
+        if raw_payload.get("kind") != "axis_aligned_box":
+            raise ValueError("Only axis_aligned_box neutral obstacles are supported.")
+        lower = _sequence_of_floats(
+            raw_payload.get("min_xyz_m"),
+            name=f"obstacles[{index}].min_xyz_m",
+            length=3,
+            positive=False,
+        )
+        upper = _sequence_of_floats(
+            raw_payload.get("max_xyz_m"),
+            name=f"obstacles[{index}].max_xyz_m",
+            length=3,
+            positive=False,
+        )
+        size = tuple(upper[axis] - lower[axis] for axis in range(3))
+        if any(value <= 0.0 for value in size):
+            raise ValueError("Neutral obstacle max_xyz_m must exceed min_xyz_m.")
+        material = str(raw_payload.get("material", "")).strip()
+        if not material:
+            raise ValueError("Neutral obstacle material must be non-empty.")
+        components.append(
+            ObstacleComponent(
+                name=str(raw_payload.get("object_id", f"obstacle-{index}")),
+                center_xyz=tuple(
+                    0.5 * (lower[axis] + upper[axis]) for axis in range(3)
+                ),
+                size_xyz=size,
+                material=material,
+            )
+        )
+        footprints.append((lower[0], lower[1], size[0], size[1]))
+
+    cell_size = float(footprints[0][2])
+    if any(
+        not np.isclose(width, cell_size, rtol=1.0e-9, atol=1.0e-12)
+        or not np.isclose(height, cell_size, rtol=1.0e-9, atol=1.0e-12)
+        for _, _, width, height in footprints
+    ):
+        raise ValueError(
+            "Neutral obstacle footprints must be equal square cells for surface patches."
+        )
+    origin_xyz = _sequence_of_floats(
+        environment_payload.get("surface_origin_xyz_m", (0.0, 0.0, 0.0)),
+        name="surface_origin_xyz_m",
+        length=3,
+        positive=False,
+    )
+    dimensions = _environment_dimensions(environment_payload)
+    if dimensions is None:
+        raise ValueError("Neutral obstacle geometry requires room dimensions.")
+    grid_shape_float = (
+        dimensions[0] / cell_size,
+        dimensions[1] / cell_size,
+    )
+    grid_shape = tuple(int(round(value)) for value in grid_shape_float)
+    if any(
+        not np.isclose(value, rounded, rtol=1.0e-9, atol=1.0e-12)
+        for value, rounded in zip(grid_shape_float, grid_shape, strict=True)
+    ):
+        raise ValueError("Room dimensions must align to neutral obstacle cell size.")
+    blocked_cells: list[tuple[int, int]] = []
+    for x_min, y_min, _, _ in footprints:
+        indices_float = (
+            (x_min - origin_xyz[0]) / cell_size,
+            (y_min - origin_xyz[1]) / cell_size,
+        )
+        indices = tuple(int(round(value)) for value in indices_float)
+        if any(
+            not np.isclose(value, rounded, rtol=1.0e-9, atol=1.0e-12)
+            for value, rounded in zip(indices_float, indices, strict=True)
+        ):
+            raise ValueError(
+                "Neutral obstacle footprints must align to the surface grid."
+            )
+        blocked_cells.append(indices)
+    boxes, mu_by_isotope = transport_model_from_components(
+        components,
+        isotopes=isotopes,
+    )
+    line_mu_by_isotope = line_transport_model_from_components(
+        components,
+        isotopes=isotopes,
+    )
+    return ObstacleGrid(
+        origin=(origin_xyz[0], origin_xyz[1]),
+        cell_size=cell_size,
+        grid_shape=(grid_shape[0], grid_shape[1]),
+        blocked_cells=tuple(blocked_cells),
+        transport_boxes_m=boxes,
+        transport_mu_by_isotope=mu_by_isotope,
+        transport_line_mu_by_isotope=line_mu_by_isotope,
+    )
+
+
+def _embedded_obstacle_grid(
+    environment_payload: Mapping[str, object],
+    *,
+    isotopes: tuple[str, ...],
+) -> ObstacleGrid | None:
+    """Return local geometry from an embedded grid or neutral box list."""
     candidates: list[object] = []
     for key in ("obstacle_grid", "obstacle_layout", "obstacles"):
         if key in environment_payload and environment_payload[key] is not None:
@@ -172,57 +306,28 @@ def _embedded_obstacle_grid(environment_payload: Mapping[str, object]) -> Obstac
     if not candidates:
         return None
     if len(candidates) > 1:
-        raise ValueError("environment.json contains multiple embedded obstacle layouts.")
-    payload = candidates[0]
-    if not isinstance(payload, Mapping):
-        raise ValueError("Embedded obstacle layout must be a JSON object.")
-    return ObstacleGrid.from_dict(dict(payload))
-
-
-def _is_within(path: Path, root: Path) -> bool:
-    """Return whether a resolved path is contained by a resolved root."""
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-    return True
-
-
-def _safe_relative_path(path_value: object, *, field_name: str) -> Path:
-    """Reject absolute paths and parent traversal from persisted logs."""
-    path = Path(str(path_value))
-    if path.is_absolute():
         raise ValueError(
-            f"{field_name} must be relative; absolute paths are forbidden in standalone replay."
+            "environment.json contains multiple embedded obstacle layouts."
         )
-    if not path.parts or any(part == ".." for part in path.parts):
-        raise ValueError(f"{field_name} must not contain parent-directory traversal.")
-    return path
+    payload = candidates[0]
+    if isinstance(payload, Sequence) and not isinstance(payload, (str, bytes)):
+        return _axis_aligned_obstacle_grid(
+            payload,
+            environment_payload=environment_payload,
+            isotopes=isotopes,
+        )
+    if not isinstance(payload, Mapping):
+        raise ValueError("Embedded obstacle layout must be an object or box array.")
+    return ObstacleGrid.from_dict(dict(payload))
 
 
 def _resolve_local_obstacle_path(run_dir: Path, path_value: object) -> Path:
     """Resolve an obstacle layout only inside the run or local repository assets."""
-    relative = _safe_relative_path(path_value, field_name="obstacle_layout_path")
-    resolved_run_dir = run_dir.resolve()
-    run_candidate = (resolved_run_dir / relative).resolve()
-    if not _is_within(run_candidate, resolved_run_dir):
-        raise ValueError("obstacle_layout_path escapes the measurement run directory.")
-    if run_candidate.is_file():
-        return run_candidate
-
-    relative_parts = relative.parts
-    if relative_parts and relative_parts[0] == "obstacle_layouts":
-        repository_relative = Path(*relative_parts[1:])
-    else:
-        repository_relative = relative
-    repository_candidate = (_LOCAL_OBSTACLE_ROOT / repository_relative).resolve()
-    if not _is_within(repository_candidate, _LOCAL_OBSTACLE_ROOT):
-        raise ValueError("obstacle_layout_path escapes the local obstacle_layouts directory.")
-    if repository_candidate.is_file():
-        return repository_candidate
-    raise FileNotFoundError(
-        "Obstacle layout was not found in the measurement run or this repository: "
-        f"{relative.as_posix()!r}. Checked {run_candidate} and {repository_candidate}."
+    return resolve_file_backed_model_asset(
+        path_value,
+        field_name="obstacle_layout_path",
+        run_root=run_dir,
+        repository_root=_REPOSITORY_ROOT,
     )
 
 
@@ -231,7 +336,10 @@ def _resolve_obstacle_grid(
     run_dir: Path,
 ) -> tuple[ObstacleGrid | None, Path | None]:
     """Resolve embedded, run-local, or repository-local obstacle data."""
-    embedded = _embedded_obstacle_grid(log.context.environment)
+    embedded = _embedded_obstacle_grid(
+        log.context.environment,
+        isotopes=log.context.isotopes,
+    )
     if embedded is not None:
         return embedded, None
     path_value = log.context.obstacle_layout_path
@@ -261,30 +369,18 @@ def _safe_runtime_model_payload(
     model_path_value = payload.pop("pf_transport_response_model_path", None)
     if model_path_value is None:
         return payload
-    relative = _safe_relative_path(
+    selected = resolve_file_backed_model_asset(
         model_path_value,
         field_name="pf_transport_response_model_path",
+        run_root=run_dir,
+        repository_root=_REPOSITORY_ROOT,
     )
-    resolved_run_dir = run_dir.resolve()
-    candidates = (
-        (resolved_run_dir / relative).resolve(),
-        (_REPOSITORY_ROOT / relative).resolve(),
-    )
-    allowed_roots = (resolved_run_dir, _REPOSITORY_ROOT)
-    selected = None
-    for candidate, allowed_root in zip(candidates, allowed_roots, strict=True):
-        if _is_within(candidate, allowed_root) and candidate.is_file():
-            selected = candidate
-            break
-    if selected is None:
-        raise FileNotFoundError(
-            "pf_transport_response_model_path was not found in the run or local repository: "
-            f"{relative.as_posix()!r}."
-        )
     try:
         loaded = json.loads(selected.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Could not load transport response model {selected}.") from exc
+        raise ValueError(
+            f"Could not load transport response model {selected}."
+        ) from exc
     if isinstance(loaded, Mapping) and isinstance(
         loaded.get("pf_transport_response_model"),
         Mapping,
@@ -326,6 +422,7 @@ def prepare_replay(
     run_dir: str | Path,
     *,
     config: MLEConfig | Mapping[str, Any] | str | Path | None = None,
+    config_source_sha256: str | None = None,
 ) -> ReplayContext:
     """Load a measurement log and construct its fully local forward model."""
     resolved_run_dir = Path(run_dir).resolve()
@@ -336,6 +433,17 @@ def prepare_replay(
     )
     batch = observation_batch_from_log(log)
     mle_config = _resolve_mle_config(config, batch)
+    if config_source_sha256 is not None:
+        config_sha256 = str(config_source_sha256).lower()
+        if len(config_sha256) != 64 or any(
+            character not in "0123456789abcdef" for character in config_sha256
+        ):
+            raise ValueError("config_source_sha256 must be a lowercase SHA-256 digest.")
+    elif isinstance(config, (str, Path)):
+        config_sha256 = sha256(Path(config).read_bytes()).hexdigest()
+    else:
+        config_sha256 = sha256(canonical_json_bytes(mle_config.to_dict())).hexdigest()
+    resolved_estimator_config_sha256 = canonical_json_sha256(mle_config.to_dict())
     environment = _resolve_environment_config(log)
     obstacle_grid, obstacle_path = _resolve_obstacle_grid(log, resolved_run_dir)
     runtime_config = _safe_runtime_model_payload(
@@ -361,6 +469,8 @@ def prepare_replay(
         resolved_obstacle_path=obstacle_path,
         observation_model=observation_model,
         kernel=kernel,
+        config_sha256=config_sha256,
+        resolved_estimator_config_sha256=resolved_estimator_config_sha256,
     )
 
 
@@ -385,15 +495,52 @@ def run_replay(
     config: MLEConfig | Mapping[str, Any] | str | Path | None = None,
     output_dir: str | Path | None = None,
     save_hook: ReplaySaveHook | None = None,
+    config_source_sha256: str | None = None,
 ) -> ReplayResult:
     """Prepare, fit, and optionally persist one standalone replay result."""
-    context = prepare_replay(run_dir, config=config)
+    context = prepare_replay(
+        run_dir,
+        config=config,
+        config_source_sha256=config_source_sha256,
+    )
     estimate = SurfaceMLEEstimator(context.config).fit(
         context.batch,
         context.environment,
         context.kernel,
         obstacle_grid=context.obstacle_grid,
     )
+    if isinstance(estimate, MLEEstimate):
+        measurement_log_digest = context.log.content_sha256
+        if measurement_log_digest is None:
+            raise ValueError("Loaded MeasurementLog is missing its content SHA-256.")
+        forward_model_manifest_sha256 = sha256(
+            (context.run_dir / "forward_model_manifest.json").read_bytes()
+        ).hexdigest()
+        provenance = estimator_provenance(
+            variant=context.config.mode,
+            measurement_log_schema_version=context.log.context.schema_version,
+            measurement_run_id=context.log.context.run_id,
+            measurement_repository_commit=context.log.context.repository_commit,
+            resolved_config_sha256=context.log.context.runtime_config_sha256,
+            forward_model_manifest_sha256=forward_model_manifest_sha256,
+            measurement_log_sha256=measurement_log_digest,
+            config_sha256=context.config_sha256,
+            resolved_estimator_config_sha256=(context.resolved_estimator_config_sha256),
+        )
+        estimate = replace(
+            estimate,
+            diagnostics={
+                **estimate.diagnostics,
+                "provenance": provenance,
+                "estimator_family": provenance["estimator_family"],
+                "estimator_variant": provenance["estimator_variant"],
+                "candidate_domain": provenance["candidate_domain"],
+                "uses_pf_state": provenance["uses_pf_state"],
+                "uses_pf_candidates": provenance["uses_pf_candidates"],
+                "measurement_run_id": context.log.context.run_id,
+                "measurement_log_schema_version": context.log.context.schema_version,
+            },
+        )
     saved_output = None
     if output_dir is not None:
         hook = save_hook if save_hook is not None else _available_reporting_hook()

@@ -275,6 +275,7 @@ from runtime_defaults import (
 from runtime_environment import build_runtime_obstacle_environment
 from runtime.measurement_log import MeasurementLogRecorder
 from runtime.records import MeasurementRecord, RunContext
+from three_d_estimation.provenance import repository_commit
 from sim import (
     SimulationCommand,
     SimulationObservation,
@@ -322,20 +323,6 @@ HEALTH_LOG_TOP_K = 0
 ADAPTIVE_STEP_ID_STRIDE = 100000
 
 
-def _local_snapshot_commit() -> str:
-    """Return the vendored runtime provenance without consulting another repo."""
-    provenance_path = ROOT / "UPSTREAM_PF_COMMIT"
-    try:
-        value = provenance_path.read_text(encoding="utf-8").strip()
-    except OSError as exc:
-        raise RuntimeError(
-            f"Local runtime provenance file is unavailable: {provenance_path}"
-        ) from exc
-    if not value:
-        raise ValueError(f"Local runtime provenance file is empty: {provenance_path}")
-    return value
-
-
 def _portable_repository_path(path_value: str | None) -> str | None:
     """Return a repository-relative provenance path, never an external dependency."""
     if path_value is None or not str(path_value).strip():
@@ -354,13 +341,11 @@ def _build_measurement_run_context(
     runtime_config: Mapping[str, object],
     environment: EnvironmentConfig,
     obstacle_grid: ObstacleGrid | None,
-    sources: Sequence[PointSource],
     isotopes: Sequence[str],
     sim_backend: str,
     spectrum_count_method: str,
     environment_mode: str,
     obstacle_layout_path: str | None,
-    source_layout_path: str | None,
     output_tag: str | None,
     measurement_time_s: float,
     adaptive_dwell: bool,
@@ -387,28 +372,18 @@ def _build_measurement_run_context(
         "environment_mode": str(environment_mode),
         "obstacle_grid": None if obstacle_grid is None else obstacle_grid.to_dict(),
     }
-    truth_sources = tuple(
-        {
-            "isotope": str(source.isotope),
-            "position_xyz": [float(value) for value in source.position],
-            "intensity_cps_1m": float(source.intensity_cps_1m),
-        }
-        for source in sources
-    )
     return RunContext(
-        upstream_pf_commit=_local_snapshot_commit(),
+        repository_commit=repository_commit(),
         runtime_config=resolved_runtime_config,
         environment=environment_payload,
         sim_backend=str(sim_backend),
         spectrum_count_method=str(spectrum_count_method),
         isotopes=tuple(str(name) for name in isotopes),
         obstacle_layout_path=_portable_repository_path(obstacle_layout_path),
-        source_layout_path=_portable_repository_path(source_layout_path),
         source_rate_model="detector_cps_1m",
-        truth_sources=truth_sources,
+        run_id=(None if output_tag is None else str(output_tag)),
         metadata={
             "runtime_repository": "3D_estimation",
-            "vendored_runtime_snapshot": True,
             "output_tag": output_tag,
         },
     )
@@ -11784,13 +11759,11 @@ def run_live_pf(
             runtime_config=runtime_config,
             environment=env,
             obstacle_grid=obstacle_grid,
-            sources=sources,
             isotopes=isotopes,
             sim_backend=sim_backend,
             spectrum_count_method=spectrum_count_method,
             environment_mode=normalized_environment_mode,
             obstacle_layout_path=obstacle_layout_path,
-            source_layout_path=source_layout_path,
             output_tag=output_tag,
             measurement_time_s=live_time,
             adaptive_dwell=adaptive_dwell,
@@ -12424,6 +12397,7 @@ def run_live_pf(
                             "count_variance_by_isotope": log_variances,
                             "spectrum_count_method": spectrum_count_method,
                         },
+                        include_observation_metadata=False,
                     )
                     # This durable append must remain before Measurement/PF mutation.
                     measurement_log_recorder.append(log_record)

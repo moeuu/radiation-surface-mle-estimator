@@ -181,12 +181,13 @@ Response columns outside that support are zeroed. The selected problem is then r
 
 ## Fit/hold-out split and diagnostics
 
-`held_out_fraction` deterministically samples whole measurement rows using `random_seed`; at least one measurement remains in the fit. The estimator fits only the training rows, predicts every row, and reports held-out Poisson deviance when the held-out set is non-empty.
+`held_out_fraction` deterministically selects complete groups using `random_seed`; at least one measurement remains in the fit. `held_out_grouping` defaults to `station_id`, so related shield views at one station cannot cross the fit/held-out boundary. `same_xy_height` additionally keeps vertically separated records at the same XY location together, while `shield_program_block` groups the explicit block IDs preserved from observation metadata. Only the explicit diagnostic `row` mode permits individual rows to split. The estimator fits only the training groups, predicts every row, and reports held-out Poisson deviance when the held-out set is non-empty.
 
 Every estimate records:
 
 - mode, units, patch count, and response tensor shape;
 - fit and held-out measurement indices;
+- held-out grouping, per-row group labels, and selected group IDs;
 - full residual arrays and residual L2 norm;
 - Poisson negative log likelihood and total deviance;
 - L1, TV, group, and nuisance penalty contributions;
@@ -232,6 +233,6 @@ The implemented public JSON fields are grouped below:
 | Spectral pulse | `continuum_to_peak`, `backscatter_fraction` |
 | Refinement/debias | `coarse_to_fine_levels`, `refinement_fraction`, `debias_refit`, `support_threshold_fraction` |
 | Post-processing | `response_correlation_threshold`, `cluster_threshold_fraction`, `cluster_min_strength_cps_1m` |
-| Evaluation split | `held_out_fraction`, `random_seed` |
+| Evaluation split | `held_out_fraction`, `held_out_grouping`, `held_out_xy_tolerance_m`, `random_seed` |
 
 Examples are checked in under [configs/mle](../../configs/mle). The CLI validates these fields through `MLEConfig`; unknown fields or physically invalid values fail rather than being ignored.

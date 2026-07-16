@@ -1,0 +1,12 @@
+{"action_id":0,"array_index":0,"metadata":{"acquisition":"analytic_shared_fixture","shield_pair":"0:0"},"run_id":"shared-small-run-v1","station_id":0,"step_id":0}
+{"action_id":1,"array_index":1,"metadata":{"acquisition":"analytic_shared_fixture","shield_pair":"2:4"},"run_id":"shared-small-run-v1","station_id":0,"step_id":1}
+{"action_id":2,"array_index":2,"metadata":{"acquisition":"analytic_shared_fixture","shield_pair":"5:7"},"run_id":"shared-small-run-v1","station_id":0,"step_id":2}
+{"action_id":3,"array_index":3,"metadata":{"acquisition":"analytic_shared_fixture","shield_pair":"1:6"},"run_id":"shared-small-run-v1","station_id":1,"step_id":3}
+{"action_id":4,"array_index":4,"metadata":{"acquisition":"analytic_shared_fixture","shield_pair":"3:1"},"run_id":"shared-small-run-v1","station_id":1,"step_id":4}
+{"action_id":5,"array_index":5,"metadata":{"acquisition":"analytic_shared_fixture","shield_pair":"7:3"},"run_id":"shared-small-run-v1","station_id":1,"step_id":5}
+{"action_id":6,"array_index":6,"metadata":{"acquisition":"analytic_shared_fixture","shield_pair":"0:7"},"run_id":"shared-small-run-v1","station_id":2,"step_id":6}
+{"action_id":7,"array_index":7,"metadata":{"acquisition":"analytic_shared_fixture","shield_pair":"4:2"},"run_id":"shared-small-run-v1","station_id":2,"step_id":7}
+{"action_id":8,"array_index":8,"metadata":{"acquisition":"analytic_shared_fixture","shield_pair":"6:5"},"run_id":"shared-small-run-v1","station_id":2,"step_id":8}
+{"action_id":9,"array_index":9,"metadata":{"acquisition":"analytic_shared_fixture","shield_pair":"1:1"},"run_id":"shared-small-run-v1","station_id":3,"step_id":9}
+{"action_id":10,"array_index":10,"metadata":{"acquisition":"analytic_shared_fixture","shield_pair":"3:6"},"run_id":"shared-small-run-v1","station_id":3,"step_id":10}
+{"action_id":11,"array_index":11,"metadata":{"acquisition":"analytic_shared_fixture","shield_pair":"7:0"},"run_id":"shared-small-run-v1","station_id":3,"step_id":11}
