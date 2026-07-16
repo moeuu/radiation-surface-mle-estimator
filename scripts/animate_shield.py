@@ -1,5 +1,4 @@
 import matplotlib.pyplot as plt
-import numpy as np
 from matplotlib.animation import FuncAnimation
 
 from three_d_estimation.animation import draw_shield

@@ -9,8 +9,6 @@ import inspect
 import json
 import math
 from pathlib import Path
-from typing import Any
-
 import numpy as np
 
 from measurement.model import EnvironmentConfig

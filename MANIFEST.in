@@ -1,0 +1,16 @@
+prune src/baselines
+prune src/pf
+prune src/planning
+prune src/visualization
+prune tests
+
+exclude src/cui_runtime.py
+exclude src/evaluation_metrics.py
+exclude src/mission_control.py
+exclude src/piplup_notify.py
+exclude src/realtime_demo.py
+exclude src/runtime_defaults.py
+exclude src/runtime_environment.py
+
+global-exclude __pycache__
+global-exclude *.py[cod]

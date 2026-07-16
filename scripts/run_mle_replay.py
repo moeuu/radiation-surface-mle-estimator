@@ -11,7 +11,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from three_d_estimation.cli import main
+from three_d_estimation.cli import main  # noqa: E402
 
 
 if __name__ == "__main__":

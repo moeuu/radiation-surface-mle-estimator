@@ -5,7 +5,7 @@ standalone pure-PF and pure-MLE replay contracts. It contains twelve causal
 rows at four stations/heights, three Fe/Pb views per station, raw spectra,
 spectrum variances, and complete three-isotope counts/covariance. The exact
 MeasurementLog inventory digest is
-`b52a0066f47d83bcd44aebfc97ff213f3200477c3a8d3f722fee40b2a29c7a69`.
+`2ed73e665983ab1deffdb8e867b92e6becf962089e4c2ccad1640649f50bdc5d`.
 
 Regenerate the deterministic binary observation member after moving the
 existing file aside with:

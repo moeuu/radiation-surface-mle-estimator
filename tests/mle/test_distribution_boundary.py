@@ -37,3 +37,21 @@ def test_package_discovery_excludes_pf_and_realtime_demo() -> None:
         "spectrum",
         "three_d_estimation",
     }.issubset(packages)
+
+
+def test_source_distribution_prunes_non_mle_application_trees() -> None:
+    """The sdist must enforce the same PF/planner boundary as the wheel."""
+    directives = {
+        line.strip()
+        for line in (ROOT / "MANIFEST.in").read_text("utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    }
+
+    assert {
+        "prune src/baselines",
+        "prune src/pf",
+        "prune src/planning",
+        "prune src/visualization",
+        "prune tests",
+        "exclude src/realtime_demo.py",
+    }.issubset(directives)

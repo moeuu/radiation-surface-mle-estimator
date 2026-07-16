@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from measurement.model import EnvironmentConfig, PointSource
+from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
 from realtime_demo import (
     _build_measurement_run_context,
