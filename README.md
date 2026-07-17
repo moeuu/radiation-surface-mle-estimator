@@ -93,13 +93,15 @@ Each observation is finalized after adaptive-dwell merging and spectrum processi
 
 ## Replay with surface MLE
 
-The installed CLI has four subcommands:
+The installed CLI has six subcommands:
 
 ```text
 estimate-radiation-mle replay
 estimate-radiation-mle fit-spectrum
 estimate-radiation-mle report
 estimate-radiation-mle forward-conformance
+estimate-radiation-mle materialize-prefix
+estimate-radiation-mle score-future
 ```
 
 ### Count-domain replay
@@ -129,6 +131,46 @@ uv run estimate-radiation-mle fit-spectrum \
 The command determines its mode: `replay` forces count mode and `fit-spectrum` forces spectral mode even if the supplied JSON contains another `mode`. A supplied configuration's `isotope_names` and order must exactly match the log. If `--mle-config` is omitted, the CLI derives the isotope order from the log and uses `MLEConfig` defaults for that mode.
 
 If `--output-dir` is omitted, results go to `RUN_DIR/mle_count` or `RUN_DIR/mle_spectral`. Existing MLE report files are protected; pass `--overwrite` to replace them. Use `--no-debias` to skip the support-selected unregularized refit, and `--json` for a machine-readable fit summary.
+
+### Causal hybrid-provider boundaries
+
+Standalone cold replay remains the default and does not depend on PF state. The
+orchestrator may additionally request an exact station-complete prefix and initialize
+its next count fit from a prior report:
+
+```bash
+uv run estimate-radiation-mle materialize-prefix \
+  --run-dir results/measurement-logs/analytic-ex1 \
+  --cutoff-step 23 --cutoff-station 5 --assert-station-complete \
+  --output-dir results/prefixes/through-23
+
+uv run estimate-radiation-mle replay \
+  --run-dir results/prefixes/through-23 \
+  --mle-config configs/mle/default_count.json \
+  --initial-estimate results/mle/prefix-through-15 \
+  --output-dir results/mle/prefix-through-23 --cpu
+```
+
+`--initial-estimate` supplies optimizer initialization only. The response, objective,
+and diagnostics are rebuilt over the complete current prefix; previous objective terms
+are not inherited. The output records exact prefix and prior-artifact hashes.
+
+Future-only verification freezes that earlier count model and compares its full
+prediction with the same model after zeroing each candidate cluster:
+
+```bash
+uv run estimate-radiation-mle score-future \
+  --run-dir results/prefixes/through-31 \
+  --mle-config configs/mle/default_count.json \
+  --snapshot-estimate results/mle/prefix-through-23 \
+  --snapshot results/snapshots/through-23.json \
+  --output results/scores/through-31.json
+```
+
+No parameter is refit on future rows. The reported quantity is a frozen-model count
+log predictive likelihood ratio, not a Bayes factor. These commands never accept PF
+particles, PF candidate support, or truth; they are provider boundaries for the
+separate orchestrator repository.
 
 ### Read a saved report
 

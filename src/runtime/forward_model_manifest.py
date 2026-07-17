@@ -145,7 +145,9 @@ def _safe_relative_asset_path(path_value: object, *, field_name: str) -> Path:
         raise ValueError(f"{field_name} must use portable forward-slash separators.")
     relative = Path(raw)
     if relative.is_absolute():
-        raise ValueError(f"{field_name} must be relative; absolute paths are forbidden.")
+        raise ValueError(
+            f"{field_name} must be relative; absolute paths are forbidden."
+        )
     if not relative.parts or any(part in {"", ".."} for part in relative.parts):
         raise ValueError(f"{field_name} must not contain parent-directory traversal.")
     return relative
@@ -280,6 +282,30 @@ def _runtime_file_asset_identities(
             repository_root=repository_root,
         )
     return grouped
+
+
+def file_backed_model_asset_paths(
+    runtime_config: Mapping[str, object],
+    *,
+    obstacle_layout_path: str | None,
+) -> tuple[str, ...]:
+    """Return canonical relative paths for every configured model asset."""
+    paths: set[str] = set()
+    if obstacle_layout_path is not None:
+        paths.add(
+            _safe_relative_asset_path(
+                obstacle_layout_path,
+                field_name="obstacle_layout_path",
+            ).as_posix()
+        )
+    for field_path, _, path_value in _runtime_file_asset_references(runtime_config):
+        paths.add(
+            _safe_relative_asset_path(
+                path_value,
+                field_name=f"runtime_config.{field_path}",
+            ).as_posix()
+        )
+    return tuple(sorted(paths))
 
 
 def forward_model_component_payloads(
@@ -689,6 +715,7 @@ __all__ = [
     "SOURCE_RATE_SEMANTICS",
     "RESPONSE_SEMANTICS",
     "build_forward_model_manifest",
+    "file_backed_model_asset_paths",
     "forward_model_component_payloads",
     "load_forward_model_manifest",
     "registered_conformance_line_mu_by_isotope",

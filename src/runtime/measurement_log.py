@@ -26,6 +26,8 @@ from runtime.records import (
 from runtime.forward_model_manifest import (
     SOURCE_RATE_SEMANTICS,
     build_forward_model_manifest,
+    file_backed_model_asset_paths,
+    resolve_file_backed_model_asset,
     validate_forward_model_manifest,
 )
 
@@ -136,6 +138,48 @@ def _write_deterministic_npz(
                 archive.writestr(entry, buffer.getvalue())
         raw_handle.flush()
         os.fsync(raw_handle.fileno())
+
+
+def _normalize_extra_artifacts(
+    artifacts: Mapping[str, bytes] | None,
+) -> dict[str, bytes]:
+    """Validate deterministic truth-free auxiliary model artifacts."""
+    if artifacts is None:
+        return {}
+    if not isinstance(artifacts, Mapping):
+        raise TypeError("extra_artifacts must be a mapping or None.")
+    reserved = set(_REQUIRED_FILES) | {
+        _LEGACY_COMMIT_FILENAME,
+        _TRUTH_FILENAME,
+        _LEGACY_TRUTH_FILENAME,
+    }
+    normalized: dict[str, bytes] = {}
+    for raw_name, raw_payload in artifacts.items():
+        if not isinstance(raw_name, str) or not raw_name:
+            raise ValueError("extra_artifacts keys must be non-empty relative paths.")
+        if "\\" in raw_name:
+            raise ValueError("extra_artifacts paths must use forward slashes.")
+        relative = Path(raw_name)
+        name = relative.as_posix()
+        if (
+            relative.is_absolute()
+            or name != raw_name
+            or any(part in {"", ".", ".."} for part in relative.parts)
+        ):
+            raise ValueError(f"Invalid extra_artifacts path: {raw_name!r}.")
+        if name in reserved or _is_forbidden_estimator_artifact(name):
+            raise ValueError(f"Forbidden extra_artifacts path: {name!r}.")
+        if not isinstance(raw_payload, bytes):
+            raise TypeError(f"extra_artifacts[{name!r}] must contain bytes.")
+        normalized[name] = raw_payload
+    paths = {name: Path(name) for name in normalized}
+    for left_name, left in paths.items():
+        for right_name, right in paths.items():
+            if left_name != right_name and left in right.parents:
+                raise ValueError(
+                    "extra_artifacts cannot use one artifact as another's directory."
+                )
+    return {name: normalized[name] for name in sorted(normalized)}
 
 
 def _validate_records(
@@ -418,6 +462,9 @@ def save_measurement_log(
     run_dir: str | Path,
     context: RunContext,
     records: Iterable[MeasurementRecord],
+    *,
+    extra_artifacts: Mapping[str, bytes] | None = None,
+    model_asset_root: str | Path | None = None,
 ) -> Path:
     """Atomically publish a complete measurement-log directory.
 
@@ -436,6 +483,29 @@ def save_measurement_log(
         )
     record_tuple = tuple(records)
     record_count, bin_count = _validate_records(context, record_tuple)
+    auxiliary_artifacts = _normalize_extra_artifacts(extra_artifacts)
+    declared_assets = set(
+        file_backed_model_asset_paths(
+            context.runtime_config,
+            obstacle_layout_path=context.obstacle_layout_path,
+        )
+    )
+    undeclared_assets = sorted(set(auxiliary_artifacts) - declared_assets)
+    if undeclared_assets:
+        raise ValueError(
+            "extra_artifacts contains files not declared by the forward model: "
+            f"{undeclared_assets}."
+        )
+    for name, payload in auxiliary_artifacts.items():
+        resolved_asset = resolve_file_backed_model_asset(
+            name,
+            field_name=f"extra_artifacts[{name!r}]",
+            run_root=model_asset_root,
+        )
+        if resolved_asset.read_bytes() != payload:
+            raise ValueError(
+                f"extra_artifacts[{name!r}] differs from its resolved model asset."
+            )
     expected_forward_manifest = build_forward_model_manifest(
         runtime_config=context.runtime_config,
         environment=context.environment,
@@ -444,6 +514,7 @@ def save_measurement_log(
         repository_commit=str(context.repository_commit),
         resolved_config_sha256=str(context.runtime_config_sha256),
         source_rate_model=context.source_rate_model,
+        run_root=model_asset_root,
     )
     if context.forward_model_manifest is None:
         forward_manifest = expected_forward_manifest
@@ -457,6 +528,7 @@ def save_measurement_log(
             repository_commit=str(context.repository_commit),
             resolved_config_sha256=str(context.runtime_config_sha256),
             source_rate_model=context.source_rate_model,
+            run_root=model_asset_root,
         )
 
     target = Path(run_dir)
@@ -510,6 +582,11 @@ def save_measurement_log(
             temporary / "repository_commit.txt",
             (str(context.repository_commit) + "\n").encode("utf-8"),
         )
+        for name, payload in auxiliary_artifacts.items():
+            artifact_path = temporary / name
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_bytes(artifact_path, payload)
+            _fsync_directory(artifact_path.parent)
         artifact_names = (
             "runtime_config.resolved.json",
             "environment.json",
@@ -517,7 +594,7 @@ def save_measurement_log(
             "observations.npz",
             "observation_metadata.jsonl",
             "repository_commit.txt",
-        )
+        ) + tuple(auxiliary_artifacts)
         artifact_hashes = {
             name: sha256((temporary / name).read_bytes()).hexdigest()
             for name in artifact_names

@@ -9,12 +9,34 @@ from .conformance import (
 )
 from .estimator import SurfaceMLEEstimator, fit_surface_mle
 from .estimator_backend import SurfaceMLEBackend
+from .future_scoring import (
+    covered_station_boundaries_sha256,
+    save_future_candidate_scores,
+    score_future_count_candidates,
+)
+from .measurement_prefix import (
+    MeasurementLogPrefix,
+    materialize_measurement_log_prefix,
+    measurement_records_sha256,
+)
 from .observation_batch import (
     observation_batch_from_log,
     observation_batch_from_records,
 )
-from .replay import ReplayContext, ReplayResult, prepare_replay, run_replay
-from .reporting import MLEReportPaths, load_mle_estimate, save_mle_estimate
+from .replay import (
+    ReplayContext,
+    ReplayResult,
+    WarmStartArtifact,
+    prepare_replay,
+    run_replay,
+    validate_warm_start_artifact,
+)
+from .reporting import (
+    MLEReportPaths,
+    load_mle_estimate,
+    mle_report_sha256,
+    save_mle_estimate,
+)
 from .response_builder import (
     CountResponseMatrices,
     build_count_response,
@@ -44,6 +66,7 @@ from .surface_patches import build_surface_patches, refine_surface_patches
 __all__ = [
     "MLEConfig",
     "MLEEstimate",
+    "MeasurementLogPrefix",
     "MLEReportPaths",
     "ObservationBatch",
     "ReplayContext",
@@ -55,6 +78,7 @@ __all__ = [
     "SurfaceMLEEstimator",
     "SurfacePatch",
     "SurfacePatchSet",
+    "WarmStartArtifact",
     "CountResponseMatrices",
     "ForwardConformanceResult",
     "SpectralResponseResult",
@@ -69,13 +93,20 @@ __all__ = [
     "fit_surface_map_poisson",
     "fit_surface_mle",
     "compute_forward_conformance",
+    "covered_station_boundaries_sha256",
     "load_forward_conformance_axes",
     "load_mle_estimate",
+    "materialize_measurement_log_prefix",
+    "measurement_records_sha256",
+    "mle_report_sha256",
     "observation_batch_from_log",
     "observation_batch_from_records",
     "prepare_replay",
     "run_replay",
+    "validate_warm_start_artifact",
     "refine_surface_patches",
     "save_mle_estimate",
+    "save_future_candidate_scores",
     "save_forward_conformance",
+    "score_future_count_candidates",
 ]

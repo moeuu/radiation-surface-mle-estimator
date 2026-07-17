@@ -107,7 +107,9 @@ def _config_payload(config: MLEConfig | Mapping[str, object] | None) -> object:
     to_dict = getattr(config, "to_dict", None)
     if callable(to_dict):
         return _json_safe(to_dict(), path="$.config")
-    raise TypeError("config must be MLEConfig, a mapping, expose to_dict(), or be None.")
+    raise TypeError(
+        "config must be MLEConfig, a mapping, expose to_dict(), or be None."
+    )
 
 
 def _offsets(lengths: Sequence[int]) -> NDArray[np.int64]:
@@ -154,7 +156,9 @@ def _canonical_adjacency(
                 rtol=1.0e-9,
                 atol=1.0e-12,
             ):
-                raise ValueError(f"Patch adjacency {key} has duplicate inconsistent lengths.")
+                raise ValueError(
+                    f"Patch adjacency {key} has duplicate inconsistent lengths."
+                )
             edge_lengths[key] = float(length)
     if not edge_lengths:
         return np.zeros((0, 2), dtype=np.int64), np.zeros(0, dtype=float)
@@ -175,12 +179,8 @@ def _estimate_arrays(
     patch_count = len(patches)
     quadrature_counts = [patch.quadrature_count for patch in patches]
     quadrature_offsets = _offsets(quadrature_counts)
-    quadrature_points = np.vstack(
-        [patch.quadrature_points_xyz for patch in patches]
-    )
-    quadrature_weights = np.concatenate(
-        [patch.quadrature_weights for patch in patches]
-    )
+    quadrature_points = np.vstack([patch.quadrature_points_xyz for patch in patches])
+    quadrature_weights = np.concatenate([patch.quadrature_weights for patch in patches])
     neighbor_counts = [len(patch.neighbor_patch_ids) for patch in patches]
     neighbor_offsets = _offsets(neighbor_counts)
     if neighbor_offsets[-1] > 0:
@@ -578,9 +578,7 @@ def _patches_from_archive(
                 f"got {actual_arrays[name].shape}."
             )
 
-    quadrature_points = np.asarray(
-        archive["patch_quadrature_points_xyz"], dtype=float
-    )
+    quadrature_points = np.asarray(archive["patch_quadrature_points_xyz"], dtype=float)
     quadrature_weights = np.asarray(archive["patch_quadrature_weights"], dtype=float)
     if quadrature_points.ndim != 2 or quadrature_points.shape[1:] != (3,):
         raise ValueError("patch_quadrature_points_xyz must have shape (Q, 3).")
@@ -675,6 +673,27 @@ def _report_directory(path: str | Path) -> Path:
     return candidate
 
 
+def mle_report_sha256(output_dir: str | Path) -> str:
+    """Hash the canonical files of one validated MLE report artifact."""
+    directory = _report_directory(output_dir)
+    estimate_path = directory / ESTIMATE_FILENAME
+    diagnostics_path = directory / DIAGNOSTICS_FILENAME
+    if not estimate_path.is_file() or not diagnostics_path.is_file():
+        raise FileNotFoundError(
+            f"MLE report requires {ESTIMATE_FILENAME} and {DIAGNOSTICS_FILENAME}."
+        )
+    inventory = {
+        ESTIMATE_FILENAME: sha256(estimate_path.read_bytes()).hexdigest(),
+        DIAGNOSTICS_FILENAME: sha256(diagnostics_path.read_bytes()).hexdigest(),
+    }
+    hotspot_path = directory / HOTSPOT_CLUSTERS_FILENAME
+    if hotspot_path.is_file():
+        inventory[HOTSPOT_CLUSTERS_FILENAME] = sha256(
+            hotspot_path.read_bytes()
+        ).hexdigest()
+    return sha256(_json_bytes(inventory)).hexdigest()
+
+
 def load_mle_estimate(output_dir: str | Path) -> MLEEstimate:
     """Load and validate an exact semantic round-trip of a saved estimate."""
     directory = _report_directory(output_dir)
@@ -693,12 +712,16 @@ def load_mle_estimate(output_dir: str | Path) -> MLEEstimate:
     try:
         archive_context = np.load(estimate_path, allow_pickle=False)
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
-        raise ValueError(f"Unable to read valid MLE estimate NPZ: {estimate_path}") from exc
+        raise ValueError(
+            f"Unable to read valid MLE estimate NPZ: {estimate_path}"
+        ) from exc
     with archive_context as archive:
         _required_npz_members(archive)
         schema_version = int(_scalar(archive["schema_version"], name="schema_version"))
         if schema_version != REPORT_SCHEMA_VERSION:
-            raise ValueError(f"Unsupported MLE estimate schema_version: {schema_version}")
+            raise ValueError(
+                f"Unsupported MLE estimate schema_version: {schema_version}"
+            )
         expected_digest = str(
             _scalar(archive["diagnostics_sha256"], name="diagnostics_sha256")
         )
@@ -776,13 +799,16 @@ def load_mle_estimate(output_dir: str | Path) -> MLEEstimate:
         rtol=0.0,
         atol=0.0,
     ):
-        raise ValueError("Stored global adjacency does not match patch neighbor metadata.")
+        raise ValueError(
+            "Stored global adjacency does not match patch neighbor metadata."
+        )
     _validate_diagnostics_mirror(metadata, estimate=estimate)
 
     hotspot_path = directory / HOTSPOT_CLUSTERS_FILENAME
-    clusters_available = "hotspot_clusters" in diagnostics and diagnostics.get(
-        "hotspot_clusters"
-    ) is not None
+    clusters_available = (
+        "hotspot_clusters" in diagnostics
+        and diagnostics.get("hotspot_clusters") is not None
+    )
     if clusters_available:
         if not hotspot_path.is_file():
             raise FileNotFoundError(
@@ -796,15 +822,15 @@ def load_mle_estimate(output_dir: str | Path) -> MLEEstimate:
         ):
             raise ValueError("hotspot_clusters.json does not match MLE diagnostics.")
     elif hotspot_path.exists():
-        raise ValueError("Stale hotspot_clusters.json exists without cluster diagnostics.")
+        raise ValueError(
+            "Stale hotspot_clusters.json exists without cluster diagnostics."
+        )
     return estimate
 
 
 def load_mle_config_payload(output_dir: str | Path) -> dict[str, object] | None:
     """Load the resolved configuration stored beside an estimate."""
-    metadata = _read_strict_json(
-        _report_directory(output_dir) / DIAGNOSTICS_FILENAME
-    )
+    metadata = _read_strict_json(_report_directory(output_dir) / DIAGNOSTICS_FILENAME)
     config = metadata.get("config")
     if config is None:
         return None
@@ -821,5 +847,6 @@ __all__ = [
     "REPORT_SCHEMA_VERSION",
     "load_mle_config_payload",
     "load_mle_estimate",
+    "mle_report_sha256",
     "save_mle_estimate",
 ]
