@@ -17,23 +17,20 @@ from measurement.observation_model import (
     continuous_kernel_from_observation_model,
 )
 from measurement.obstacles import ObstacleGrid
-from runtime.estimator_backend import (
+from three_d_estimation.backend_contracts import (
     EstimatorResult,
     EstimatorSnapshot,
     SourceMode,
     SurfaceMapSnapshot,
 )
-from runtime.measurement_log import MeasurementLog
 from runtime.records import MeasurementRecord, RunContext
 
 from .config import MLEConfig
 from .estimator import SurfaceMLEEstimator
-from .observation_batch import observation_batch_from_log
+from .observation_batch import observation_batch_from_records
 from .types import MLEEstimate
 
 
-_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-_OBSTACLE_ROOT = (_REPOSITORY_ROOT / "obstacle_layouts").resolve()
 _SOURCE_RATE_MODEL = "detector_cps_1m"
 
 
@@ -156,45 +153,17 @@ def _embedded_obstacle(context: RunContext) -> ObstacleGrid | None:
     return ObstacleGrid.from_dict(dict(candidates[0]))
 
 
-def _safe_relative_path(value: object, *, name: str) -> Path:
-    """Return a relative path without parent traversal or absolute dependency."""
-    path = Path(str(value))
-    if path.is_absolute():
-        raise ValueError(f"{name} must not be absolute in a standalone backend.")
-    if not path.parts or any(part == ".." for part in path.parts):
-        raise ValueError(f"{name} must not contain parent-directory traversal.")
-    return path
-
-
-def _within(path: Path, root: Path) -> bool:
-    """Return whether resolved path is contained by resolved root."""
-    try:
-        path.relative_to(root)
-    except ValueError:
-        return False
-    return True
-
-
 def _obstacle_from_context(context: RunContext) -> ObstacleGrid | None:
-    """Resolve obstacles from embedded data or committed local assets only."""
+    """Resolve obstacles only from shared-runtime embedded geometry."""
     embedded = _embedded_obstacle(context)
     if embedded is not None:
         return embedded
     path_value = context.obstacle_layout_path
     if path_value is None or not str(path_value).strip():
         return None
-    relative = _safe_relative_path(path_value, name="obstacle_layout_path")
-    if relative.parts[0] == "obstacle_layouts":
-        relative = Path(*relative.parts[1:])
-    candidate = (_OBSTACLE_ROOT / relative).resolve()
-    if not _within(candidate, _OBSTACLE_ROOT):
-        raise ValueError("obstacle_layout_path escapes local obstacle_layouts.")
-    if not candidate.is_file():
-        raise FileNotFoundError(
-            "Live SurfaceMLEBackend requires embedded obstacles or a committed local "
-            f"obstacle_layouts file; not found: {candidate}"
-        )
-    return ObstacleGrid.load(candidate)
+    raise ValueError(
+        "Live SurfaceMLEBackend requires the shared runtime to embed obstacle geometry."
+    )
 
 
 def _runtime_config_from_context(context: RunContext) -> dict[str, object]:
@@ -205,37 +174,10 @@ def _runtime_config_from_context(context: RunContext) -> dict[str, object]:
         raise ValueError("Runtime config source_rate_model must be 'detector_cps_1m'.")
     payload["source_rate_model"] = _SOURCE_RATE_MODEL
 
-    path_value = payload.pop("pf_transport_response_model_path", None)
-    inline_model = payload.get("pf_transport_response_model")
-    if inline_model is not None:
-        if not isinstance(inline_model, Mapping):
-            raise ValueError("pf_transport_response_model must contain an object.")
-        payload["pf_transport_response_model"] = deepcopy(dict(inline_model))
-        return payload
-    if path_value is None:
-        return payload
-    relative = _safe_relative_path(
-        path_value,
-        name="pf_transport_response_model_path",
-    )
-    candidate = (_REPOSITORY_ROOT / relative).resolve()
-    if not _within(candidate, _REPOSITORY_ROOT) or not candidate.is_file():
-        raise FileNotFoundError(
-            "pf_transport_response_model_path must resolve inside this repository: "
-            f"{relative}"
-        )
-    try:
-        loaded = json.loads(candidate.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValueError(f"Could not load local transport response model {candidate}.") from exc
-    if isinstance(loaded, Mapping) and isinstance(
-        loaded.get("pf_transport_response_model"),
-        Mapping,
-    ):
-        loaded = loaded["pf_transport_response_model"]
-    if not isinstance(loaded, Mapping):
-        raise ValueError("Transport response model must contain a JSON object.")
-    payload["pf_transport_response_model"] = dict(loaded)
+    if any(str(key).startswith("pf_") for key in payload):
+        raise ValueError("RunContext contains estimator-owned PF settings.")
+    if "full_spectrum_generative_model" not in payload:
+        raise ValueError("RunContext must embed full_spectrum_generative_model.")
     return payload
 
 
@@ -462,8 +404,10 @@ class SurfaceMLEBackend:
         assert self._environment is not None
         assert self._kernel is not None
         assert self._estimator is not None
-        log = MeasurementLog(context=self._context, records=tuple(self._records))
-        batch = observation_batch_from_log(log)
+        batch = observation_batch_from_records(
+            self._records,
+            self._context.isotopes,
+        )
         fit_kwargs: dict[str, object] = {"obstacle_grid": self._obstacle_grid}
         fit_signature = inspect.signature(self._estimator.fit)
         accepts_kwargs = any(

@@ -17,7 +17,6 @@ from .future_scoring import (
     save_future_candidate_scores,
     score_future_count_candidates,
 )
-from .measurement_prefix import materialize_measurement_log_prefix
 from .replay import run_replay
 from .reporting import load_mle_estimate, save_mle_estimate
 
@@ -116,45 +115,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--overwrite",
         action="store_true",
         help="Replace an existing conformance NPZ.",
-    )
-    prefix_parser = subparsers.add_parser(
-        "materialize-prefix",
-        help="Persist an exact truth-free MeasurementLog prefix.",
-    )
-    prefix_parser.add_argument(
-        "--run-dir",
-        type=Path,
-        required=True,
-        help="Complete source MeasurementLog directory.",
-    )
-    prefix_parser.add_argument(
-        "--output-dir",
-        type=Path,
-        required=True,
-        help="New prefix MeasurementLog directory.",
-    )
-    prefix_parser.add_argument(
-        "--cutoff-step",
-        type=int,
-        required=True,
-        help="Exact final step ID of the attested station boundary.",
-    )
-    prefix_parser.add_argument(
-        "--cutoff-station",
-        type=int,
-        required=True,
-        help="Exact final station ID paired with --cutoff-step.",
-    )
-    prefix_parser.add_argument(
-        "--assert-station-complete",
-        action="store_true",
-        help=(
-            "Attest a boundary supplied by an independently validated schedule "
-            "when the writer did not store metadata.station_complete=true."
-        ),
-    )
-    prefix_parser.add_argument(
-        "--json", action="store_true", help="Print prefix lineage as JSON."
     )
     score_parser = subparsers.add_parser(
         "score-future",
@@ -308,32 +268,6 @@ def _run_forward_conformance(args: argparse.Namespace) -> int:
     return 0
 
 
-def _run_materialize_prefix(args: argparse.Namespace) -> int:
-    """Materialize one explicitly attested station-complete log prefix."""
-    result = materialize_measurement_log_prefix(
-        args.run_dir,
-        args.output_dir,
-        cutoff_step=args.cutoff_step,
-        cutoff_station=args.cutoff_station,
-        assert_station_complete=bool(args.assert_station_complete),
-    )
-    payload = {
-        "output_dir": str(result.output_dir),
-        "record_count": result.record_count,
-        "covered_step_ids": list(result.covered_step_ids),
-        "data_cutoff_step": result.data_cutoff_step,
-        "data_cutoff_station": result.data_cutoff_station,
-        "covered_records_sha256": result.covered_records_sha256,
-        "measurement_log_sha256": result.measurement_log_sha256,
-    }
-    if args.json:
-        print(json.dumps(payload, indent=2, sort_keys=True))
-    else:
-        for name, value in payload.items():
-            print(f"{name}: {value}")
-    return 0
-
-
 def _run_score_future(args: argparse.Namespace) -> int:
     """Run frozen future-only candidate verification and save its artifact."""
     payload = score_future_count_candidates(
@@ -369,8 +303,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_report(args)
     if args.command == "forward-conformance":
         return _run_forward_conformance(args)
-    if args.command == "materialize-prefix":
-        return _run_materialize_prefix(args)
     if args.command == "score-future":
         return _run_score_future(args)
     parser.error(f"Unknown command: {args.command}")

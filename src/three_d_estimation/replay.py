@@ -33,7 +33,7 @@ from runtime.records import canonical_json_bytes, canonical_json_sha256
 
 from .config import MLEConfig
 from .estimator import SurfaceMLEEstimator
-from .measurement_prefix import (
+from runtime.prefix import (
     covered_station_boundaries_sha256,
     measurement_records_sha256,
 )
@@ -49,7 +49,6 @@ from .reporting import (
 from .types import MLEEstimate, ObservationBatch
 
 
-_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 _SOURCE_RATE_MODEL = "detector_cps_1m"
 
 
@@ -345,12 +344,11 @@ def _embedded_obstacle_grid(
 
 
 def _resolve_local_obstacle_path(run_dir: Path, path_value: object) -> Path:
-    """Resolve an obstacle layout only inside the run or local repository assets."""
+    """Resolve an obstacle layout inside the log or shared runtime assets."""
     return resolve_file_backed_model_asset(
         path_value,
         field_name="obstacle_layout_path",
         run_root=run_dir,
-        repository_root=_REPOSITORY_ROOT,
     )
 
 
@@ -379,7 +377,8 @@ def _safe_runtime_model_payload(
     runtime_config: Mapping[str, object],
     run_dir: Path,
 ) -> dict[str, object]:
-    """Inline the only file-backed observation-model payload using local paths."""
+    """Return the immutable observation model embedded by the shared runtime."""
+    del run_dir
     payload = deepcopy(dict(runtime_config))
     configured_rate_model = payload.get("source_rate_model")
     if configured_rate_model is not None:
@@ -389,29 +388,14 @@ def _safe_runtime_model_payload(
         )
     payload["source_rate_model"] = _SOURCE_RATE_MODEL
 
-    model_path_value = payload.pop("pf_transport_response_model_path", None)
-    if model_path_value is None:
-        return payload
-    selected = resolve_file_backed_model_asset(
-        model_path_value,
-        field_name="pf_transport_response_model_path",
-        run_root=run_dir,
-        repository_root=_REPOSITORY_ROOT,
-    )
-    try:
-        loaded = json.loads(selected.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+    if any(str(key).startswith("pf_") for key in payload):
         raise ValueError(
-            f"Could not load transport response model {selected}."
-        ) from exc
-    if isinstance(loaded, Mapping) and isinstance(
-        loaded.get("pf_transport_response_model"),
-        Mapping,
-    ):
-        loaded = loaded["pf_transport_response_model"]
-    if not isinstance(loaded, Mapping):
-        raise ValueError("Transport response model must be a JSON object.")
-    payload["pf_transport_response_model"] = dict(loaded)
+            "MeasurementLog runtime_config contains estimator-owned PF settings."
+        )
+    if "full_spectrum_generative_model" not in payload:
+        raise ValueError(
+            "MeasurementLog must embed full_spectrum_generative_model."
+        )
     return payload
 
 

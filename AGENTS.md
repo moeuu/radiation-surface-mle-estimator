@@ -2,19 +2,21 @@
 
 ## Repository role
 
-This repository is a fully standalone 3-D radiation-estimation application.
-It contains its own snapshot of the simulation, environment, detector,
-shielding, obstacle-transport, spectrum, planning, and visualization code.
-The MLE implementation lives under `src/three_d_estimation/`.
+This repository owns only the 3-D surface-MLE estimator. Geant4, environment,
+detector, shield, obstacle transport, spectrum physics, observation generation,
+and raw MeasurementLog v2 ownership belong to the sibling
+`Rotating-shield-simulation-runtime` package.
 
 ## Repository isolation
 
-- Never import, install, execute, copy from, or write to a sibling repository.
-- Do not add path dependencies, Git dependencies, submodules, external
-  symlinks, runtime sync scripts, or CI checkouts of another repository.
-- `UPSTREAM_PF_COMMIT` is provenance only. It is not a runtime or build input.
-- All normal builds, tests, simulations, and replays must work when this is the
-  only repository present.
+- Depend on the versioned `rotating-shield-simulation-runtime` package rather
+  than copying its implementation.
+- Do not vendor `native`, `measurement`, `sim`, `spectrum`, environment assets,
+  source layouts, obstacle layouts, or MeasurementLog writers here.
+- Keep MLE solver, regularization, response-matrix assembly, warm starts, and
+  MLE reporting under `src/three_d_estimation/`.
+- Simulation acquisition is invoked through the shared runtime CLI, never by a
+  local simulator implementation.
 
 ## Git publishing
 
@@ -28,7 +30,7 @@ The MLE implementation lives under `src/three_d_estimation/`.
 ## Physical semantics
 
 - `intensity_cps_1m` is expected net detector cps at 1 m, not total gamma/s.
-- MLE code must call the local `RuntimeObservationModel` and
+- MLE code must call the shared `RuntimeObservationModel` and
   `ContinuousKernel`; do not duplicate shield, obstacle, detector, or spectrum
   physics in the estimator.
 - Preserve spectra, bin edges, variances, detector poses, live times, and Fe/Pb
@@ -49,4 +51,4 @@ The MLE implementation lives under `src/three_d_estimation/`.
 - Follow PEP 8; every function must have a docstring.
 - Comments and docstrings are written in English.
 - Run `uv run pytest` before completion.
-- Run `uv run python scripts/check_standalone.py` before completion.
+- Run `uv run python scripts/check_repository_boundary.py` before completion.

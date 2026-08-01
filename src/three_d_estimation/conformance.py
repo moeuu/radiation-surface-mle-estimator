@@ -40,7 +40,7 @@ EXPECTED_UNITS = {
 }
 _RUNTIME_CONFIG = {
     "source_rate_model": "detector_cps_1m",
-    "pf_line_resolved_shield_attenuation": True,
+    "line_resolved_shield_attenuation": True,
 }
 
 

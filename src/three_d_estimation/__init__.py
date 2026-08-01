@@ -14,11 +14,6 @@ from .future_scoring import (
     save_future_candidate_scores,
     score_future_count_candidates,
 )
-from .measurement_prefix import (
-    MeasurementLogPrefix,
-    materialize_measurement_log_prefix,
-    measurement_records_sha256,
-)
 from .observation_batch import (
     observation_batch_from_log,
     observation_batch_from_records,
@@ -66,7 +61,6 @@ from .surface_patches import build_surface_patches, refine_surface_patches
 __all__ = [
     "MLEConfig",
     "MLEEstimate",
-    "MeasurementLogPrefix",
     "MLEReportPaths",
     "ObservationBatch",
     "ReplayContext",
@@ -96,8 +90,6 @@ __all__ = [
     "covered_station_boundaries_sha256",
     "load_forward_conformance_axes",
     "load_mle_estimate",
-    "materialize_measurement_log_prefix",
-    "measurement_records_sha256",
     "mle_report_sha256",
     "observation_batch_from_log",
     "observation_batch_from_records",

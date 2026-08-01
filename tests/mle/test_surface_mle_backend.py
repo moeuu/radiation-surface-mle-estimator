@@ -5,14 +5,19 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
-from runtime.estimator_backend import EstimatorBackend, StationCompleteEstimatorBackend
+from three_d_estimation.backend_contracts import (
+    EstimatorBackend,
+    StationCompleteEstimatorBackend,
+)
 from runtime.records import MeasurementRecord, RunContext
+from spectrum.transport_spectral import GeometryConditionedSpectralModel
 from three_d_estimation.config import MLEConfig
 from three_d_estimation.estimator_backend import SurfaceMLEBackend
 from three_d_estimation.types import MLEEstimate, ObservationBatch, SurfacePatch
@@ -20,7 +25,7 @@ from three_d_estimation.types import MLEEstimate, ObservationBatch, SurfacePatch
 
 def _context(
     *,
-    spectrum_count_method: str = "response_poisson",
+    spectrum_count_method: str = "joint_full_spectrum_generative",
     obstacle_layout_path: str | None = None,
     embedded_obstacle: bool = True,
 ) -> RunContext:
@@ -33,16 +38,25 @@ def _context(
     }
     if embedded_obstacle:
         environment["obstacle_grid"] = {
+            "version": 1,
             "origin": [0.0, 0.0],
             "cell_size": 1.0,
             "grid_shape": [3, 4],
             "blocked_cells": [[2, 3]],
+            "blocked_fraction": 1.0 / 12.0,
         }
     return RunContext(
-        repository_commit="standalone-snapshot",
+        repository_commit="a" * 40,
         runtime_config={
             "source_rate_model": "detector_cps_1m",
-            "pf_line_resolved_shield_attenuation": False,
+            "line_resolved_shield_attenuation": False,
+            "full_spectrum_generative_model": (
+                GeometryConditionedSpectralModel.standard_native(
+                    ("Cs-137",),
+                    dead_time_tau_s=0.0,
+                    background_rate_cps=0.0,
+                ).manifest_payload()
+            ),
         },
         environment=environment,
         sim_backend="analytic",
@@ -50,14 +64,21 @@ def _context(
         isotopes=("Cs-137",),
         obstacle_layout_path=obstacle_layout_path,
         source_rate_model="detector_cps_1m",
+        source_layout_path=None,
+        metadata={},
+        run_id="surface-mle-backend-test",
+        source_rate_semantics={},
+        forward_model_manifest={},
+        runtime_config_sha256="b" * 64,
     )
 
 
 def _record(step_id: int, station_id: int) -> MeasurementRecord:
     """Return one complete finalized runtime observation."""
     return MeasurementRecord(
-        station_id=station_id,
         step_id=step_id,
+        action_id=step_id,
+        station_id=station_id,
         detector_pose_xyz=(0.5 + 0.1 * step_id, 0.5, 1.0),
         detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
         fe_orientation_index=step_id % 4,
@@ -65,12 +86,12 @@ def _record(step_id: int, station_id: int) -> MeasurementRecord:
         live_time_s=2.0,
         travel_time_s=0.25,
         shield_actuation_time_s=0.1,
-        spectrum_counts=np.array([3.0 + step_id, 2.0]),
-        spectrum_variance=np.array([3.5 + step_id, 2.5]),
+        spectrum_counts=np.array([3 + step_id, 2], dtype=np.int64),
         energy_bin_edges_keV=np.array([0.0, 400.0, 800.0]),
-        counts_by_isotope={"Cs-137": 4.0 + step_id},
-        count_covariance_by_isotope={"Cs-137": {"Cs-137": 1.5}},
-        metadata={"finalized": True},
+        metadata={
+            "finalized": True,
+            "full_spectrum_contract_hash_sha256": "c" * 64,
+        },
     )
 
 
@@ -167,6 +188,23 @@ def _backend(recorder: _RecordingEstimator) -> SurfaceMLEBackend:
     return SurfaceMLEBackend(config, estimator_factory=lambda _config: recorder)
 
 
+def _initialize_with_test_kernel(
+    backend: SurfaceMLEBackend,
+    context: RunContext,
+) -> None:
+    """Initialize the adapter without constructing the production physics kernel."""
+    kernel = ContinuousKernel(use_gpu=False)
+    with patch(
+        "three_d_estimation.estimator_backend.build_runtime_observation_model",
+        return_value=object(),
+    ), patch(
+        "three_d_estimation.estimator_backend."
+        "continuous_kernel_from_observation_model",
+        return_value=kernel,
+    ):
+        backend.initialize(context)
+
+
 class SurfaceMLEBackendTests(unittest.TestCase):
     """Exercise runtime contracts, station fits, conversion, and isolation."""
 
@@ -177,7 +215,7 @@ class SurfaceMLEBackendTests(unittest.TestCase):
 
         self.assertIsInstance(backend, EstimatorBackend)
         self.assertIsInstance(backend, StationCompleteEstimatorBackend)
-        backend.initialize(_context())
+        _initialize_with_test_kernel(backend, _context())
         empty = backend.snapshot()
         self.assertEqual(empty.step_id, -1)
         self.assertEqual(empty.diagnostics["fit_kind"], "not_fitted")
@@ -223,7 +261,7 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         """MLE-specific arrays and clusters should satisfy generic output contracts."""
         recorder = _RecordingEstimator()
         backend = _backend(recorder)
-        backend.initialize(_context())
+        _initialize_with_test_kernel(backend, _context())
         record = _record(0, 4)
         backend.update(record)
         result = backend.finalize()
@@ -248,7 +286,7 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         """A caller cannot warm-fit fabricated or already-completed station rows."""
         recorder = _RecordingEstimator()
         backend = _backend(recorder)
-        backend.initialize(_context())
+        _initialize_with_test_kernel(backend, _context())
         record = _record(0, 9)
         backend.update(record)
 
@@ -262,17 +300,18 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         """The adapter should reject external paths, duplicates, and empty history."""
         recorder = _RecordingEstimator()
         backend = _backend(recorder)
-        with self.assertRaisesRegex(ValueError, "must not be absolute"):
-            backend.initialize(
+        with self.assertRaisesRegex(ValueError, "requires the shared runtime"):
+            _initialize_with_test_kernel(
+                backend,
                 _context(
                     obstacle_layout_path="/tmp/external-obstacles.json",
                     embedded_obstacle=False,
-                )
+                ),
             )
         self.assertEqual(recorder.measurement_counts, [])
 
         backend = _backend(recorder)
-        backend.initialize(_context())
+        _initialize_with_test_kernel(backend, _context())
         with self.assertRaisesRegex(RuntimeError, "no measurements"):
             backend.finalize()
         record = _record(0, 1)
@@ -285,7 +324,12 @@ class SurfaceMLEBackendTests(unittest.TestCase):
             estimator_factory=lambda _config: recorder,
         )
         with self.assertRaisesRegex(ValueError, "response_poisson"):
-            count_backend.initialize(_context(spectrum_count_method="window_sum"))
+            _initialize_with_test_kernel(
+                count_backend,
+                _context(
+                    spectrum_count_method="joint_full_spectrum_generative"
+                ),
+            )
 
 
 if __name__ == "__main__":

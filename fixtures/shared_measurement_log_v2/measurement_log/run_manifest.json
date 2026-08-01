@@ -1,0 +1,83 @@
+{
+  "artifact_hashes": {
+    "environment.json": "523a7f7fd52accf6ce3921738ddb92e06a196691e1cb4e507cd2a8abfbc23a3f",
+    "forward_model_manifest.json": "b59492a57f513b9e2d19ba991a5cbadf2e5ae26478051e1120aeae81719d8282",
+    "observation_metadata.jsonl": "b25198f4537b8f4b290a679bdc68a69082f6155af1c4dd1e781fbb728d603b73",
+    "observations.npz": "f8d7594a3b716838f602a0e12f35c4484369e097e8fd1764bffe4d7067965a58",
+    "repository_commit.txt": "5a84b79716842f146f7533d890cc7308cad7b21abdc29c1852c6b3bb8ad66672",
+    "runtime_config.resolved.json": "1346db95479db1e3b3f6b8a309b91d228bc79223bb0b2d6cdf537e9586e7e026"
+  },
+  "bin_width_keV": 2.0,
+  "energy_bin_count": 851,
+  "energy_max_keV": 1700.0,
+  "energy_min_keV": 0.0,
+  "environment": {
+    "detector_position": [
+      0.25,
+      0.25,
+      0.4
+    ],
+    "environment_model_id": "test-room.v2",
+    "obstacle_grid": null,
+    "obstacle_model_id": "test-obstacle-empty.v2",
+    "size_x": 2.0,
+    "size_y": 2.0,
+    "size_z": 1.5
+  },
+  "forward_model_manifest_sha256": "b59492a57f513b9e2d19ba991a5cbadf2e5ae26478051e1120aeae81719d8282",
+  "full_spectrum_contract_hash_sha256": "a3d7be61bf990276c9e14fb20ddc2b09d0d8c47c02a0721744a312fb58bedaae",
+  "full_spectrum_contract_schema_version": 3,
+  "index_conventions": {
+    "action_id": "zero_based_unique_measurement_action",
+    "record_order": "causal_step_order",
+    "station_id": "zero_based_nondecreasing_station_group",
+    "step_id": "zero_based_strictly_increasing"
+  },
+  "isotopes": [
+    "Co-60",
+    "Cs-137",
+    "Eu-154"
+  ],
+  "metadata": {},
+  "model_identifiers": {
+    "detector": {
+      "id": "test-detector.v2",
+      "sha256": "f6294066cb0ea8f61c0166750054abaa8d19029ba0643c4a42d573c1a5c17847"
+    },
+    "environment": {
+      "id": "test-room.v2",
+      "sha256": "523a7f7fd52accf6ce3921738ddb92e06a196691e1cb4e507cd2a8abfbc23a3f"
+    },
+    "obstacle": {
+      "id": "test-obstacle-empty.v2",
+      "sha256": "f02aa924dbd904d2ce40397abe9aa2e14dbb11821be6efbbb9f7dd4bf6924f87"
+    },
+    "shield": {
+      "id": "test-shield.v2",
+      "sha256": "c5e24ded41d8f15b59cbcb08d37c41d281a3867aa39e5fde4bf1bfb6004160f3"
+    },
+    "spectrum": {
+      "id": "test-full-spectrum.v2",
+      "sha256": "555a4c412073680ccc9fd01f5087f9a9de156a221aafec18893900a61478a37f"
+    },
+    "transport": {
+      "id": "test-transport.v2",
+      "sha256": "3be670144ec795263322bbc4bb769a97cc9e54246e78e1d034c539daf53691d5"
+    }
+  },
+  "observation_model": "joint_full_spectrum_generative",
+  "obstacle_layout_path": null,
+  "record_count": 12,
+  "repository_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "resolved_config_sha256": "1346db95479db1e3b3f6b8a309b91d228bc79223bb0b2d6cdf537e9586e7e026",
+  "run_id": "pure-pf-schema-v2-local-fixture",
+  "schema_version": 2,
+  "sim_backend": "analytic_test_fixture",
+  "source_layout_path": null,
+  "source_rate_model": "detector_cps_1m",
+  "source_rate_semantics": {
+    "normalization_distance_m": 1.0,
+    "quantity": "expected_pre_dead_time_detector_pulse_rate",
+    "unit": "cps"
+  }
+}

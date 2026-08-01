@@ -1,0 +1,13 @@
+{
+  "detector_position": [
+    0.25,
+    0.25,
+    0.4
+  ],
+  "environment_model_id": "test-room.v2",
+  "obstacle_grid": null,
+  "obstacle_model_id": "test-obstacle-empty.v2",
+  "size_x": 2.0,
+  "size_y": 2.0,
+  "size_z": 1.5
+}

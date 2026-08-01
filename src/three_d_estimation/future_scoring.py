@@ -20,7 +20,7 @@ from runtime.records import (
 )
 
 from .config import MLEConfig
-from .measurement_prefix import measurement_records_sha256
+from runtime.prefix import measurement_records_sha256
 from .observation_batch import subset_observation_batch
 from .replay import ReplayContext, prepare_replay, validate_warm_start_artifact
 from .reporting import mle_report_sha256

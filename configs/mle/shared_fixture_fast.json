@@ -5,8 +5,8 @@
   "fit_scatter_nuisance": false,
   "held_out_fraction": 0.0,
   "isotope_names": [
-    "Cs-137",
     "Co-60",
+    "Cs-137",
     "Eu-154"
   ],
   "max_iterations": 30,

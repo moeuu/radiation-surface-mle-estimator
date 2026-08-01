@@ -5,13 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "three-d-estimation"
 version = "0.2.0"
-description = "Standalone rotating-shield simulation and surface MLE reconstruction"
+description = "Surface MLE estimator for shared rotating-shield MeasurementLog v2 data"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "matplotlib>=3.10.7",
   "numpy>=2.3.5",
   "pytest>=9.0.1",
+  "rotating-shield-simulation-runtime",
   "scipy>=1.16.3",
   "torch",
 ]
@@ -27,15 +28,12 @@ py-modules = []
 [tool.setuptools.packages.find]
 where = ["src"]
 include = [
-  "counts*",
-  "measurement*",
-  "runtime*",
-  "sim*",
-  "spectrum*",
   "three_d_estimation*",
 ]
-exclude = ["pf", "pf.*", "planning", "planning.*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.uv.sources]
+rotating-shield-simulation-runtime = { path = "../Rotating-shield-simulation-runtime", editable = true }

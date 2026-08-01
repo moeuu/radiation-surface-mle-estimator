@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 
-from runtime.estimator_backend import (
+from three_d_estimation.backend_contracts import (
     EstimatorBackend,
     EstimatorResult,
     EstimatorSnapshot,
@@ -15,24 +15,33 @@ from runtime.estimator_backend import (
     SurfaceMapSnapshot,
 )
 from runtime.records import MeasurementRecord, RunContext
-from runtime.session import LiveEstimationSession, SessionState
+from three_d_estimation.session import LiveEstimationSession, SessionState
 
 
 def build_context() -> RunContext:
     return RunContext(
-        repository_commit="standalone-snapshot",
+        repository_commit="a" * 40,
         runtime_config={"mode": "analytic"},
         environment={"size_x": 4.0, "size_y": 5.0, "size_z": 3.0},
         sim_backend="analytic",
         spectrum_count_method="response_poisson",
         isotopes=("Cs-137",),
+        obstacle_layout_path=None,
+        source_layout_path=None,
+        source_rate_model="detector_cps_1m",
+        metadata={},
+        run_id="test-run",
+        source_rate_semantics={},
+        forward_model_manifest={},
+        runtime_config_sha256="b" * 64,
     )
 
 
 def build_record(step_id: int, station_id: int = 5) -> MeasurementRecord:
     return MeasurementRecord(
-        station_id=station_id,
         step_id=step_id,
+        action_id=step_id,
+        station_id=station_id,
         detector_pose_xyz=(1.0, 2.0, 1.5),
         detector_quat_wxyz=(1.0, 0.0, 0.0, 0.0),
         fe_orientation_index=2,
@@ -40,12 +49,12 @@ def build_record(step_id: int, station_id: int = 5) -> MeasurementRecord:
         live_time_s=4.0,
         travel_time_s=0.5,
         shield_actuation_time_s=0.25,
-        spectrum_counts=np.array([2.0, 3.0]),
-        spectrum_variance=np.array([2.5, 3.5]),
+        spectrum_counts=np.array([2, 3], dtype=np.int64),
         energy_bin_edges_keV=np.array([0.0, 100.0, 200.0]),
-        counts_by_isotope={"Cs-137": 4.5},
-        count_covariance_by_isotope={"Cs-137": {"Cs-137": 1.25}},
-        metadata={"finalized": True},
+        metadata={
+            "finalized": True,
+            "full_spectrum_contract_hash_sha256": "c" * 64,
+        },
     )
 
 
