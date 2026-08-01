@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 
 MEASUREMENT_LOG_SCHEMA_VERSION = 1
+SUPPORTED_MEASUREMENT_LOG_SCHEMA_VERSIONS = frozenset({1, 2})
 
 _FORBIDDEN_REALIZED_SOURCE_MARKERS = (
     "truth",
@@ -46,6 +47,8 @@ def _is_forbidden_estimator_input_field(name: str, value: object) -> bool:
         return True
     if normalized == "sources":
         return True
+    if normalized.endswith(("numsources", "maxsources", "minsources")):
+        return False
     return (
         normalized.endswith("sources")
         and normalized != "resources"
@@ -78,11 +81,17 @@ def validate_truth_free_estimator_input(
     source lists, and fields explicitly named as truth are forbidden.
     """
     if isinstance(value, Mapping):
+        aggregate_validation_metrics = path.endswith(
+            ".full_spectrum_generative_model.validation.metrics"
+        )
         for key, child in value.items():
             if not isinstance(key, str):
                 raise TypeError(f"{path} contains a non-string mapping key: {key!r}.")
             child_path = f"{path}.{key}"
-            if _is_forbidden_estimator_input_field(key, child):
+            if (
+                not aggregate_validation_metrics
+                and _is_forbidden_estimator_input_field(key, child)
+            ):
                 raise ValueError(
                     f"{child_path} is a forbidden realized-truth/source field in "
                     "estimator input."
@@ -299,9 +308,10 @@ class RunContext:
 
     def __post_init__(self) -> None:
         """Validate and freeze a JSON-safe, content-addressed run context."""
-        if self.schema_version != MEASUREMENT_LOG_SCHEMA_VERSION:
+        if self.schema_version not in SUPPORTED_MEASUREMENT_LOG_SCHEMA_VERSIONS:
             raise ValueError(
-                f"schema_version must be {MEASUREMENT_LOG_SCHEMA_VERSION}; "
+                "schema_version must be one of "
+                f"{sorted(SUPPORTED_MEASUREMENT_LOG_SCHEMA_VERSIONS)}; "
                 f"got {self.schema_version}."
             )
         if (
@@ -334,10 +344,17 @@ class RunContext:
         if not isinstance(source_rate_semantics, dict):
             raise TypeError("source_rate_semantics must be a mapping.")
         expected_semantics = {
-            "quantity": "expected_net_detector_count_rate",
-            "unit": "cps",
-            "normalization_distance_m": 1.0,
-        }
+            1: {
+                "quantity": "expected_net_detector_count_rate",
+                "unit": "cps",
+                "normalization_distance_m": 1.0,
+            },
+            2: {
+                "quantity": "expected_pre_dead_time_detector_pulse_rate",
+                "unit": "cps",
+                "normalization_distance_m": 1.0,
+            },
+        }[int(self.schema_version)]
         if source_rate_semantics != expected_semantics:
             raise ValueError(
                 "source_rate_semantics must describe expected net detector cps at 1 m."
@@ -353,7 +370,7 @@ class RunContext:
         if self.source_layout_path is not None:
             raise ValueError(
                 "source_layout_path is evaluation truth and must be None in "
-                "MeasurementLog schema v1 estimator inputs."
+                "MeasurementLog estimator inputs."
             )
 
         isotopes = tuple(self.isotopes)

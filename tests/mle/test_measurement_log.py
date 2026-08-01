@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
+from hashlib import sha256
 import json
 from pathlib import Path
 import tempfile
@@ -121,6 +122,96 @@ class MeasurementLogTests(unittest.TestCase):
         self.assertFalse(restored.spectrum_counts.flags.writeable)
         with self.assertRaises(FrozenInstanceError):
             restored.station_id = 99  # type: ignore[misc]
+
+    def test_loader_accepts_raw_full_spectrum_measurement_log_v2(self) -> None:
+        """The MLE consumes PF-owned v2 integer spectra without count projection."""
+        with tempfile.TemporaryDirectory() as temporary:
+            run_dir = save_measurement_log(
+                Path(temporary) / "shared-v2",
+                self.build_context(),
+                [self.build_record()],
+            )
+            manifest_path = run_dir / "run_manifest.json"
+            forward_path = run_dir / "forward_model_manifest.json"
+            archive_path = run_dir / "observations.npz"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            forward = json.loads(forward_path.read_text(encoding="utf-8"))
+            with np.load(archive_path, allow_pickle=False) as loaded:
+                base_names = (
+                    "step_id",
+                    "action_id",
+                    "station_id",
+                    "detector_pose_xyz",
+                    "detector_quat_wxyz",
+                    "fe_orientation_index",
+                    "pb_orientation_index",
+                    "live_time_s",
+                    "travel_time_s",
+                    "shield_actuation_time_s",
+                    "energy_bin_edges_keV",
+                    "spectrum_counts",
+                )
+                arrays = {
+                    name: np.array(loaded[name], copy=True) for name in base_names
+                }
+            arrays["spectrum_counts"] = arrays["spectrum_counts"].astype(
+                np.int64
+            )
+            with archive_path.open("wb") as stream:
+                np.savez(stream, **arrays)
+
+            v2_semantics = {
+                "quantity": "expected_pre_dead_time_detector_pulse_rate",
+                "unit": "cps",
+                "normalization_distance_m": 1.0,
+            }
+            forward = {
+                "schema_version": 2,
+                "repository_commit": forward["repository_commit"],
+                "resolved_config_sha256": forward["resolved_config_sha256"],
+                "source_rate_model": "detector_cps_1m",
+                "source_rate_semantics": v2_semantics,
+                "model_identifiers": forward["model_identifiers"],
+                "units": forward["units"],
+                "response_semantics": {
+                    **forward["response_semantics"],
+                    "observation_distribution": (
+                        "joint_renewal_total_and_conditional_energy_marks"
+                    ),
+                },
+                "line_mu_by_isotope": forward["line_mu_by_isotope"],
+            }
+            forward_path.write_bytes(canonical_json_bytes(forward))
+
+            manifest["schema_version"] = 2
+            manifest["source_rate_semantics"] = v2_semantics
+            manifest["observation_model"] = "joint_full_spectrum_generative"
+            manifest.pop("spectrum_count_method", None)
+            manifest["forward_model_manifest_sha256"] = sha256(
+                forward_path.read_bytes()
+            ).hexdigest()
+            artifact_hashes = {
+                path.relative_to(run_dir).as_posix(): sha256(path.read_bytes()).hexdigest()
+                for path in run_dir.iterdir()
+                if path.is_file() and path.name != "run_manifest.json"
+            }
+            manifest["artifact_hashes"] = artifact_hashes
+            manifest_path.write_bytes(canonical_json_bytes(manifest))
+
+            loaded = load_measurement_log(run_dir)
+
+        self.assertEqual(loaded.context.schema_version, 2)
+        self.assertEqual(
+            loaded.context.spectrum_count_method,
+            "joint_full_spectrum_generative",
+        )
+        self.assertIsNone(loaded.records[0].spectrum_variance)
+        self.assertIsNone(loaded.records[0].counts_by_isotope)
+        self.assertIsNone(loaded.records[0].count_covariance_by_isotope)
+        np.testing.assert_array_equal(
+            loaded.records[0].spectrum_counts,
+            np.array([4.0, 9.0, 0.0]),
+        )
 
     def test_invalid_spectrum_shapes_and_mixed_energy_bins_are_rejected(self) -> None:
         observation = SimulationObservation(

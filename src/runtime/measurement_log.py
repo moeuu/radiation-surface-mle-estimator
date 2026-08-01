@@ -17,7 +17,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from runtime.records import (
-    MEASUREMENT_LOG_SCHEMA_VERSION,
+    SUPPORTED_MEASUREMENT_LOG_SCHEMA_VERSIONS,
     MeasurementRecord,
     RunContext,
     canonical_json_bytes,
@@ -869,8 +869,93 @@ def _validate_masked_numeric_storage(
         )
 
 
+def _validate_v2_forward_model_manifest(
+    payload: Mapping[str, object],
+    *,
+    run_manifest: Mapping[str, object],
+    repository_commit: str,
+    resolved_config_sha256: str,
+) -> dict[str, object]:
+    """Validate the producer-owned full-spectrum forward identity for log v2.
+
+    The standalone estimator deliberately does not rebuild PF simulation
+    physics.  It verifies the immutable producer manifest and consumes that
+    identity as estimator input; the PF runtime remains the sole authority for
+    constructing and validating the physical model assets.
+    """
+    required = {
+        "schema_version",
+        "repository_commit",
+        "resolved_config_sha256",
+        "source_rate_model",
+        "source_rate_semantics",
+        "model_identifiers",
+        "units",
+        "response_semantics",
+        "line_mu_by_isotope",
+    }
+    if set(payload) != required or payload.get("schema_version") != 2:
+        raise ValueError(
+            "MeasurementLog v2 forward_model_manifest.json has an invalid schema."
+        )
+    expected_fields = {
+        "repository_commit": repository_commit,
+        "resolved_config_sha256": resolved_config_sha256,
+        "source_rate_model": run_manifest.get("source_rate_model"),
+        "source_rate_semantics": run_manifest.get("source_rate_semantics"),
+        "model_identifiers": run_manifest.get("model_identifiers"),
+    }
+    for field_name, expected in expected_fields.items():
+        if payload.get(field_name) != expected:
+            raise ValueError(
+                "MeasurementLog v2 forward model and run manifest differ at "
+                f"{field_name}."
+            )
+    units = payload.get("units")
+    if not isinstance(units, Mapping) or units.get("source_strength") != (
+        "detector_cps_1m"
+    ):
+        raise ValueError(
+            "MeasurementLog v2 forward model must use detector_cps_1m strength."
+        )
+    if not isinstance(payload.get("response_semantics"), Mapping):
+        raise ValueError(
+            "MeasurementLog v2 forward model requires response_semantics."
+        )
+    isotopes = tuple(str(value) for value in run_manifest.get("isotopes", ()))
+    line_table = payload.get("line_mu_by_isotope")
+    if not isinstance(line_table, Mapping) or set(line_table) != set(isotopes):
+        raise ValueError(
+            "MeasurementLog v2 line_mu_by_isotope must match manifest isotopes."
+        )
+    for isotope in isotopes:
+        entries = line_table[isotope]
+        if not isinstance(entries, list) or not entries:
+            raise ValueError(f"Forward line table for {isotope} must be nonempty.")
+        energies: list[float] = []
+        weight_sum = 0.0
+        for entry in entries:
+            if not isinstance(entry, Mapping) or set(entry) != {
+                "energy_keV",
+                "weight",
+                "fe",
+                "pb",
+            }:
+                raise ValueError(f"Forward line entry for {isotope} is invalid.")
+            values = [float(entry[name]) for name in ("energy_keV", "weight", "fe", "pb")]
+            if not np.all(np.isfinite(values)) or any(value < 0.0 for value in values):
+                raise ValueError(f"Forward line entry for {isotope} is nonphysical.")
+            energies.append(values[0])
+            weight_sum += values[1]
+        if any(right <= left for left, right in zip(energies, energies[1:])):
+            raise ValueError(f"Forward line energies for {isotope} must increase.")
+        if not np.isclose(weight_sum, 1.0, rtol=0.0, atol=1.0e-9):
+            raise ValueError(f"Forward line weights for {isotope} must sum to one.")
+    return dict(payload)
+
+
 def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
-    """Validate and reconstruct a measurement log saved by this module."""
+    """Validate and reconstruct producer v1 or raw full-spectrum v2 logs."""
     root = Path(run_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Measurement log directory does not exist: {root}")
@@ -916,10 +1001,10 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
     )
 
     schema_version = manifest.get("schema_version")
-    if schema_version != MEASUREMENT_LOG_SCHEMA_VERSION:
+    if schema_version not in SUPPORTED_MEASUREMENT_LOG_SCHEMA_VERSIONS:
         raise ValueError(
             f"Unsupported measurement-log schema_version {schema_version!r}; "
-            f"expected {MEASUREMENT_LOG_SCHEMA_VERSION}."
+            f"expected one of {sorted(SUPPORTED_MEASUREMENT_LOG_SCHEMA_VERSIONS)}."
         )
     expected_hash = str(
         manifest.get(
@@ -952,7 +1037,16 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
     if not isinstance(run_id, str) or not run_id.strip():
         raise ValueError("run_manifest.json run_id must be a non-empty string.")
     source_rate_semantics = manifest.get("source_rate_semantics")
-    if source_rate_semantics != SOURCE_RATE_SEMANTICS:
+    expected_source_rate_semantics = (
+        {
+            "quantity": "expected_pre_dead_time_detector_pulse_rate",
+            "unit": "cps",
+            "normalization_distance_m": 1.0,
+        }
+        if schema_version == 2
+        else SOURCE_RATE_SEMANTICS
+    )
+    if source_rate_semantics != expected_source_rate_semantics:
         raise ValueError("run_manifest.json source_rate_semantics is incompatible.")
     forward_manifest_digest = sha256(
         (root / "forward_model_manifest.json").read_bytes()
@@ -986,17 +1080,25 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
                 f"Measurement-log artifact {artifact_name!r} does not match its SHA-256."
             )
 
-    validated_forward_manifest = validate_forward_model_manifest(
-        forward_model_manifest,
-        runtime_config=runtime_config,
-        environment=environment,
-        obstacle_layout_path=manifest.get("obstacle_layout_path"),
-        isotopes=tuple(manifest.get("isotopes", ())),
-        repository_commit=repository_commit,
-        resolved_config_sha256=expected_hash,
-        source_rate_model=str(manifest.get("source_rate_model", "")),
-        run_root=root,
-    )
+    if schema_version == 2:
+        validated_forward_manifest = _validate_v2_forward_model_manifest(
+            forward_model_manifest,
+            run_manifest=manifest,
+            repository_commit=repository_commit,
+            resolved_config_sha256=expected_hash,
+        )
+    else:
+        validated_forward_manifest = validate_forward_model_manifest(
+            forward_model_manifest,
+            runtime_config=runtime_config,
+            environment=environment,
+            obstacle_layout_path=manifest.get("obstacle_layout_path"),
+            isotopes=tuple(manifest.get("isotopes", ())),
+            repository_commit=repository_commit,
+            resolved_config_sha256=expected_hash,
+            source_rate_model=str(manifest.get("source_rate_model", "")),
+            run_root=root,
+        )
     if manifest.get("model_identifiers") != validated_forward_manifest.get(
         "model_identifiers"
     ):
@@ -1019,7 +1121,12 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
             runtime_config=runtime_config,
             environment=environment,
             sim_backend=str(manifest["sim_backend"]),
-            spectrum_count_method=str(manifest["spectrum_count_method"]),
+            spectrum_count_method=str(
+                manifest.get(
+                    "spectrum_count_method",
+                    manifest.get("observation_model", ""),
+                )
+            ),
             isotopes=tuple(manifest["isotopes"]),
             obstacle_layout_path=manifest.get("obstacle_layout_path"),
             source_layout_path=manifest.get("source_layout_path"),
@@ -1048,7 +1155,7 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
     except (OSError, ValueError, zipfile.BadZipFile) as exc:
         raise ValueError("Could not read a valid observations.npz archive.") from exc
 
-    expected_array_names = {
+    base_array_names = {
         "step_id",
         "action_id",
         "station_id",
@@ -1061,6 +1168,8 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
         "shield_actuation_time_s",
         "energy_bin_edges_keV",
         "spectrum_counts",
+    }
+    legacy_optional_array_names = {
         "spectrum_variance",
         "spectrum_variance_present",
         "isotope_counts",
@@ -1070,6 +1179,11 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
         "isotope_count_covariance_present",
         "isotope_count_covariance_record_present",
     }
+    expected_array_names = (
+        base_array_names
+        if schema_version == 2
+        else base_array_names | legacy_optional_array_names
+    )
     if set(archive) != expected_array_names:
         missing_arrays = sorted(expected_array_names - set(archive))
         extra_arrays = sorted(set(archive) - expected_array_names)
@@ -1134,86 +1248,104 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
         archive,
         "spectrum_counts",
         shape=(record_count, bin_count),
-        dtype=np.float64,
+        dtype=np.int64 if schema_version == 2 else np.float64,
     )
-    variances = _array(
-        archive,
-        "spectrum_variance",
-        shape=(record_count, bin_count),
-        dtype=np.float64,
-    )
-    variance_present = _array(
-        archive,
-        "spectrum_variance_present",
-        shape=(record_count,),
-        dtype=np.bool_,
-    )
-    isotope_counts = _array(
-        archive,
-        "isotope_counts",
-        shape=(record_count, isotope_count),
-        dtype=np.float64,
-    )
-    isotope_counts_present = _array(
-        archive,
-        "isotope_counts_present",
-        shape=(record_count, isotope_count),
-        dtype=np.bool_,
-    )
-    isotope_counts_record_present = _array(
-        archive,
-        "isotope_counts_record_present",
-        shape=(record_count,),
-        dtype=np.bool_,
-    )
-    isotope_covariances = _array(
-        archive,
-        "isotope_count_covariance",
-        shape=(record_count, isotope_count, isotope_count),
-        dtype=np.float64,
-    )
-    isotope_covariance_present = _array(
-        archive,
-        "isotope_count_covariance_present",
-        shape=(record_count, isotope_count, isotope_count),
-        dtype=np.bool_,
-    )
-    isotope_covariance_record_present = _array(
-        archive,
-        "isotope_count_covariance_record_present",
-        shape=(record_count,),
-        dtype=np.bool_,
-    )
-    _validate_masked_numeric_storage(
-        variances,
-        variance_present[:, None],
-        name="spectrum_variance",
-        nonnegative=True,
-    )
-    _validate_masked_numeric_storage(
-        isotope_counts,
-        isotope_counts_present,
-        name="isotope_counts",
-        nonnegative=True,
-    )
-    _validate_masked_numeric_storage(
-        isotope_covariances,
-        isotope_covariance_present,
-        name="isotope_count_covariance",
-        nonnegative=False,
-    )
-    if np.any(np.any(isotope_counts_present, axis=1) != isotope_counts_record_present):
-        raise ValueError(
-            "isotope_counts_record_present does not match per-entry presence masks."
+    if schema_version == 2:
+        if np.any(spectra < 0):
+            raise ValueError(
+                "MeasurementLog v2 spectrum_counts must be nonnegative integers."
+            )
+        variances = None
+        variance_present = None
+        isotope_counts = None
+        isotope_counts_present = None
+        isotope_counts_record_present = None
+        isotope_covariances = None
+        isotope_covariance_present = None
+        isotope_covariance_record_present = None
+    else:
+        variances = _array(
+            archive,
+            "spectrum_variance",
+            shape=(record_count, bin_count),
+            dtype=np.float64,
         )
-    covariance_row_presence = np.any(
-        isotope_covariance_present,
-        axis=(1, 2),
-    )
-    if np.any(covariance_row_presence != isotope_covariance_record_present):
-        raise ValueError(
-            "isotope_count_covariance_record_present does not match entry masks."
+        variance_present = _array(
+            archive,
+            "spectrum_variance_present",
+            shape=(record_count,),
+            dtype=np.bool_,
         )
+        isotope_counts = _array(
+            archive,
+            "isotope_counts",
+            shape=(record_count, isotope_count),
+            dtype=np.float64,
+        )
+        isotope_counts_present = _array(
+            archive,
+            "isotope_counts_present",
+            shape=(record_count, isotope_count),
+            dtype=np.bool_,
+        )
+        isotope_counts_record_present = _array(
+            archive,
+            "isotope_counts_record_present",
+            shape=(record_count,),
+            dtype=np.bool_,
+        )
+        isotope_covariances = _array(
+            archive,
+            "isotope_count_covariance",
+            shape=(record_count, isotope_count, isotope_count),
+            dtype=np.float64,
+        )
+        isotope_covariance_present = _array(
+            archive,
+            "isotope_count_covariance_present",
+            shape=(record_count, isotope_count, isotope_count),
+            dtype=np.bool_,
+        )
+        isotope_covariance_record_present = _array(
+            archive,
+            "isotope_count_covariance_record_present",
+            shape=(record_count,),
+            dtype=np.bool_,
+        )
+        _validate_masked_numeric_storage(
+            variances,
+            variance_present[:, None],
+            name="spectrum_variance",
+            nonnegative=True,
+        )
+        _validate_masked_numeric_storage(
+            isotope_counts,
+            isotope_counts_present,
+            name="isotope_counts",
+            nonnegative=True,
+        )
+        _validate_masked_numeric_storage(
+            isotope_covariances,
+            isotope_covariance_present,
+            name="isotope_count_covariance",
+            nonnegative=False,
+        )
+        if np.any(
+            np.any(isotope_counts_present, axis=1)
+            != isotope_counts_record_present
+        ):
+            raise ValueError(
+                "isotope_counts_record_present does not match per-entry "
+                "presence masks."
+            )
+        covariance_row_presence = np.any(
+            isotope_covariance_present,
+            axis=(1, 2),
+        )
+        if np.any(covariance_row_presence != isotope_covariance_record_present):
+            raise ValueError(
+                "isotope_count_covariance_record_present does not match entry masks."
+            )
 
     metadata_lines = (
         (root / "observation_metadata.jsonl").read_text(encoding="utf-8").splitlines()
@@ -1274,14 +1406,24 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
     records: list[MeasurementRecord] = []
     for record_index in range(record_count):
         counts = None
-        if bool(isotope_counts_record_present[record_index]):
+        if (
+            isotope_counts_record_present is not None
+            and isotope_counts_present is not None
+            and isotope_counts is not None
+            and bool(isotope_counts_record_present[record_index])
+        ):
             counts = {
                 isotope: float(isotope_counts[record_index, isotope_index])
                 for isotope_index, isotope in enumerate(context.isotopes)
                 if bool(isotope_counts_present[record_index, isotope_index])
             }
         covariance = None
-        if bool(isotope_covariance_record_present[record_index]):
+        if (
+            isotope_covariance_record_present is not None
+            and isotope_covariance_present is not None
+            and isotope_covariances is not None
+            and bool(isotope_covariance_record_present[record_index])
+        ):
             covariance = {}
             for row_index, row_isotope in enumerate(context.isotopes):
                 row = {
@@ -1314,9 +1456,11 @@ def load_measurement_log(run_dir: str | Path) -> MeasurementLog:
                 shield_actuation_time_s=float(actuation_times[record_index]),
                 spectrum_counts=spectra[record_index],
                 spectrum_variance=(
-                    variances[record_index]
-                    if bool(variance_present[record_index])
-                    else None
+                    None
+                    if variances is None
+                    or variance_present is None
+                    or not bool(variance_present[record_index])
+                    else variances[record_index]
                 ),
                 energy_bin_edges_keV=energy_edges,
                 counts_by_isotope=counts,

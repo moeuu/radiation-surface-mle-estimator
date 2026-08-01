@@ -1,15 +1,17 @@
-# MeasurementLog v1
+# MeasurementLog v1 and v2
 
 `MeasurementLog` is the estimator-independent boundary between acquisition and
 standalone surface MLE. It contains finalized measurements and resolved physical
 model metadata, never particle state, PF candidates, estimator output, or truth.
+New production acquisition is owned by `Rotating-shield-particle-filter` and emits
+raw full-spectrum schema v2. Schema v1 remains readable for archived local runs.
 
 See the [README](../../README.md) for commands and
 [MLE architecture](architecture.md) for reconstruction details.
 
 ## Directory contract
 
-Schema version 1 contains exactly the estimator inputs below:
+Both supported schema versions contain exactly the estimator inputs below:
 
 ```text
 RUN_DIR/
@@ -46,7 +48,18 @@ source-strength, and source-extent model parameters remain valid physics.
 
 ## Run manifest
 
-`run_manifest.json` includes:
+Schema v2 changes the observation contract, not the ownership boundary. It declares
+`observation_model=joint_full_spectrum_generative` and source-rate quantity
+`expected_pre_dead_time_detector_pulse_rate`. Its `observations.npz` contains only the
+base geometry, timing, shield, energy-edge, and raw `int64` spectrum arrays. There are
+no projected isotope counts, fitted variances, or isotope covariance arrays.
+
+The spectral MLE consumes those raw spectra directly. Count-domain replay requires
+the optional projected arrays from v1 and therefore fails closed on a raw-only v2 log.
+This prevents a second isotope-count extraction implementation from drifting away
+from the production observation model.
+
+The schema-v1 `run_manifest.json` includes:
 
 - `schema_version`, exactly `1`;
 - non-empty `run_id`;

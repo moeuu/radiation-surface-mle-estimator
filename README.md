@@ -1,19 +1,30 @@
 # 3D Estimation
 
-3D Estimation is a standalone rotating-shield radiation simulation and surface-reconstruction repository. It contains two connected workflows:
+3D Estimation is the standalone surface-MLE estimator for rotating-shield radiation
+measurements. For new shared experiments, production acquisition is owned by
+`Rotating-shield-particle-filter`; this repository consumes its truth-free raw
+full-spectrum MeasurementLog v2 and does not require simulation-code synchronization.
+It retains the historical local acquisition snapshot only for legacy reproducibility.
+It contains two workflows:
 
-1. `main.py` runs the local acquisition stack with either the analytic Python transport backend or the native Geant4 backend. It can persist every finalized observation as a versioned measurement log.
-2. `estimate-radiation-mle` replays that log and fits a non-negative, all-history Poisson maximum-likelihood map on the room and obstacle surfaces.
+1. `estimate-radiation-mle fit-spectrum` consumes the current shared raw-spectrum v2
+   log (or a legacy v1 log) and fits a non-negative, all-history Poisson maximum-
+   likelihood map on room and obstacle surfaces.
+2. The historical `main.py` acquisition snapshot remains available for reproducing
+   old standalone runs, but it is not the production source for new common experiments.
 
 The MLE estimates isotope-specific surface density in detector `cps@1m/m²`. This is a detector count-rate-equivalent strength density, not activity in Bq. Multiplying a patch density by its exact area gives that patch's integrated detector `cps@1m` strength.
 
 For implementation details, see [MLE architecture](docs/mle/architecture.md) and [measurement-log format](docs/mle/measurement_log.md).
 
-## Standalone repository guarantee
+## Estimator isolation guarantee
 
-This repository is an independent checkout. Installation, testing, acquisition, replay, and reporting do not require a particle-filter sibling checkout. There is no sibling runtime, path, import, package, submodule, or synchronization dependency. Simulation backends, detector and shield physics, spectrum processing, obstacle/source assets, the live estimator, the MLE, and the Geant4 sidecar source all live here.
+Installation, replay, and reporting remain independently testable. Shared runs connect
+through serialized MeasurementLog artifacts and subprocess CLIs, never sibling Python
+imports, path dependencies, symlinks, or copied source. This keeps the estimator
+isolated while making the PF repository the only production simulation implementation.
 
-[COMMON_RUNTIME_SNAPSHOT.json](COMMON_RUNTIME_SNAPSHOT.json) and [UPSTREAM_PF_COMMIT](UPSTREAM_PF_COMMIT) record where the vendored runtime snapshot came from. They are provenance only: they are not an update mechanism, a compatibility check against another checkout, or a runtime dependency. Changes in another repository do not flow into this one automatically.
+[COMMON_RUNTIME_SNAPSHOT.json](COMMON_RUNTIME_SNAPSHOT.json) and [UPSTREAM_PF_COMMIT](UPSTREAM_PF_COMMIT) record where the legacy vendored runtime snapshot came from. They are provenance only. Shared production logs carry their own runtime commit and complete forward-model identity, so no manual source synchronization is required.
 
 Audit this property at any time:
 

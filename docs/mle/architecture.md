@@ -4,16 +4,25 @@ This document describes the implemented all-history surface maximum-likelihood e
 
 ## Repository and estimator boundary
 
-The complete acquisition and reconstruction stack is local to this repository. It has no runtime, path, import, package, submodule, or synchronization dependency on a sibling checkout. The files [COMMON_RUNTIME_SNAPSHOT.json](../../COMMON_RUNTIME_SNAPSHOT.json) and [UPSTREAM_PF_COMMIT](../../UPSTREAM_PF_COMMIT) retain historical snapshot provenance only.
+Production acquisition is not owned by this repository. New shared experiments are
+generated once by `Rotating-shield-particle-filter` and enter the MLE through a
+truth-free raw MeasurementLog v2. This estimator remains independently installable:
+there is no sibling import, path dependency, package dependency, submodule, or source
+synchronization hook. The files
+[COMMON_RUNTIME_SNAPSHOT.json](../../COMMON_RUNTIME_SNAPSHOT.json) and
+[UPSTREAM_PF_COMMIT](../../UPSTREAM_PF_COMMIT) describe the archived local simulator
+snapshot only; they are not production inputs.
 
 The MLE is deliberately separated from live-estimator state:
 
-1. The analytic or Geant4 runtime produces a simulator observation.
-2. Adaptive-dwell chunks are merged and spectrum processing is finalized.
-3. An estimator-independent `MeasurementRecord` is built and durably staged.
-4. Only after the durable append returns does the local live estimator receive its measurement update.
-5. At run completion, the public measurement-log directory is atomically published.
-6. Replay loads only that log, reconstructs the local physical model, builds all surface responses, solves the MLE, and writes a self-contained report.
+1. The PF-owned Geant4 runtime produces, finalizes, and durably publishes raw
+   observations.
+2. The MLE validates the complete MeasurementLog and producer-owned forward-model
+   identity before returning any record.
+3. Replay builds its estimator response from the logged physical contract, constructs
+   all surface responses, solves the MLE, and writes a self-contained report.
+4. Cross-repository forward-response conformance tests detect estimator-kernel drift;
+   they are not a simulator synchronization mechanism.
 
 The current MLE CLI is an offline replay path. It does not read live particle state, control the online planner, or mutate an acquisition log.
 
