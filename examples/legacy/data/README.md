@@ -1,21 +1,22 @@
-# Historical GT measurement tables
+# Historical research data
 
-These CSV files are preserved as legacy research artifacts from the former
+This directory preserves the complete `data/` tree from the former
 `moeuu/Radiation_distribution_machine_learning` repository at commit
-`d07b4ead`. Line endings were normalized to LF during migration; numeric
-values and marker columns were retained.
+`d07b4eadf800813aaab1b11d65e10bd0e215e092`.
 
-| File | Original Git blob |
-| --- | --- |
-| `result.csv` | `6b75ef3892ee204431b3c0e61c9f4180a4eaffee` |
-| `result_3points.csv` | `aae4736d96402fe4ec2e3ce17bc47714f64a7a24` |
-| `result_5points.csv` | `5c9e33919aba6ec95c8af2b5a4010ee826cb0b95` |
-| `result_noshield.csv` | `d2bf0258bb33377f0d9f2c3fc887504fc3a198a4` |
+| Directory | Files | Bytes | Contents |
+| --- | ---: | ---: | --- |
+| `GT/` | 4 | 8,063 | Shield-aware and no-shield measurement tables |
+| `cor_img/` | 214 | 1,415,436 | Correlation images |
+| `img/` | 214 | 1,638,972 | Generated result images |
+| `rad_cnt/` | 369 | 204,278,653 | Radiation-count CSV files |
+| `test/` | 3 | 13,064 | Test CSV files |
+| **Total** | **804** | **207,354,188** | Original files, byte-for-byte |
 
-The shield-aware files use `x`, `y`, `z`, `value`, and `shield`.
-The three- and five-source tables also retain the original unlabeled marker
-column containing `*` on selected rows.
+The migration retains original filenames, directory structure, line endings,
+empty files, partial files, and marker columns. This preservation guarantees
+historical fidelity, not data quality or completeness.
 
-These tables are not MeasurementLog v2 inputs and are not consumed by the
-maintained estimator example. Use
-`../shield_aware_surface_mle.ipynb` for the current executable workflow.
+These artifacts are not MeasurementLog v2 inputs and are not consumed by the
+maintained estimator example. Use `../shield_aware_surface_mle.ipynb` for the
+current executable workflow.

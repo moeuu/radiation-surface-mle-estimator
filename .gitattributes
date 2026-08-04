@@ -1,0 +1,2 @@
+# Preserve frozen legacy CSV artifacts byte-for-byte and suppress text diffs.
+examples/legacy/data/**/*.csv binary
