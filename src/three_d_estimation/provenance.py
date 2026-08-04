@@ -76,7 +76,7 @@ def estimator_provenance(
         "candidate_domain": "complete_surface_dictionary",
         "uses_pf_state": False,
         "uses_pf_candidates": False,
-        "estimator_repository": "moeuu/3D_estimation",
+        "estimator_repository": "moeuu/radiation-surface-mle-estimator",
         "estimator_commit": commit,
         "repository_commit": commit,
         "measurement_log_schema_version": measurement_log_schema_version,

@@ -1,4 +1,4 @@
-# 3D Estimation
+# Radiation Surface MLE Estimator
 
 This repository contains the surface maximum-likelihood estimator only.
 
