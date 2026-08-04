@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 from scipy.sparse import csr_matrix
+
+from .response_operator import ResponseOperator
 
 
 @dataclass(frozen=True)
@@ -18,6 +21,9 @@ class SurfaceMapConfig:
     isotope_group_weight: float = 0.0
     nuisance_l1_weight: float = 0.0
     nuisance_l2_weight: float = 0.0
+    nuisance_l2_weights: tuple[float, ...] = ()
+    likelihood_family: str = "poisson"
+    overdispersion_alpha: tuple[float, ...] = ()
     max_iterations: int = 4000
     tolerance: float = 1.0e-6
     objective_tolerance: float = 1.0e-7
@@ -43,6 +49,22 @@ class SurfaceMapConfig:
             raise ValueError(
                 "Regularization weights and tolerances must be finite and non-negative."
             )
+        if any(
+            not np.isfinite(value) or float(value) < 0.0
+            for value in self.nuisance_l2_weights
+        ):
+            raise ValueError("nuisance_l2_weights must be finite and non-negative.")
+        if self.likelihood_family not in {"poisson", "negative_binomial"}:
+            raise ValueError("likelihood_family must be poisson or negative_binomial.")
+        if any(
+            not np.isfinite(value) or float(value) < 0.0
+            for value in self.overdispersion_alpha
+        ):
+            raise ValueError("overdispersion_alpha must be finite and non-negative.")
+        if self.likelihood_family == "poisson" and any(
+            float(value) != 0.0 for value in self.overdispersion_alpha
+        ):
+            raise ValueError("Poisson likelihood cannot have positive overdispersion.")
         if int(self.max_iterations) < 1:
             raise ValueError("max_iterations must be at least one.")
         if int(self.check_interval) < 1:
@@ -110,6 +132,19 @@ class _PreparedSurfaceMapProblem:
     observation_shape: tuple[int, ...]
     patch_count: int
     isotope_count: int
+
+
+def _nuisance_l2_vector(
+    config: SurfaceMapConfig,
+    count: int,
+) -> NDArray[np.float64]:
+    """Return one L2 shrinkage weight per nuisance coefficient."""
+    if not config.nuisance_l2_weights:
+        return np.full(count, float(config.nuisance_l2_weight), dtype=np.float64)
+    weights = np.asarray(config.nuisance_l2_weights, dtype=np.float64)
+    if weights.shape != (count,):
+        raise ValueError("nuisance_l2_weights must match nuisance_response columns.")
+    return weights
 
 
 def _as_non_negative_vector(
@@ -373,16 +408,13 @@ def _objective_from_prepared(
     group_penalty = float(config.isotope_group_weight) * float(
         np.sum(problem.patch_areas * np.linalg.norm(density_matrix, axis=1))
     )
+    nuisance_l2 = _nuisance_l2_vector(config, nuisance.size)
     nuisance_penalty = float(config.nuisance_l1_weight) * float(
         np.sum(nuisance)
-    ) + 0.5 * float(config.nuisance_l2_weight) * float(np.dot(nuisance, nuisance))
+    ) + 0.5 * float(np.dot(nuisance_l2, nuisance * nuisance))
     objective = SurfaceMapObjective(
         total=float(
-            poisson_nll
-            + l1_penalty
-            + tv_penalty
-            + group_penalty
-            + nuisance_penalty
+            poisson_nll + l1_penalty + tv_penalty + group_penalty + nuisance_penalty
         ),
         poisson_nll=float(poisson_nll),
         l1_penalty=float(l1_penalty),
@@ -557,7 +589,7 @@ def _kkt_residual(
         nuisance_gradient = (
             nuisance_gradient
             + float(config.nuisance_l1_weight)
-            + float(config.nuisance_l2_weight) * nuisance
+            + _nuisance_l2_vector(config, nuisance.size) * nuisance
         )
         nuisance_stationarity = np.where(
             nuisance > 1.0e-9,
@@ -596,6 +628,10 @@ def fit_surface_map_poisson(
     ``observed_shape + (patches, isotopes)`` and are flattened in one batch.
     """
     solver_config = SurfaceMapConfig() if config is None else config
+    if solver_config.likelihood_family != "poisson":
+        raise ValueError(
+            "Calibrated overdispersion requires the matrix-free solver path."
+        )
     problem = _prepare_surface_map_problem(
         observed_counts,
         response,
@@ -619,6 +655,7 @@ def fit_surface_map_poisson(
             )
         densities = density_vector.reshape(density_shape).copy()
     nuisance_count = int(problem.nuisance_response.shape[1])
+    nuisance_l2 = _nuisance_l2_vector(solver_config, nuisance_count)
     if initial_nuisance_coefficients is None:
         nuisance = np.zeros(nuisance_count, dtype=float)
     else:
@@ -712,7 +749,7 @@ def fit_surface_map_poisson(
                 - nuisance_steps
                 * (nuisance_gradient + float(solver_config.nuisance_l1_weight)),
                 0.0,
-            ) / (1.0 + nuisance_steps * float(solver_config.nuisance_l2_weight))
+            ) / (1.0 + nuisance_steps * nuisance_l2)
         relaxation = float(solver_config.over_relaxation)
         densities_bar = densities + relaxation * (densities - density_previous)
         nuisance_bar = nuisance + relaxation * (nuisance - nuisance_previous)
@@ -784,5 +821,591 @@ def fit_surface_map_poisson(
         relative_change=float(relative_change),
         relative_objective_change=float(relative_objective_change),
         kkt_residual=float(kkt_residual),
+        objective_history=tuple(objective_history),
+    )
+
+
+def _torch_response_product(
+    operator: ResponseOperator,
+    values: object,
+    *,
+    transpose: bool,
+    torch_module: object,
+) -> object:
+    """Apply a streamed response operator while retaining state on one device."""
+    torch = torch_module
+    vector = values
+    if transpose:
+        result = torch.zeros(
+            operator.source_count,
+            dtype=vector.dtype,
+            device=vector.device,
+        )
+        for block in operator.iter_blocks():
+            rows = torch.as_tensor(
+                np.array(block.observation_indices, dtype=np.int64, copy=True),
+                dtype=torch.long,
+                device=vector.device,
+            )
+            columns = torch.as_tensor(
+                np.array(block.source_indices, dtype=np.int64, copy=True),
+                dtype=torch.long,
+                device=vector.device,
+            )
+            matrix = torch.as_tensor(
+                np.array(block.values, dtype=np.float64, copy=True),
+                dtype=vector.dtype,
+                device=vector.device,
+            )
+            result.index_add_(0, columns, matrix.T @ vector[rows])
+        return result
+    result = torch.zeros(
+        operator.observation_count,
+        dtype=vector.dtype,
+        device=vector.device,
+    )
+    for block in operator.iter_blocks():
+        rows = torch.as_tensor(
+            np.array(block.observation_indices, dtype=np.int64, copy=True),
+            dtype=torch.long,
+            device=vector.device,
+        )
+        columns = torch.as_tensor(
+            np.array(block.source_indices, dtype=np.int64, copy=True),
+            dtype=torch.long,
+            device=vector.device,
+        )
+        matrix = torch.as_tensor(
+            np.array(block.values, dtype=np.float64, copy=True),
+            dtype=vector.dtype,
+            device=vector.device,
+        )
+        result.index_add_(0, rows, matrix @ vector[columns])
+    return result
+
+
+def fit_surface_map_poisson_operator(
+    observed_counts: ArrayLike,
+    response_operator: ResponseOperator,
+    patch_areas_m2: ArrayLike,
+    adjacency_edges: ArrayLike | None = None,
+    adjacency_weights: ArrayLike | None = None,
+    *,
+    background: float | ArrayLike = 0.0,
+    nuisance_response: ArrayLike | None = None,
+    initial_densities_cps_1m_m2: ArrayLike | None = None,
+    initial_nuisance_coefficients: ArrayLike | None = None,
+    config: SurfaceMapConfig | None = None,
+    use_gpu: bool = False,
+    gpu_device: str = "cuda",
+    gpu_dtype: str = "float64",
+) -> SurfaceMapResult:
+    """Fit Poisson surface density using streamed response products.
+
+    The supplied operator maps density variables directly to expected counts;
+    unlike :func:`fit_surface_map_poisson`, patch areas are therefore already
+    included in each response block.  Areas remain explicit for L1, group
+    regularization, and integrated-strength reporting.  CPU and CUDA execute
+    the same Torch primal-dual updates while response blocks stay bounded.
+    """
+    if not isinstance(response_operator, ResponseOperator):
+        raise TypeError("response_operator must implement ResponseOperator.")
+    import torch
+
+    solver_config = SurfaceMapConfig() if config is None else config
+    observed_array = np.asarray(observed_counts, dtype=np.float64)
+    if observed_array.shape != response_operator.observation_shape:
+        raise ValueError("observed_counts must match response_operator shape.")
+    observed_vector = _as_non_negative_vector(
+        observed_array,
+        name="observed_counts",
+    )
+    if solver_config.overdispersion_alpha:
+        raw_alpha = np.asarray(
+            solver_config.overdispersion_alpha,
+            dtype=np.float64,
+        )
+        if raw_alpha.shape == (response_operator.observation_count,):
+            alpha_vector = raw_alpha
+        elif len(response_operator.observation_shape) == 2 and raw_alpha.shape == (
+            response_operator.observation_shape[1],
+        ):
+            alpha_vector = np.tile(raw_alpha, response_operator.observation_shape[0])
+        else:
+            raise ValueError(
+                "overdispersion_alpha must match all observations or energy bins."
+            )
+    else:
+        alpha_vector = np.zeros(response_operator.observation_count, dtype=np.float64)
+    if solver_config.likelihood_family == "negative_binomial" and not np.any(
+        alpha_vector > 0.0
+    ):
+        raise ValueError("Negative-binomial likelihood requires positive calibration.")
+    areas = _as_non_negative_vector(patch_areas_m2, name="patch_areas_m2")
+    if areas.shape != (response_operator.patch_count,) or np.any(areas <= 0.0):
+        raise ValueError("patch_areas_m2 must contain one positive area per patch.")
+    nuisance_matrix = _flatten_nuisance_response(
+        nuisance_response,
+        response_operator.observation_shape,
+    )
+    background_vector = _broadcast_observation_vector(
+        background,
+        response_operator.observation_shape,
+        name="background",
+    )
+    incidence, edge_weights = _canonical_graph(
+        adjacency_edges,
+        adjacency_weights,
+        response_operator.patch_count,
+    )
+    density_shape = (
+        response_operator.patch_count,
+        response_operator.isotope_count,
+    )
+    if initial_densities_cps_1m_m2 is None:
+        initial_density = np.zeros(density_shape, dtype=np.float64)
+    else:
+        initial_density = _as_non_negative_vector(
+            initial_densities_cps_1m_m2,
+            name="initial_densities_cps_1m_m2",
+        )
+        if initial_density.size != response_operator.source_count:
+            raise ValueError("Initial densities must match patches by isotopes.")
+        initial_density = initial_density.reshape(density_shape)
+    if solver_config.likelihood_family == "negative_binomial" and not np.any(
+        initial_density > 0.0
+    ):
+        unit_total = float(np.sum(response_operator.row_sums()))
+        initial_scale = float(np.sum(observed_vector)) / max(unit_total, 1.0e-12)
+        initial_density = np.full(density_shape, initial_scale, dtype=np.float64)
+    nuisance_count = nuisance_matrix.shape[1]
+    nuisance_l2_values = _nuisance_l2_vector(solver_config, nuisance_count)
+    if initial_nuisance_coefficients is None:
+        initial_nuisance = np.zeros(nuisance_count, dtype=np.float64)
+    else:
+        initial_nuisance = _as_non_negative_vector(
+            initial_nuisance_coefficients,
+            name="initial_nuisance_coefficients",
+        )
+        if initial_nuisance.size != nuisance_count:
+            raise ValueError("Initial nuisance values must match nuisance columns.")
+    if gpu_dtype not in {"float32", "float64"}:
+        raise ValueError("gpu_dtype must be float32 or float64.")
+    device = torch.device(gpu_device if use_gpu else "cpu")
+    if use_gpu and device.type == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA matrix-free solve requested but CUDA is unavailable.")
+    dtype = torch.float32 if gpu_dtype == "float32" else torch.float64
+
+    def tensor(values: ArrayLike, *, integer: bool = False) -> object:
+        """Copy one bounded array to the selected solver device."""
+        return torch.as_tensor(
+            np.asarray(values),
+            dtype=torch.long if integer else dtype,
+            device=device,
+        )
+
+    observed = tensor(observed_vector)
+    alpha_t = tensor(alpha_vector)
+    background_t = tensor(background_vector)
+    nuisance_design = tensor(nuisance_matrix)
+    areas_t = tensor(areas)
+    edge_weights_t = tensor(edge_weights)
+    densities = tensor(initial_density).clone()
+    nuisance = tensor(initial_nuisance).clone()
+    tv_active = bool(float(solver_config.tv_weight) > 0.0 and incidence.shape[0] > 0)
+    coo = incidence.tocoo()
+    incidence_t = torch.sparse_coo_tensor(
+        tensor(np.vstack((coo.row, coo.col)), integer=True),
+        tensor(coo.data),
+        size=incidence.shape,
+        dtype=dtype,
+        device=device,
+        check_invariants=False,
+    ).coalesce()
+
+    row_sums = response_operator.row_sums()
+    if nuisance_count:
+        row_sums = row_sums + np.sum(nuisance_matrix, axis=1)
+    observation_steps = tensor(
+        float(solver_config.step_safety) / np.maximum(row_sums, 1.0e-12)
+    )
+    column_sums = response_operator.column_sums().reshape(density_shape)
+    if tv_active:
+        degrees = np.asarray(np.abs(incidence).sum(axis=0)).reshape(-1)
+        column_sums = column_sums + degrees[:, None]
+    group_bound = np.max(column_sums, axis=1, keepdims=True)
+    density_steps = tensor(
+        np.broadcast_to(
+            float(solver_config.step_safety) / np.maximum(group_bound, 1.0e-12),
+            density_shape,
+        ).copy()
+    )
+    nuisance_steps = tensor(
+        (
+            float(solver_config.step_safety)
+            / np.maximum(np.sum(nuisance_matrix, axis=0), 1.0e-12)
+        )
+        if nuisance_count
+        else np.zeros(0, dtype=np.float64)
+    )
+    nuisance_l2_t = tensor(nuisance_l2_values)
+    edge_steps = (
+        torch.full(
+            (incidence.shape[0],),
+            float(solver_config.step_safety) / 2.0,
+            dtype=dtype,
+            device=device,
+        )
+        if tv_active
+        else torch.zeros(0, dtype=dtype, device=device)
+    )
+    observation_dual = torch.zeros(
+        response_operator.observation_count,
+        dtype=dtype,
+        device=device,
+    )
+    tv_dual = torch.zeros(
+        (incidence.shape[0] if tv_active else 0, response_operator.isotope_count),
+        dtype=dtype,
+        device=device,
+    )
+    densities_bar = densities.clone()
+    nuisance_bar = nuisance.clone()
+    previous_density = densities.clone()
+    previous_nuisance = nuisance.clone()
+    previous_objective = float("inf")
+    relative_change = float("inf")
+    relative_objective_change = float("inf")
+    converged = False
+    iterations = 0
+    objective_history: list[float] = []
+
+    def forward(density_values: object) -> object:
+        """Apply the streamed density operator on the solver device."""
+        return _torch_response_product(
+            response_operator,
+            density_values.reshape(-1),
+            transpose=False,
+            torch_module=torch,
+        )
+
+    def transpose(observation_values: object) -> object:
+        """Apply the streamed transpose on the solver device."""
+        return _torch_response_product(
+            response_operator,
+            observation_values,
+            transpose=True,
+            torch_module=torch,
+        ).reshape(density_shape)
+
+    def expected_counts(density_values: object, nuisance_values: object) -> object:
+        """Return the current positive expected-count vector."""
+        signal = forward(density_values)
+        if nuisance_count:
+            signal = signal + nuisance_design @ nuisance_values
+        return torch.clamp(
+            background_t + signal,
+            min=float(solver_config.min_mean),
+        )
+
+    def objective_values(
+        density_values: object,
+        nuisance_values: object,
+    ) -> tuple[tuple[float, ...], object]:
+        """Return objective components and expected counts on the device."""
+        expected = expected_counts(density_values, nuisance_values)
+        if solver_config.likelihood_family == "negative_binomial":
+            positive_alpha = alpha_t > 0.0
+            concentration = torch.where(
+                positive_alpha,
+                1.0 / torch.clamp(alpha_t, min=1.0e-30),
+                torch.ones_like(alpha_t),
+            )
+            nb_nll = (
+                (observed + concentration) * torch.log(concentration + expected)
+                - observed * torch.log(expected)
+                - concentration * torch.log(concentration)
+            )
+            poisson_terms = expected - observed * torch.log(expected)
+            likelihood = torch.sum(torch.where(positive_alpha, nb_nll, poisson_terms))
+        else:
+            likelihood = torch.sum(expected - observed * torch.log(expected))
+        l1 = float(solver_config.l1_weight) * torch.sum(
+            areas_t[:, None] * density_values
+        )
+        if tv_active:
+            differences = torch.sparse.mm(incidence_t, density_values)
+            tv = float(solver_config.tv_weight) * torch.sum(
+                edge_weights_t[:, None] * torch.abs(differences)
+            )
+        else:
+            tv = torch.zeros((), dtype=dtype, device=device)
+        group = float(solver_config.isotope_group_weight) * torch.sum(
+            areas_t * torch.linalg.vector_norm(density_values, dim=1)
+        )
+        nuisance_penalty = float(solver_config.nuisance_l1_weight) * torch.sum(
+            nuisance_values
+        ) + 0.5 * torch.dot(nuisance_l2_t * nuisance_values, nuisance_values)
+        if solver_config.likelihood_family == "negative_binomial":
+            saturated_mean = torch.clamp(observed, min=float(solver_config.min_mean))
+            saturated_nb = (
+                (observed + concentration) * torch.log(concentration + saturated_mean)
+                - observed * torch.log(saturated_mean)
+                - concentration * torch.log(concentration)
+            )
+            saturated_poisson = saturated_mean - observed * torch.log(saturated_mean)
+            saturated = torch.where(
+                positive_alpha,
+                saturated_nb,
+                saturated_poisson,
+            )
+            deviance = 2.0 * (likelihood - torch.sum(saturated))
+        else:
+            positive = observed > 0.0
+            log_term = torch.where(
+                positive,
+                observed * torch.log(torch.clamp(observed, min=1.0e-30) / expected),
+                torch.zeros_like(observed),
+            )
+            deviance = 2.0 * torch.sum(log_term - observed + expected)
+        total = likelihood + l1 + tv + group + nuisance_penalty
+        return (
+            float(total.item()),
+            float(likelihood.item()),
+            float(l1.item()),
+            float(tv.item()),
+            float(group.item()),
+            float(nuisance_penalty.item()),
+            float(deviance.item()),
+        ), expected
+
+    for iteration in range(1, int(solver_config.max_iterations) + 1):
+        if solver_config.likelihood_family == "negative_binomial":
+            expected_current = expected_counts(densities, nuisance)
+            likelihood_gradient = (expected_current - observed) / torch.clamp(
+                expected_current + alpha_t * expected_current * expected_current,
+                min=float(solver_config.min_mean),
+            )
+            density_old = densities
+            nuisance_old = nuisance
+            gradient = transpose(likelihood_gradient)
+            gradient = gradient + float(solver_config.l1_weight) * areas_t[:, None]
+            if float(solver_config.isotope_group_weight) > 0.0:
+                norms = torch.linalg.vector_norm(densities, dim=1, keepdim=True)
+                active = norms[:, 0] > 1.0e-12
+                gradient[active] += (
+                    float(solver_config.isotope_group_weight)
+                    * areas_t[active][:, None]
+                    * densities[active]
+                    / norms[active]
+                )
+            if tv_active:
+                differences = torch.sparse.mm(incidence_t, densities)
+                tv_dual = (
+                    float(solver_config.tv_weight)
+                    * edge_weights_t[:, None]
+                    * torch.sign(differences)
+                )
+                gradient = gradient + torch.sparse.mm(
+                    incidence_t.transpose(0, 1),
+                    tv_dual,
+                )
+            # Diagonal response-sum preconditioning is damped for the
+            # non-quadratic calibrated likelihood.  The diminishing factor is
+            # deterministic and prevents large early nuisance corrections.
+            damping = min(0.25, 2.5 / math.sqrt(float(iteration)))
+            densities = torch.clamp(
+                densities - damping * density_steps * gradient,
+                min=0.0,
+            )
+            if nuisance_count:
+                nuisance_gradient = (
+                    nuisance_design.T @ likelihood_gradient
+                    + float(solver_config.nuisance_l1_weight)
+                    + nuisance_l2_t * nuisance
+                )
+                nuisance = torch.clamp(
+                    nuisance - damping * nuisance_steps * nuisance_gradient,
+                    min=0.0,
+                )
+            densities_bar = densities
+            nuisance_bar = nuisance
+            iterations = iteration
+            if iteration % int(solver_config.check_interval) != 0 and iteration != int(
+                solver_config.max_iterations
+            ):
+                continue
+            state_delta = torch.sqrt(
+                torch.sum((densities - previous_density) ** 2)
+                + torch.sum((nuisance - previous_nuisance) ** 2)
+            )
+            state_norm = torch.sqrt(torch.sum(densities**2) + torch.sum(nuisance**2))
+            relative_change = float(
+                (state_delta / torch.clamp(state_norm, min=1.0)).item()
+            )
+            terms, _ = objective_values(densities, nuisance)
+            objective_history.append(terms[0])
+            if np.isfinite(previous_objective):
+                relative_objective_change = abs(terms[0] - previous_objective) / max(
+                    abs(previous_objective), 1.0
+                )
+            previous_density = densities.clone()
+            previous_nuisance = nuisance.clone()
+            previous_objective = terms[0]
+            if relative_change <= float(
+                solver_config.tolerance
+            ) and relative_objective_change <= float(solver_config.objective_tolerance):
+                converged = True
+                break
+            continue
+        signal_bar = forward(densities_bar)
+        if nuisance_count:
+            signal_bar = signal_bar + nuisance_design @ nuisance_bar
+        trial = observation_dual + observation_steps * signal_bar
+        gamma = 1.0 / observation_steps
+        center = trial / observation_steps
+        shifted = background_t + center - gamma
+        mean = 0.5 * (
+            shifted
+            + torch.sqrt(
+                torch.clamp(shifted * shifted + 4.0 * gamma * observed, min=0.0)
+            )
+        )
+        observation_dual = trial - observation_steps * (mean - background_t)
+        if tv_active:
+            difference_bar = torch.sparse.mm(incidence_t, densities_bar)
+            tv_trial = tv_dual + edge_steps[:, None] * difference_bar
+            tv_bound = float(solver_config.tv_weight) * edge_weights_t[:, None]
+            tv_dual = torch.maximum(torch.minimum(tv_trial, tv_bound), -tv_bound)
+
+        density_old = densities
+        nuisance_old = nuisance
+        gradient = transpose(observation_dual)
+        if tv_active:
+            gradient = gradient + torch.sparse.mm(incidence_t.transpose(0, 1), tv_dual)
+        densities = torch.clamp(
+            densities
+            - density_steps
+            * (gradient + float(solver_config.l1_weight) * areas_t[:, None]),
+            min=0.0,
+        )
+        if float(solver_config.isotope_group_weight) > 0.0:
+            group_norm = torch.linalg.vector_norm(densities, dim=1, keepdim=True)
+            threshold = (
+                density_steps[:, :1]
+                * float(solver_config.isotope_group_weight)
+                * areas_t[:, None]
+            )
+            densities = densities * torch.clamp(
+                1.0 - threshold / torch.clamp(group_norm, min=1.0e-30),
+                min=0.0,
+            )
+        if nuisance_count:
+            nuisance_gradient = nuisance_design.T @ observation_dual
+            nuisance = torch.clamp(
+                nuisance
+                - nuisance_steps
+                * (nuisance_gradient + float(solver_config.nuisance_l1_weight)),
+                min=0.0,
+            ) / (1.0 + nuisance_steps * nuisance_l2_t)
+        relaxation = float(solver_config.over_relaxation)
+        densities_bar = densities + relaxation * (densities - density_old)
+        nuisance_bar = nuisance + relaxation * (nuisance - nuisance_old)
+        iterations = iteration
+        if iteration % int(solver_config.check_interval) != 0 and iteration != int(
+            solver_config.max_iterations
+        ):
+            continue
+        state_delta = torch.sqrt(
+            torch.sum((densities - previous_density) ** 2)
+            + torch.sum((nuisance - previous_nuisance) ** 2)
+        )
+        state_norm = torch.sqrt(torch.sum(densities**2) + torch.sum(nuisance**2))
+        relative_change = float((state_delta / torch.clamp(state_norm, min=1.0)).item())
+        terms, _ = objective_values(densities, nuisance)
+        objective_history.append(terms[0])
+        if np.isfinite(previous_objective):
+            relative_objective_change = abs(terms[0] - previous_objective) / max(
+                abs(previous_objective), 1.0
+            )
+        previous_density = densities.clone()
+        previous_nuisance = nuisance.clone()
+        previous_objective = terms[0]
+        if relative_change <= float(
+            solver_config.tolerance
+        ) and relative_objective_change <= float(solver_config.objective_tolerance):
+            converged = True
+            break
+
+    terms, expected = objective_values(densities, nuisance)
+    if solver_config.likelihood_family == "negative_binomial":
+        likelihood_gradient = (expected - observed) / torch.clamp(
+            expected + alpha_t * expected * expected,
+            min=float(solver_config.min_mean),
+        )
+    else:
+        likelihood_gradient = 1.0 - observed / expected
+    density_gradient = transpose(likelihood_gradient)
+    density_gradient = (
+        density_gradient + float(solver_config.l1_weight) * areas_t[:, None]
+    )
+    if float(solver_config.isotope_group_weight) > 0.0:
+        norms = torch.linalg.vector_norm(densities, dim=1, keepdim=True)
+        active = norms[:, 0] > 1.0e-12
+        density_gradient[active] += (
+            float(solver_config.isotope_group_weight)
+            * areas_t[active][:, None]
+            * densities[active]
+            / norms[active]
+        )
+    if tv_active:
+        density_gradient = density_gradient + torch.sparse.mm(
+            incidence_t.transpose(0, 1), tv_dual
+        )
+    stationarity = torch.where(
+        densities > 1.0e-9,
+        density_gradient,
+        torch.minimum(density_gradient, torch.zeros_like(density_gradient)),
+    ).reshape(-1)
+    residual_parts = [stationarity]
+    if nuisance_count:
+        nuisance_gradient = (
+            nuisance_design.T @ likelihood_gradient
+            + float(solver_config.nuisance_l1_weight)
+            + nuisance_l2_t * nuisance
+        )
+        residual_parts.append(
+            torch.where(
+                nuisance > 1.0e-9,
+                nuisance_gradient,
+                torch.minimum(nuisance_gradient, torch.zeros_like(nuisance_gradient)),
+            )
+        )
+    kkt = float(
+        (
+            torch.linalg.vector_norm(torch.cat(residual_parts))
+            / torch.clamp(torch.linalg.vector_norm(likelihood_gradient), min=1.0)
+        ).item()
+    )
+    densities_numpy = densities.detach().cpu().numpy().astype(np.float64, copy=False)
+    nuisance_numpy = nuisance.detach().cpu().numpy().astype(np.float64, copy=False)
+    expected_numpy = expected.detach().cpu().numpy().astype(np.float64, copy=False)
+    return SurfaceMapResult(
+        densities_cps_1m_m2=densities_numpy,
+        integrated_strengths_cps_1m=densities_numpy * areas[:, None],
+        nuisance_coefficients=nuisance_numpy,
+        expected_counts=expected_numpy.reshape(response_operator.observation_shape),
+        objective=terms[0],
+        poisson_nll=terms[1],
+        l1_penalty=terms[2],
+        tv_penalty=terms[3],
+        group_penalty=terms[4],
+        nuisance_penalty=terms[5],
+        deviance=terms[6],
+        converged=converged,
+        iterations=iterations,
+        relative_change=relative_change,
+        relative_objective_change=relative_objective_change,
+        kkt_residual=kkt,
         objective_history=tuple(objective_history),
     )

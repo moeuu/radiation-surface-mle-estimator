@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import tracemalloc
 
 import numpy as np
 import pytest
@@ -12,6 +14,7 @@ from measurement.continuous_kernels import ContinuousKernel
 from measurement.kernels import ShieldParams
 from measurement.obstacles import ObstacleGrid
 from measurement.shielding import generate_octant_orientations
+from runtime.discrepancy_calibration import DiscrepancyCalibration
 from spectrum.response_matrix import (
     BACKSCATTER_FRACTION,
     COMPTON_CONTINUUM_TO_PEAK,
@@ -22,6 +25,8 @@ from spectrum.response_matrix import (
 from three_d_estimation.spectral_response_builder import (
     build_spectral_nuisance_response,
     build_spectral_response,
+    build_spectral_response_operator,
+    build_structured_spectral_nuisance_response,
 )
 
 
@@ -154,8 +159,7 @@ def _kernel(
     """Return a local shared kernel with controlled line physics."""
     return ContinuousKernel(
         mu_by_isotope={
-            isotope: {"fe": 0.0, "pb": 0.0}
-            for isotope in line_mu_by_isotope
+            isotope: {"fe": 0.0, "pb": 0.0} for isotope in line_mu_by_isotope
         },
         shield_params=_shield_params(thickness_cm=thickness_cm),
         line_mu_by_isotope=line_mu_by_isotope,
@@ -266,7 +270,9 @@ def test_co60_lines_receive_distinct_shield_attenuation() -> None:
         fe_indices=np.asarray([0]),
         pb_indices=np.asarray([0]),
     )
-    patches = _patches(np.asarray([[[-orientation[0], -orientation[1], -orientation[2]]]]))
+    patches = _patches(
+        np.asarray([[[-orientation[0], -orientation[1], -orientation[2]]]])
+    )
     differential_lines = (
         dict(_CO_LINES_UNATTENUATED[0]),
         {
@@ -452,6 +458,56 @@ def test_nuisance_rate_bases_are_nonnegative_and_live_time_scaled() -> None:
     assert empty_names == ()
 
 
+def test_structured_nuisance_uses_shared_pair_and_station_bases() -> None:
+    """Calibrated discrepancy must share coefficients rather than fit each row."""
+    calibration = DiscrepancyCalibration.from_mapping(
+        {
+            "schema_version": 1,
+            "calibration_id": "test-all-pairs",
+            "independent_environment_ids": ["a", "b"],
+            "shield_pair_ids": list(range(64)),
+            "energy_bin_edges_keV": [0.0, 100.0, 200.0],
+            "background_basis": [[0.7, 0.3]],
+            "scatter_basis": [[0.4, 0.6]],
+            "shield_pair_feature_basis": [[1.0, pair / 63.0] for pair in range(64)],
+            "shield_leakage_basis": [[0.2, 0.8]],
+            "low_rank_spectral_residual_basis": [[0.5, 0.5]],
+            "gain_derivative_basis": [[-0.1, 0.1]],
+            "resolution_derivative_basis": [[0.2, -0.2]],
+            "overdispersion": {
+                "family": "negative_binomial",
+                "alpha_by_bin": [0.02, 0.03],
+            },
+            "shrinkage_l2_by_family": {
+                "background": 1.0,
+                "scatter": 2.0,
+                "shield_leakage": 3.0,
+                "station_rate": 4.0,
+                "low_rank_residual": 5.0,
+                "gain_drift": 6.0,
+                "resolution_drift": 7.0,
+            },
+        }
+    )
+
+    response, names, shrinkage, alpha = build_structured_spectral_nuisance_response(
+        np.asarray([1.0, 2.0, 1.5]),
+        np.asarray([0.0, 100.0, 200.0]),
+        np.asarray([0, 0, 7]),
+        np.asarray([0, 1, 7]),
+        np.asarray([0, 0, 1]),
+        calibration,
+        include_gain_resolution_drift=True,
+    )
+
+    assert response.shape[:2] == (3, 2)
+    assert len(names) == response.shape[2] == shrinkage.size
+    assert sum(name.startswith("station_rate:") for name in names) == 2
+    assert sum(name.startswith("shield_leakage:") for name in names) == 2
+    assert np.all(response >= 0.0)
+    np.testing.assert_array_equal(alpha, [0.02, 0.03])
+
+
 def test_kernel_chunk_size_does_not_change_cpu_result() -> None:
     """Kernel chunk boundaries alter memory use but not spectral responses."""
     edges = np.arange(0.0, 1505.0, 5.0)
@@ -506,6 +562,141 @@ def test_kernel_chunk_size_does_not_change_cpu_result() -> None:
         large.response_per_density,
     )
     np.testing.assert_array_equal(small.nuisance_response, large.nuisance_response)
+
+
+def test_matrix_free_operator_matches_materialized_density_response(
+    tmp_path: Path,
+) -> None:
+    """Forward, transpose, and materialized views must share exact physics."""
+    edges = np.arange(0.0, 1505.0, 10.0)
+    observations = _observations(
+        np.asarray([[0.0, 0.0, 0.5], [0.25, 0.1, 1.5]]),
+        edges,
+        live_times_s=np.asarray([1.0, 2.0]),
+        fe_indices=np.asarray([0, 7]),
+        pb_indices=np.asarray([7, 0]),
+    )
+    patches = _patches(
+        np.asarray(
+            [
+                [[1.0, 0.0, 0.5], [1.2, 0.0, 0.5]],
+                [[0.0, 1.0, 1.5], [0.0, 1.2, 1.5]],
+            ]
+        ),
+        quadrature_weights=np.asarray([[0.4, 0.6], [0.25, 0.75]]),
+        areas_m2=np.asarray([0.75, 1.5]),
+    )
+    isotopes = ("Cs-137", "Co-60")
+    kernel = _kernel({"Cs-137": _CS_LINE, "Co-60": _CO_LINES_UNATTENUATED})
+    materialized = build_spectral_response(
+        observations,
+        patches,
+        isotopes,
+        kernel,
+        chunk_size=2,
+    )
+    streamed = build_spectral_response_operator(
+        observations,
+        patches,
+        isotopes,
+        kernel,
+        chunk_size=2,
+        energy_chunk_size=17,
+        patch_chunk_size=1,
+        cache_directory=tmp_path / "cache",
+    )
+    expected = materialized.response_per_density
+    actual = streamed.operator.materialize()
+
+    np.testing.assert_allclose(actual, expected, rtol=1.0e-12, atol=1.0e-14)
+    vector = np.arange(1, streamed.operator.source_count + 1, dtype=float)
+    residual = np.linspace(0.1, 1.0, streamed.operator.observation_count)
+    np.testing.assert_allclose(
+        streamed.operator.matvec(vector),
+        expected.reshape(streamed.operator.observation_count, -1) @ vector,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+    np.testing.assert_allclose(
+        streamed.operator.rmatvec(residual),
+        expected.reshape(streamed.operator.observation_count, -1).T @ residual,
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    )
+
+
+def test_matrix_free_cache_appends_only_new_measurement_rows(tmp_path: Path) -> None:
+    """Extending an online prefix must reuse every existing immutable row block."""
+    edges = np.arange(0.0, 1005.0, 10.0)
+    patches = _patches(np.asarray([[[1.0, 0.0, 0.5]]]))
+    first_observations = _observations(np.asarray([[0.0, 0.0, 0.5]]), edges)
+    cache = tmp_path / "cache"
+    first = build_spectral_response_operator(
+        first_observations,
+        patches,
+        ("Cs-137",),
+        _kernel({"Cs-137": _CS_LINE}),
+        energy_chunk_size=25,
+        patch_chunk_size=1,
+        cache_directory=cache,
+    )
+    first.operator.row_sums()
+    original_files = tuple(sorted(cache.rglob("*.npy")))
+    original_bytes = {
+        path.relative_to(cache): path.read_bytes() for path in original_files
+    }
+
+    extended_observations = _observations(
+        np.asarray([[0.0, 0.0, 0.5], [0.5, 0.0, 1.0]]),
+        edges,
+    )
+    extended = build_spectral_response_operator(
+        extended_observations,
+        patches,
+        ("Cs-137",),
+        _kernel({"Cs-137": _CS_LINE}),
+        energy_chunk_size=25,
+        patch_chunk_size=1,
+        cache_directory=cache,
+    )
+    extended.operator.row_sums()
+    final_files = tuple(sorted(cache.rglob("*.npy")))
+
+    assert len(final_files) == 2 * len(original_files)
+    assert all(
+        (cache / relative).read_bytes() == content
+        for relative, content in original_bytes.items()
+    )
+
+
+def test_operator_peak_memory_is_bounded_by_response_blocks() -> None:
+    """Operator construction must not allocate the declared full response tensor."""
+    edges = np.arange(0.0, 1501.0, 1.0)
+    observations = _observations(
+        np.asarray([[0.0, 0.0, 0.5], [0.5, 0.0, 1.5]]),
+        edges,
+    )
+    points = np.zeros((128, 1, 3), dtype=float)
+    points[:, 0, 0] = np.linspace(1.0, 4.0, 128)
+    points[:, 0, 2] = 0.5
+    patches = _patches(points)
+    full_response_bytes = 2 * 1500 * 128 * 8
+
+    tracemalloc.start()
+    streamed = build_spectral_response_operator(
+        observations,
+        patches,
+        ("Cs-137",),
+        _kernel({"Cs-137": _CS_LINE}),
+        energy_chunk_size=32,
+        patch_chunk_size=16,
+    )
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+
+    assert peak < full_response_bytes
+    with pytest.raises(MemoryError):
+        streamed.operator.materialize(maximum_bytes=full_response_bytes - 1)
 
 
 def test_invalid_pair_index_and_chunk_are_rejected_before_kernel_work() -> None:

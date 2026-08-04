@@ -1,17 +1,16 @@
-# MeasurementLog v1 and v2
+# Shared MeasurementLog v2 boundary
 
-`MeasurementLog` is the estimator-independent boundary between acquisition and
-standalone surface MLE. It contains finalized measurements and resolved physical
-model metadata, never particle state, PF candidates, estimator output, or truth.
-New production acquisition is owned by `Rotating-shield-particle-filter` and emits
-raw full-spectrum schema v2. Schema v1 remains readable for archived local runs.
+`MeasurementLog` is the estimator-independent boundary between acquisition and the
+surface MLE. The versioned `rotating-shield-simulation-runtime` package exclusively
+owns its schema, durable stream writer, validation, and final publication. This
+repository only consumes the package's `MeasurementLog`, `RunContext`, and
+`MeasurementRecord` views.
 
-See the [README](../../README.md) for commands and
-[MLE architecture](architecture.md) for reconstruction details.
+The log contains resolved physical model metadata and raw unit-weight integer spectra.
+It never contains realized source truth, PF particles/candidates, MLE output, or
+planner state.
 
-## Directory contract
-
-Both supported schema versions contain exactly the estimator inputs below:
+## Published directory
 
 ```text
 RUN_DIR/
@@ -24,117 +23,13 @@ RUN_DIR/
 └── repository_commit.txt
 ```
 
-`repository_commit.txt` is the canonical provenance filename. The loader accepts
-the historical `upstream_pf_commit.txt` only as a reader alias for existing local
-logs; new logs never write it.
+The runtime loader verifies the file inventory and artifact hashes before exposing any
+record. Truth and source-layout artifacts must live outside `RUN_DIR`; forbidden truth
+names and recursively embedded realized source values fail closed.
 
-Truth is forbidden below `RUN_DIR`. Simulation truth belongs in a separate
-evaluation directory, for example:
+## Raw observation arrays
 
-```text
-EVALUATION_DIR/
-└── truth.json
-```
-
-`save_evaluation_truth` and `load_evaluation_truth` manage that separate artifact.
-Neither `load_measurement_log` nor replay reads it.
-
-The boundary is fail-closed beyond the canonical filename: any artifact path
-whose normalized name contains `truth` or `source-layout` is rejected. Run,
-environment, context, and per-record metadata are scanned recursively for
-truth, realized source layouts/positions/coordinates/locations, and source
-lists. Strings pointing to those artifacts are rejected as well. Source-rate,
-source-strength, and source-extent model parameters remain valid physics.
-
-## Run manifest
-
-Schema v2 changes the observation contract, not the ownership boundary. It declares
-`observation_model=joint_full_spectrum_generative` and source-rate quantity
-`expected_pre_dead_time_detector_pulse_rate`. Its `observations.npz` contains only the
-base geometry, timing, shield, energy-edge, and raw `int64` spectrum arrays. There are
-no projected isotope counts, fitted variances, or isotope covariance arrays.
-
-The spectral MLE consumes those raw spectra directly. Count-domain replay requires
-the optional projected arrays from v1 and therefore fails closed on a raw-only v2 log.
-This prevents a second isotope-count extraction implementation from drifting away
-from the production observation model.
-
-The schema-v1 `run_manifest.json` includes:
-
-- `schema_version`, exactly `1`;
-- non-empty `run_id`;
-- `repository_commit`, matching `repository_commit.txt`;
-- `resolved_config_sha256`, matching the exact resolved-config file bytes;
-- `forward_model_manifest_sha256`, matching the exact forward manifest bytes;
-- `source_rate_model`, exactly `detector_cps_1m`;
-- `source_rate_semantics`, exactly
-  `{quantity: expected_net_detector_count_rate, unit: cps,
-  normalization_distance_m: 1.0}`;
-- all six `model_identifiers` entries: detector, shield, environment, obstacle,
-  transport, and spectrum, each with a non-empty `id` and lowercase SHA-256;
-- exact `index_conventions` for causal step order, unique actions, and
-  nondecreasing station groups;
-- `artifact_hashes` for every estimator-input file other than the manifest
-  itself;
-- isotope order, environment, simulator/spectrum method, an optional relative
-  obstacle-layout path, metadata, and record/bin counts;
-- `source_layout_path`, retained only as a schema-v1 compatibility sentinel
-  whose value must be `null`.
-
-Unknown schema versions, missing artifacts, hash mismatches, incompatible source
-semantics, and model-identity mismatches fail before records are returned.
-
-## Forward-model manifest
-
-`forward_model_manifest.json` binds replay to physical semantics. It records:
-
-- repository and resolved-config identity;
-- the six model IDs and hashes;
-- distance `m`, time `s`, energy `keV`, source-strength
-  `detector_cps_1m`, and linear-attenuation `cm^-1` units;
-- inverse-square/near-field distance behavior;
-- detector geometry binding;
-- the 8 × 8 Fe/Pb orientation-pair response;
-- line-segment obstacle attenuation;
-- linear live-time scaling;
-- energy-bin-integrated isotope-line response.
-
-The registered fixture additionally carries the exact production
-`line_mu_by_isotope` table. Every ordered line records energy, normalized
-weight, Fe attenuation, and Pb attenuation. Its shield-model hash binds the
-full table; its spectrum-model hash binds the energy/weight subset.
-
-Native logs are checked against a manifest derived from their complete local
-resolved configuration. The versioned
-`rotating-shield-analytic-conformance-v1` fixture is the only registry binding:
-its exact six IDs/hashes and every semantic field are fail-closed. That binding
-is accepted because the local implementation is verified numerically over all
-4,608 canonical forward-response cases. An unknown registry ID or any changed
-field is rejected; registry matching is not a general fallback.
-
-Every file-backed obstacle, transport, detector, or spectrum asset selected by
-replay must use a safe relative path resolved below the run directory or this
-standalone repository. The corresponding component payload binds both that
-portable path and the SHA-256 of the raw asset bytes. A file changed in place
-therefore produces a model-identity mismatch even when its configured path is
-unchanged. Registered conformance manifests cannot reference arbitrary
-file-backed assets because their hashes are fixed by the registry.
-
-Generate the numerical provider output with:
-
-```bash
-uv run estimate-radiation-mle forward-conformance \
-  --axes fixtures/forward_response_conformance.json \
-  --output results/mle_forward_response.npz
-```
-
-The output contains exactly `case_ids` and `unit_response`. Ordering is isotope,
-listed detector pose, Fe 0–7, Pb 0–7, listed source, then listed obstacle.
-
-## Observation arrays
-
-Let `M` be records, `B` energy bins, and `I` isotopes. `observations.npz` is a
-deterministic, uncompressed, pickle-free archive with these exact members:
+For `M` records and `B` energy bins, `observations.npz` contains:
 
 | Member | Dtype | Shape |
 | --- | --- | --- |
@@ -144,67 +39,79 @@ deterministic, uncompressed, pickle-free archive with these exact members:
 | `fe_orientation_index`, `pb_orientation_index` | `int64` | `M` |
 | `live_time_s`, `travel_time_s`, `shield_actuation_time_s` | `float64` | `M` |
 | `energy_bin_edges_keV` | `float64` | `B + 1` |
-| `spectrum_counts`, `spectrum_variance` | `float64` | `M × B` |
-| `spectrum_variance_present` | `bool` | `M` |
-| `isotope_counts` | `float64` | `M × I` |
-| `isotope_counts_present` | `bool` | `M × I` |
-| `isotope_counts_record_present` | `bool` | `M` |
-| `isotope_count_covariance` | `float64` | `M × I × I` |
-| `isotope_count_covariance_present` | `bool` | `M × I × I` |
-| `isotope_count_covariance_record_present` | `bool` | `M` |
+| `spectrum_counts` | `int64` | `M × B` |
 
-Presence masks are authoritative. Absent numeric values must be stored as NaN;
-present values must be finite. Counts and variances are non-negative. Every
-stored covariance is complete, symmetric, finite, and positive semidefinite.
+Spectra are exact non-negative event counts. Schema v2 deliberately has no projected
+isotope counts, fitted spectrum variances, or isotope covariance arrays. Production
+MLE therefore uses `fit-spectrum` or the spectral online backend. The count-domain
+solver remains available only for an explicitly derived/imported count contract; it
+must not project raw v2 spectra itself.
 
-Live time is strictly positive. Travel and shield-actuation times are
-non-negative. Fe/Pb indices are integers in `[0, 7]`. Quaternions must be finite,
-nonzero, and normalized within `rtol=1e-9`, `atol=1e-12`. Energy edges are finite
-and strictly increasing. Steps are strictly increasing, actions are unique, and
-stations are nondecreasing in causal file order.
+Live time is positive. Travel and shield-actuation times are non-negative. Fe/Pb
+orientation indices lie in `[0, 7]`. Quaternions are normalized, energy edges are
+strictly increasing, steps/actions follow zero-based causal order, and station IDs are
+contiguous nondecreasing groups.
 
-## Per-row metadata
+## Station-causal online use
 
-`observation_metadata.jsonl` has one compact JSON object per array row with
-exactly these keys:
+The runtime stream writer first fsyncs a record shard and its metadata row. On the
+final record at a station it then durably rewrites that row with
+`station_complete: true`. Only after those operations may a controller call
+`OnlineMLESession.receive_persisted`.
 
-```json
-{"action_id":0,"array_index":0,"metadata":{},"run_id":"run-1","station_id":0,"step_id":0}
-```
+The MLE does not read private stream-stage files. It receives the public
+`MeasurementRecord` object held by the runtime controller, and it validates any
+explicit station flag against the durable record metadata. Non-final station views are
+buffered without solving. At a station boundary the backend fits the complete prefix,
+using the prior station solution only as numerical initialization.
 
-Every identifier must match the corresponding NPZ row. `metadata` may hold
-descriptive acquisition fields such as `shield_program_block_id`; numerical
-geometry, shields, spectra, covariance, and timing remain in typed arrays.
+`online-replay` validates a finalized log and checks that exactly the final record of
+every station carries the marker before driving the same update path. Each station
+report records:
 
-## Content digest and provenance
+- covered step IDs;
+- cutoff step and station;
+- covered-record content SHA-256;
+- update policy `station_complete_all_history`; and
+- runtime/config identity without claiming a full-log hash that was unavailable at
+  that causal cutoff.
 
-`measurement_log_sha256(RUN_DIR)` inventories every regular file recursively as
-`{relative POSIX path: raw file SHA-256}`, serializes that mapping with the
-runtime canonical JSON encoder plus its terminating newline, and hashes those
-bytes. The digest includes `run_manifest.json`. Symlinks, non-regular files, and
-truth/source-layout artifact names inside the log fail validation.
+The final report may bind the complete finalized MeasurementLog content hash.
 
-MLE provenance records:
+## Forward-model identity
 
-- estimator repository and commit;
-- estimator family `surface_mle` and variant `count` or `spectral`;
-- candidate domain `complete_surface_dictionary`;
-- `uses_pf_state: false` and `uses_pf_candidates: false`;
-- measurement run/schema/repository identity;
-- measurement-log and forward-manifest hashes;
-- raw estimator-config file hash (`config_sha256`);
-- resolved semantic estimator-config hash
-  (`resolved_estimator_config_sha256`).
+`forward_model_manifest.json` binds the MLE response to the runtime's physical
+semantics. The current native contract includes:
 
-## Durable publication
+- repository and resolved runtime-config identity;
+- detector, shield, environment, obstacle, transport, and spectrum model IDs/hashes;
+- detector-response, shield-pose, obstacle-material, and transport-table contract
+  hashes;
+- `detector_cps_1m` source-rate semantics;
+- distance/time/energy/attenuation units;
+- all 8 × 8 Fe/Pb orientation pairs;
+- line-resolved isotope energies, weights, and Fe/Pb attenuation; and
+- obstacle path and live-time response semantics.
 
-`MeasurementLogRecorder` fsyncs a finalized one-record shard before acquisition
-may update any live estimator. Finalization validates the complete causal
-sequence, writes all public artifacts into a sibling temporary directory,
-fsyncs them, and atomically renames the directory into place. Existing targets
-are never replaced. Failure after completed records retains or publishes those
-inputs for diagnosis; it never fabricates missing rows.
+Replay and the online backend reconstruct `RuntimeObservationModel` and
+`ContinuousKernel` from this validated runtime context. They do not maintain a second
+copy of detector, shield, obstacle, or spectrum physics.
 
-The public representation is deterministic: strict sorted JSON, compact sorted
-JSONL, fixed NPZ member order, fixed ZIP timestamps/permissions, no pickle, and
-no object arrays.
+## Source-rate semantics
+
+`intensity_cps_1m` and fitted integrated patch strength both mean expected net detector
+count rate at one metre for the configured detector and processing contract. They are
+not total gamma emission rate or Bq. Surface density has units
+`detector_cps_1m / m²`.
+
+## Publication and content digest
+
+During acquisition, the runtime's `MeasurementLogStreamWriter` persists deterministic
+per-record shards before estimator ingestion. Finalization consolidates them into the
+canonical pickle-free bundle, verifies one station marker per station, fsyncs the
+artifacts, and atomically publishes the output directory without replacing an existing
+log.
+
+`MeasurementLog.content_sha256` inventories every regular non-truth artifact below the
+published directory and hashes that inventory. MLE final reports retain this digest;
+online station reports instead bind only their causally covered records.

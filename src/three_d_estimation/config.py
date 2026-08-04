@@ -24,8 +24,37 @@ class MLEConfig:
     isotope_group_weight: float = 0.0
     nuisance_l1_weight: float = 0.0
     nuisance_l2_weight: float = 0.0
+    regularization_selection: Literal["fixed", "grouped_cv"] = "fixed"
+    cv_l1_weights: tuple[float, ...] = (0.0,)
+    cv_tv_weights: tuple[float, ...] = (0.0,)
+    cv_fold_count: int = 5
+    cv_grouping: Literal["station_id", "same_xy_height"] = "station_id"
+    cv_one_standard_error: bool = True
+    tuning_environment_id: str | None = None
+    final_holdout_environment_id: str | None = None
+    uncertainty_enable: bool = False
+    laplace_support_threshold_fraction: float = 1.0e-3
+    laplace_max_active_parameters: int = 256
+    laplace_ridge: float = 1.0e-8
+    station_bootstrap_replicates: int = 0
+    bootstrap_confidence_level: float = 0.95
+    bootstrap_seed: int = 173
     fit_background_nuisance: bool = True
     fit_scatter_nuisance: bool = True
+    discrepancy_calibration_path: str | None = None
+    fit_shield_leakage_nuisance: bool = True
+    fit_station_rate_nuisance: bool = True
+    fit_low_rank_residual_nuisance: bool = True
+    fit_gain_resolution_drift: bool = False
+    spectral_likelihood: Literal["poisson", "calibrated_overdispersed"] = "poisson"
+    count_likelihood: Literal[
+        "poisson",
+        "covariance_gaussian",
+        "multivariate_student_t",
+    ] = "poisson"
+    count_student_t_degrees_of_freedom: float = 4.0
+    count_covariance_regularization: float = 1.0e-6
+    count_covariance_max_condition_number: float = 1.0e10
     max_iterations: int = 4000
     tolerance: float = 1.0e-6
     objective_tolerance: float = 1.0e-7
@@ -34,6 +63,13 @@ class MLEConfig:
     over_relaxation: float = 1.0
     min_mean: float = 1.0e-12
     response_chunk_size: int = 262144
+    spectral_response_mode: Literal["materialized", "matrix_free"] = "materialized"
+    response_energy_chunk_size: int = 128
+    response_patch_chunk_size: int = 128
+    response_cache_dir: str | None = None
+    online_fit_scope: Literal["station_complete"] = "station_complete"
+    online_patch_spacing_m: tuple[float, float, float] | None = None
+    online_coarse_to_fine_levels: int = 0
     use_gpu: bool = False
     gpu_device: str = "cuda"
     gpu_dtype: Literal["float32", "float64"] = "float64"
@@ -60,6 +96,82 @@ class MLEConfig:
         """Validate values that affect physical or optimization semantics."""
         if self.mode not in {"count", "spectral"}:
             raise ValueError("mode must be 'count' or 'spectral'.")
+        if self.online_fit_scope != "station_complete":
+            raise ValueError("online_fit_scope must be 'station_complete'.")
+        if self.spectral_likelihood not in {
+            "poisson",
+            "calibrated_overdispersed",
+        }:
+            raise ValueError(
+                "spectral_likelihood must be poisson or calibrated_overdispersed."
+            )
+        if self.count_likelihood not in {
+            "poisson",
+            "covariance_gaussian",
+            "multivariate_student_t",
+        }:
+            raise ValueError("Unsupported count_likelihood.")
+        if self.regularization_selection not in {"fixed", "grouped_cv"}:
+            raise ValueError("regularization_selection must be fixed or grouped_cv.")
+        if self.cv_grouping not in {"station_id", "same_xy_height"}:
+            raise ValueError("cv_grouping must be station_id or same_xy_height.")
+        if isinstance(self.cv_fold_count, bool) or int(self.cv_fold_count) < 2:
+            raise ValueError("cv_fold_count must be an integer of at least two.")
+        cv_l1 = tuple(float(value) for value in self.cv_l1_weights)
+        cv_tv = tuple(float(value) for value in self.cv_tv_weights)
+        if (
+            not cv_l1
+            or not cv_tv
+            or any(not np.isfinite(value) or value < 0.0 for value in (*cv_l1, *cv_tv))
+        ):
+            raise ValueError(
+                "CV regularization grids must be nonempty and nonnegative."
+            )
+        if self.tuning_environment_id is not None and (
+            not isinstance(self.tuning_environment_id, str)
+            or not self.tuning_environment_id.strip()
+        ):
+            raise ValueError("tuning_environment_id must be null or nonempty.")
+        if self.final_holdout_environment_id is not None and (
+            not isinstance(self.final_holdout_environment_id, str)
+            or not self.final_holdout_environment_id.strip()
+        ):
+            raise ValueError("final_holdout_environment_id must be null or nonempty.")
+        if (
+            self.tuning_environment_id is not None
+            and self.final_holdout_environment_id is not None
+            and self.tuning_environment_id == self.final_holdout_environment_id
+        ):
+            raise ValueError("Tuning and final holdout environments must differ.")
+        if (
+            not np.isfinite(self.count_student_t_degrees_of_freedom)
+            or float(self.count_student_t_degrees_of_freedom) <= 2.0
+        ):
+            raise ValueError("count_student_t_degrees_of_freedom must exceed two.")
+        if (
+            not np.isfinite(self.count_covariance_regularization)
+            or float(self.count_covariance_regularization) < 0.0
+        ):
+            raise ValueError("count_covariance_regularization must be non-negative.")
+        if (
+            not np.isfinite(self.count_covariance_max_condition_number)
+            or float(self.count_covariance_max_condition_number) <= 1.0
+        ):
+            raise ValueError("count_covariance_max_condition_number must exceed one.")
+        if (
+            self.spectral_likelihood == "calibrated_overdispersed"
+            and self.discrepancy_calibration_path is None
+        ):
+            raise ValueError(
+                "Calibrated overdispersion requires discrepancy_calibration_path."
+            )
+        if (
+            self.spectral_likelihood == "calibrated_overdispersed"
+            and self.spectral_response_mode != "matrix_free"
+        ):
+            raise ValueError(
+                "Calibrated overdispersion requires spectral_response_mode=matrix_free."
+            )
         names = tuple(str(value).strip() for value in self.isotope_names)
         if (
             not names
@@ -74,6 +186,17 @@ class MLEConfig:
             raise ValueError(
                 "patch_spacing_m must contain three finite positive values."
             )
+        online_spacing = None
+        if self.online_patch_spacing_m is not None:
+            online_spacing = tuple(
+                float(value) for value in self.online_patch_spacing_m
+            )
+            if len(online_spacing) != 3 or any(
+                not np.isfinite(value) or value <= 0.0 for value in online_spacing
+            ):
+                raise ValueError(
+                    "online_patch_spacing_m must be null or three positive values."
+                )
         if int(self.quadrature_order) not in {1, 4}:
             raise ValueError("quadrature_order must be 1 or 4.")
         nonnegative = {
@@ -92,6 +215,10 @@ class MLEConfig:
             "cluster_min_strength_cps_1m": self.cluster_min_strength_cps_1m,
             "held_out_fraction": self.held_out_fraction,
             "held_out_xy_tolerance_m": self.held_out_xy_tolerance_m,
+            "laplace_support_threshold_fraction": (
+                self.laplace_support_threshold_fraction
+            ),
+            "laplace_ridge": self.laplace_ridge,
         }
         if any(not np.isfinite(value) or value < 0.0 for value in nonnegative.values()):
             raise ValueError(
@@ -101,6 +228,27 @@ class MLEConfig:
             raise ValueError("Iteration counts must be positive.")
         if int(self.response_chunk_size) < 1:
             raise ValueError("response_chunk_size must be positive.")
+        if self.spectral_response_mode not in {"materialized", "matrix_free"}:
+            raise ValueError(
+                "spectral_response_mode must be materialized or matrix_free."
+            )
+        if (
+            int(self.response_energy_chunk_size) < 1
+            or int(self.response_patch_chunk_size) < 1
+        ):
+            raise ValueError("Response energy and patch chunk sizes must be positive.")
+        if self.response_cache_dir is not None and (
+            not isinstance(self.response_cache_dir, str)
+            or not self.response_cache_dir.strip()
+        ):
+            raise ValueError("response_cache_dir must be null or a non-empty path.")
+        if self.discrepancy_calibration_path is not None and (
+            not isinstance(self.discrepancy_calibration_path, str)
+            or not self.discrepancy_calibration_path.strip()
+        ):
+            raise ValueError(
+                "discrepancy_calibration_path must be null or a non-empty path."
+            )
         if not 0.0 < float(self.step_safety) < 1.0:
             raise ValueError("step_safety must lie strictly between zero and one.")
         if not 0.0 <= float(self.over_relaxation) <= 1.0:
@@ -132,10 +280,32 @@ class MLEConfig:
             raise ValueError("held_out_xy_tolerance_m must be finite and positive.")
         if int(self.coarse_to_fine_levels) < 0:
             raise ValueError("coarse_to_fine_levels must be non-negative.")
+        if (
+            isinstance(self.online_coarse_to_fine_levels, bool)
+            or int(self.online_coarse_to_fine_levels) < 0
+        ):
+            raise ValueError("online_coarse_to_fine_levels must be non-negative.")
+        if (
+            isinstance(self.laplace_max_active_parameters, bool)
+            or int(self.laplace_max_active_parameters) < 1
+        ):
+            raise ValueError("laplace_max_active_parameters must be positive.")
+        if (
+            isinstance(self.station_bootstrap_replicates, bool)
+            or int(self.station_bootstrap_replicates) < 0
+        ):
+            raise ValueError("station_bootstrap_replicates must be nonnegative.")
+        if not 0.0 < float(self.bootstrap_confidence_level) < 1.0:
+            raise ValueError("bootstrap_confidence_level must lie in (0, 1).")
+        if not 0.0 <= float(self.laplace_support_threshold_fraction) <= 1.0:
+            raise ValueError("laplace_support_threshold_fraction must lie in [0, 1].")
         if self.gpu_dtype not in {"float32", "float64"}:
             raise ValueError("gpu_dtype must be float32 or float64.")
         object.__setattr__(self, "isotope_names", names)
         object.__setattr__(self, "patch_spacing_m", spacing)
+        object.__setattr__(self, "online_patch_spacing_m", online_spacing)
+        object.__setattr__(self, "cv_l1_weights", cv_l1)
+        object.__setattr__(self, "cv_tv_weights", cv_tv)
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, Any]) -> "MLEConfig":
@@ -148,24 +318,52 @@ class MLEConfig:
             if isinstance(raw_spacing, (int, float)):
                 raw_spacing = (float(raw_spacing),) * 3
             values["patch_spacing_m"] = tuple(float(value) for value in raw_spacing)
+        if values.get("online_patch_spacing_m") is not None:
+            raw_online_spacing = values["online_patch_spacing_m"]
+            if isinstance(raw_online_spacing, (int, float)):
+                raw_online_spacing = (float(raw_online_spacing),) * 3
+            values["online_patch_spacing_m"] = tuple(
+                float(value) for value in raw_online_spacing
+            )
         if "isotope_names" in values:
             values["isotope_names"] = tuple(
                 str(value) for value in values["isotope_names"]
             )
+        for key in ("cv_l1_weights", "cv_tv_weights"):
+            if key in values:
+                values[key] = tuple(float(value) for value in values[key])
         return cls(**values)
 
     @classmethod
     def load(cls, path: str | Path) -> "MLEConfig":
         """Load a JSON configuration file."""
-        with Path(path).open("r", encoding="utf-8") as handle:
+        source = Path(path).expanduser().resolve()
+        with source.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
         if not isinstance(payload, Mapping):
             raise ValueError("MLE configuration root must be a JSON object.")
-        return cls.from_dict(payload)
+        values = dict(payload)
+        calibration_path = values.get("discrepancy_calibration_path")
+        if isinstance(calibration_path, str) and calibration_path.strip():
+            calibration = Path(calibration_path).expanduser()
+            if not calibration.is_absolute():
+                calibration = (source.parent / calibration).resolve()
+            values["discrepancy_calibration_path"] = calibration.as_posix()
+        return cls.from_dict(values)
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable configuration dictionary."""
-        return asdict(self)
+        payload = asdict(self)
+        payload["isotope_names"] = list(self.isotope_names)
+        payload["patch_spacing_m"] = list(self.patch_spacing_m)
+        payload["online_patch_spacing_m"] = (
+            None
+            if self.online_patch_spacing_m is None
+            else list(self.online_patch_spacing_m)
+        )
+        payload["cv_l1_weights"] = list(self.cv_l1_weights)
+        payload["cv_tv_weights"] = list(self.cv_tv_weights)
+        return payload
 
     def save(self, path: str | Path) -> None:
         """Write deterministic JSON configuration output."""

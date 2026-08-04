@@ -7,12 +7,21 @@ from typing import Sequence
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.special import gammaln
 
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.model import EnvironmentConfig
 from measurement.obstacles import ObstacleGrid
+from runtime.discrepancy_calibration import load_discrepancy_calibration
 
+from .count_covariance import fit_surface_map_count_covariance
 from .config import MLEConfig
+from .model_selection import (
+    RegularizationCVResult,
+    RegularizationCandidate,
+    grouped_kfold_indices,
+    select_regularization_one_standard_error,
+)
 from .postprocess import (
     cluster_surface_hotspots,
     poisson_deviance,
@@ -20,10 +29,27 @@ from .postprocess import (
 )
 from .provenance import estimator_provenance
 from .response_builder import build_count_responses
-from .solver import SurfaceMapConfig, SurfaceMapResult, fit_surface_map_poisson
-from .spectral_response_builder import SpectralResponseResult, build_spectral_response
+from .response_operator import ResponseOperator
+from .solver import (
+    SurfaceMapConfig,
+    SurfaceMapResult,
+    fit_surface_map_poisson,
+    fit_surface_map_poisson_operator,
+)
+from .spectral_response_builder import (
+    SpectralResponseOperatorResult,
+    SpectralResponseResult,
+    build_spectral_response,
+    build_spectral_response_operator,
+)
 from .surface_patches import build_surface_patches, refine_surface_patches
 from .types import MLEEstimate, ObservationBatch, SurfacePatch, SurfacePatchSet
+from .uncertainty import (
+    active_support_laplace,
+    augment_clusters_with_laplace,
+    bootstrap_uncertainty_summary,
+    station_bootstrap_batch,
+)
 
 
 @dataclass(frozen=True)
@@ -31,17 +57,24 @@ class _FitState:
     """Store one solver result and the response used to obtain it."""
 
     patches: SurfacePatchSet
-    response: NDArray[np.float64]
+    response: NDArray[np.float64] | ResponseOperator
     nuisance_response: NDArray[np.float64]
     nuisance_names: tuple[str, ...]
+    nuisance_l2_weights: NDArray[np.float64]
+    overdispersion_alpha_by_bin: NDArray[np.float64]
     result: SurfaceMapResult
     fit_indices: NDArray[np.int64]
     held_out_indices: NDArray[np.int64]
-    spectral_details: SpectralResponseResult | None
+    spectral_details: SpectralResponseResult | SpectralResponseOperatorResult | None
+    likelihood_diagnostics: dict[str, object]
 
 
 def _surface_map_config(
-    config: MLEConfig, *, regularized: bool = True
+    config: MLEConfig,
+    *,
+    regularized: bool = True,
+    nuisance_l2_weights: NDArray[np.float64] | None = None,
+    overdispersion_alpha_by_bin: NDArray[np.float64] | None = None,
 ) -> SurfaceMapConfig:
     """Translate public MLE settings into the numerical solver contract."""
     return SurfaceMapConfig(
@@ -52,6 +85,27 @@ def _surface_map_config(
         ),
         nuisance_l1_weight=float(config.nuisance_l1_weight),
         nuisance_l2_weight=float(config.nuisance_l2_weight),
+        nuisance_l2_weights=(
+            ()
+            if nuisance_l2_weights is None
+            else tuple(
+                float(value) + float(config.nuisance_l2_weight)
+                for value in np.asarray(nuisance_l2_weights, dtype=float)
+            )
+        ),
+        likelihood_family=(
+            "negative_binomial"
+            if config.spectral_likelihood == "calibrated_overdispersed"
+            else "poisson"
+        ),
+        overdispersion_alpha=(
+            ()
+            if overdispersion_alpha_by_bin is None
+            else tuple(
+                float(value)
+                for value in np.asarray(overdispersion_alpha_by_bin, dtype=float)
+            )
+        ),
         max_iterations=int(config.max_iterations),
         tolerance=float(config.tolerance),
         objective_tolerance=float(config.objective_tolerance),
@@ -236,9 +290,55 @@ def _fit_problem(
             batch.isotope_count,
             bool(config.fit_background_nuisance),
         )
+        nuisance_l2_weights = np.zeros(len(nuisance_names), dtype=np.float64)
+        overdispersion_alpha = np.zeros(0, dtype=np.float64)
+        likelihood_diagnostics = {"family": config.count_likelihood}
         observed = batch.isotope_counts
         spectral_details = None
+    elif config.spectral_response_mode == "matrix_free":
+        calibration = (
+            None
+            if config.discrepancy_calibration_path is None
+            else load_discrepancy_calibration(config.discrepancy_calibration_path)
+        )
+        spectral_details = build_spectral_response_operator(
+            batch,
+            patches,
+            config.isotope_names,
+            kernel,
+            chunk_size=int(config.response_chunk_size),
+            energy_chunk_size=int(config.response_energy_chunk_size),
+            patch_chunk_size=int(config.response_patch_chunk_size),
+            cache_directory=config.response_cache_dir,
+            continuum_to_peak=float(config.continuum_to_peak),
+            backscatter_fraction=float(config.backscatter_fraction),
+            require_line_resolved=True,
+            include_background_nuisance=bool(config.fit_background_nuisance),
+            include_scatter_nuisance=bool(config.fit_scatter_nuisance),
+            discrepancy_calibration=calibration,
+            include_shield_leakage_nuisance=bool(config.fit_shield_leakage_nuisance),
+            include_station_rate_nuisance=bool(config.fit_station_rate_nuisance),
+            include_low_rank_residual_nuisance=bool(
+                config.fit_low_rank_residual_nuisance
+            ),
+            include_gain_resolution_drift=bool(config.fit_gain_resolution_drift),
+        )
+        response = spectral_details.operator
+        nuisance_response = spectral_details.nuisance_response
+        nuisance_names = spectral_details.nuisance_names
+        nuisance_l2_weights = spectral_details.nuisance_l2_weights
+        overdispersion_alpha = spectral_details.overdispersion_alpha_by_bin
+        observed = batch.spectrum_counts
+        likelihood_diagnostics = {
+            "family": config.spectral_likelihood,
+            "calibration_path": config.discrepancy_calibration_path,
+        }
     else:
+        calibration = (
+            None
+            if config.discrepancy_calibration_path is None
+            else load_discrepancy_calibration(config.discrepancy_calibration_path)
+        )
         spectral_details = build_spectral_response(
             batch,
             patches,
@@ -250,33 +350,113 @@ def _fit_problem(
             require_line_resolved=True,
             include_background_nuisance=bool(config.fit_background_nuisance),
             include_scatter_nuisance=bool(config.fit_scatter_nuisance),
+            discrepancy_calibration=calibration,
+            include_shield_leakage_nuisance=bool(config.fit_shield_leakage_nuisance),
+            include_station_rate_nuisance=bool(config.fit_station_rate_nuisance),
+            include_low_rank_residual_nuisance=bool(
+                config.fit_low_rank_residual_nuisance
+            ),
+            include_gain_resolution_drift=bool(config.fit_gain_resolution_drift),
         )
         response = spectral_details.response_per_integrated_strength
         nuisance_response = spectral_details.nuisance_response
         nuisance_names = spectral_details.nuisance_names
+        nuisance_l2_weights = spectral_details.nuisance_l2_weights
+        overdispersion_alpha = spectral_details.overdispersion_alpha_by_bin
         observed = batch.spectrum_counts
+        likelihood_diagnostics = {
+            "family": config.spectral_likelihood,
+            "calibration_path": config.discrepancy_calibration_path,
+        }
 
-    fitted = fit_surface_map_poisson(
-        observed[fit_indices],
-        response[fit_indices],
-        patches.areas_m2,
-        adjacency_edges=patches.adjacency_index_edges,
-        adjacency_weights=patches.shared_edge_lengths_m,
-        background=0.0,
-        nuisance_response=nuisance_response[fit_indices],
-        initial_densities_cps_1m_m2=initial_densities,
-        initial_nuisance_coefficients=initial_nuisance,
-        config=_surface_map_config(config),
-    )
+    if config.mode == "count" and config.count_likelihood != "poisson":
+        if batch.isotope_covariances is None:
+            raise ValueError(
+                "Covariance-aware count likelihood requires isotope_covariances."
+            )
+        fitted, covariance_diagnostics = fit_surface_map_count_covariance(
+            observed[fit_indices],
+            count_details.response_by_integrated_strength[fit_indices],
+            batch.isotope_covariances[fit_indices],
+            patches.areas_m2,
+            adjacency_edges=patches.adjacency_index_edges,
+            adjacency_weights=patches.shared_edge_lengths_m,
+            nuisance_response=nuisance_response[fit_indices],
+            initial_densities_cps_1m_m2=initial_densities,
+            initial_nuisance_coefficients=initial_nuisance,
+            likelihood_family=config.count_likelihood,
+            student_t_degrees_of_freedom=float(
+                config.count_student_t_degrees_of_freedom
+            ),
+            covariance_regularization=float(config.count_covariance_regularization),
+            maximum_condition_number=float(
+                config.count_covariance_max_condition_number
+            ),
+            config=_surface_map_config(
+                config,
+                nuisance_l2_weights=nuisance_l2_weights,
+            ),
+        )
+        likelihood_diagnostics.update(
+            {
+                "covariance_regularization": (
+                    covariance_diagnostics.covariance_regularization
+                ),
+                "maximum_condition_number": (
+                    covariance_diagnostics.maximum_condition_number
+                ),
+                "condition_numbers": list(covariance_diagnostics.condition_numbers),
+            }
+        )
+    elif isinstance(response, ResponseOperator):
+        fitted = fit_surface_map_poisson_operator(
+            observed[fit_indices],
+            response.select_measurements(fit_indices.tolist()),
+            patches.areas_m2,
+            adjacency_edges=patches.adjacency_index_edges,
+            adjacency_weights=patches.shared_edge_lengths_m,
+            background=0.0,
+            nuisance_response=nuisance_response[fit_indices],
+            initial_densities_cps_1m_m2=initial_densities,
+            initial_nuisance_coefficients=initial_nuisance,
+            config=_surface_map_config(
+                config,
+                nuisance_l2_weights=nuisance_l2_weights,
+                overdispersion_alpha_by_bin=overdispersion_alpha,
+            ),
+            use_gpu=bool(config.use_gpu),
+            gpu_device=str(config.gpu_device),
+            gpu_dtype=str(config.gpu_dtype),
+        )
+    else:
+        fitted = fit_surface_map_poisson(
+            observed[fit_indices],
+            response[fit_indices],
+            patches.areas_m2,
+            adjacency_edges=patches.adjacency_index_edges,
+            adjacency_weights=patches.shared_edge_lengths_m,
+            background=0.0,
+            nuisance_response=nuisance_response[fit_indices],
+            initial_densities_cps_1m_m2=initial_densities,
+            initial_nuisance_coefficients=initial_nuisance,
+            config=_surface_map_config(
+                config,
+                nuisance_l2_weights=nuisance_l2_weights,
+                overdispersion_alpha_by_bin=overdispersion_alpha,
+            ),
+        )
     return _FitState(
         patches=patches,
         response=response,
         nuisance_response=nuisance_response,
         nuisance_names=nuisance_names,
+        nuisance_l2_weights=nuisance_l2_weights,
+        overdispersion_alpha_by_bin=overdispersion_alpha,
         result=fitted,
         fit_indices=fit_indices,
         held_out_indices=held_out_indices,
         spectral_details=spectral_details,
+        likelihood_diagnostics=likelihood_diagnostics,
     )
 
 
@@ -320,12 +500,42 @@ def _debias_state(
     config: MLEConfig,
 ) -> _FitState:
     """Refit selected support without L1, TV, or group shrinkage bias."""
+    if state.likelihood_diagnostics.get("family") in {
+        "covariance_gaussian",
+        "multivariate_student_t",
+    }:
+        # The count-covariance path is diagnostic and must never be silently
+        # replaced by a Poisson support refit.
+        return state
     densities = state.result.densities_cps_1m_m2
     maxima = np.max(densities, axis=0, keepdims=True)
     support = densities >= maxima * float(config.support_threshold_fraction)
     support &= maxima > 0.0
     if not np.any(support):
         return state
+    if isinstance(state.response, ResponseOperator):
+        masked_response = state.response.masked_sources(support)
+        result = fit_surface_map_poisson_operator(
+            observed[state.fit_indices],
+            masked_response.select_measurements(state.fit_indices.tolist()),
+            state.patches.areas_m2,
+            adjacency_edges=state.patches.adjacency_index_edges,
+            adjacency_weights=state.patches.shared_edge_lengths_m,
+            background=0.0,
+            nuisance_response=state.nuisance_response[state.fit_indices],
+            initial_densities_cps_1m_m2=np.where(support, densities, 0.0),
+            initial_nuisance_coefficients=state.result.nuisance_coefficients,
+            config=_surface_map_config(
+                config,
+                regularized=False,
+                nuisance_l2_weights=state.nuisance_l2_weights,
+                overdispersion_alpha_by_bin=state.overdispersion_alpha_by_bin,
+            ),
+            use_gpu=bool(config.use_gpu),
+            gpu_device=str(config.gpu_device),
+            gpu_dtype=str(config.gpu_dtype),
+        )
+        return replace(state, response=masked_response, result=result)
     if state.response.ndim == 4:
         masked_response = state.response * support[None, None, :, :]
     else:  # pragma: no cover - all production response tensors are rank four
@@ -340,15 +550,25 @@ def _debias_state(
         nuisance_response=state.nuisance_response[state.fit_indices],
         initial_densities_cps_1m_m2=np.where(support, densities, 0.0),
         initial_nuisance_coefficients=state.result.nuisance_coefficients,
-        config=_surface_map_config(config, regularized=False),
+        config=_surface_map_config(
+            config,
+            regularized=False,
+            nuisance_l2_weights=state.nuisance_l2_weights,
+            overdispersion_alpha_by_bin=state.overdispersion_alpha_by_bin,
+        ),
     )
     return replace(state, response=masked_response, result=result)
 
 
 def _full_prediction(state: _FitState) -> NDArray[np.float64]:
     """Evaluate the fitted density and nuisance model for every measurement."""
-    strengths = state.result.integrated_strengths_cps_1m
-    expected = np.einsum("...gi,gi->...", state.response, strengths, optimize=True)
+    if isinstance(state.response, ResponseOperator):
+        expected = state.response.matvec(
+            state.result.densities_cps_1m_m2.reshape(-1)
+        ).reshape(state.response.observation_shape)
+    else:
+        strengths = state.result.integrated_strengths_cps_1m
+        expected = np.einsum("...gi,gi->...", state.response, strengths, optimize=True)
     if state.result.nuisance_coefficients.size:
         expected = expected + np.einsum(
             "...n,n->...",
@@ -357,6 +577,63 @@ def _full_prediction(state: _FitState) -> NDArray[np.float64]:
             optimize=True,
         )
     return np.maximum(expected, 0.0)
+
+
+def _operator_identifiability(
+    operator: ResponseOperator,
+    densities: NDArray[np.float64],
+    fit_indices: NDArray[np.int64],
+    threshold: float,
+) -> dict[str, object]:
+    """Return bounded active-support response-correlation diagnostics."""
+    maximum = np.max(densities, axis=0, keepdims=True)
+    active_mask = (densities > 0.0) & (densities >= maximum * 1.0e-3)
+    active = np.flatnonzero(active_mask.reshape(-1))
+    if active.size == 0:
+        return {
+            "matrix_free": True,
+            "active_column_count": 0,
+            "maximum_column_correlation": None,
+            "high_correlation_pairs": [],
+        }
+    # Keep diagnostics bounded even when regularization leaves a diffuse tail.
+    if active.size > 256:
+        values = densities.reshape(-1)[active]
+        active = active[np.argsort(values)[-256:]]
+    selected = operator.select_measurements(fit_indices.tolist())
+    gram = np.zeros((active.size, active.size), dtype=np.float64)
+    active_lookup = np.full(operator.source_count, -1, dtype=np.int64)
+    active_lookup[active] = np.arange(active.size, dtype=np.int64)
+    for block in selected.iter_blocks():
+        local = active_lookup[block.source_indices]
+        keep = local >= 0
+        if not np.any(keep):
+            continue
+        values = block.values[:, keep]
+        indices = local[keep]
+        gram[np.ix_(indices, indices)] += values.T @ values
+    norms = np.sqrt(np.maximum(np.diag(gram), 0.0))
+    denominator = norms[:, None] * norms[None, :]
+    correlation = np.divide(
+        gram,
+        denominator,
+        out=np.zeros_like(gram),
+        where=denominator > 0.0,
+    )
+    np.fill_diagonal(correlation, 0.0)
+    pairs = np.argwhere(np.triu(correlation >= float(threshold), k=1))
+    return {
+        "matrix_free": True,
+        "active_column_count": int(active.size),
+        "active_source_indices": active.astype(int).tolist(),
+        "maximum_column_correlation": (
+            float(np.max(correlation)) if active.size > 1 else 0.0
+        ),
+        "high_correlation_pairs": [
+            [int(active[first]), int(active[second])] for first, second in pairs[:1024]
+        ],
+        "high_correlation_pair_count": int(pairs.shape[0]),
+    }
 
 
 def _json_floats(values: NDArray[np.float64]) -> list[float]:
@@ -469,6 +746,121 @@ def _initial_nuisance_from_estimate(
     )
 
 
+def _held_out_likelihood_score(
+    observed: NDArray[np.float64],
+    predicted: NDArray[np.float64],
+    state: _FitState,
+    config: MLEConfig,
+) -> float:
+    """Return mean validation loss under the configured observation family."""
+    values = np.asarray(observed, dtype=np.float64)
+    mean = np.maximum(np.asarray(predicted, dtype=np.float64), config.min_mean)
+    if (
+        config.mode == "spectral"
+        and config.spectral_likelihood == "calibrated_overdispersed"
+    ):
+        alpha = np.asarray(state.overdispersion_alpha_by_bin, dtype=float)
+        if alpha.shape != (values.shape[1],):
+            raise ValueError("Calibrated validation alpha does not match energy bins.")
+        alpha_grid = np.broadcast_to(alpha[None, :], values.shape)
+        poisson = alpha_grid <= 1.0e-15
+        loss = np.empty_like(values)
+        loss[poisson] = (
+            mean[poisson]
+            - values[poisson] * np.log(mean[poisson])
+            + gammaln(values[poisson] + 1.0)
+        )
+        if np.any(~poisson):
+            size = 1.0 / alpha_grid[~poisson]
+            selected_mean = mean[~poisson]
+            selected_values = values[~poisson]
+            loss[~poisson] = -(
+                gammaln(selected_values + size)
+                - gammaln(size)
+                - gammaln(selected_values + 1.0)
+                + size * np.log(size / (size + selected_mean))
+                + selected_values * np.log(selected_mean / (size + selected_mean))
+            )
+        return float(np.mean(loss))
+    return float(
+        poisson_deviance(values, mean, min_mean=float(config.min_mean)) / values.size
+    )
+
+
+def _select_regularization(
+    batch: ObservationBatch,
+    environment: EnvironmentConfig,
+    kernel: ContinuousKernel,
+    config: MLEConfig,
+    obstacle_grid: ObstacleGrid | None,
+) -> RegularizationCVResult:
+    """Run grouped CV on the base surface dictionary without truth access."""
+    patches = build_surface_patches(
+        environment,
+        obstacle_grid,
+        config.patch_spacing_m,
+        obstacle_height_m=float(config.obstacle_height_m),
+        quadrature_points_per_patch=int(config.quadrature_order),
+    )
+    labels = _union_group_labels(
+        batch,
+        config.cv_grouping,
+        config.held_out_xy_tolerance_m,
+    )
+    folds = grouped_kfold_indices(
+        labels,
+        min(int(config.cv_fold_count), len(set(labels))),
+        random_seed=int(config.random_seed),
+    )
+    candidates = tuple(
+        RegularizationCandidate(l1_weight=l1, tv_weight=tv)
+        for l1 in config.cv_l1_weights
+        for tv in config.cv_tv_weights
+    )
+    observed = batch.isotope_counts if config.mode == "count" else batch.spectrum_counts
+    if observed is None:
+        raise ValueError("Configured observations are unavailable for grouped CV.")
+
+    def score(
+        candidate: RegularizationCandidate,
+        fit_indices: NDArray[np.int64],
+        validation_indices: NDArray[np.int64],
+    ) -> float:
+        """Fit one fold and score only its untouched related groups."""
+        candidate_config = replace(
+            config,
+            regularization_selection="fixed",
+            l1_weight=float(candidate.l1_weight),
+            tv_weight=float(candidate.tv_weight),
+            held_out_fraction=0.0,
+            coarse_to_fine_levels=0,
+            debias_refit=False,
+        )
+        state = _fit_problem(
+            batch,
+            patches,
+            kernel,
+            candidate_config,
+            fit_indices,
+            validation_indices,
+        )
+        prediction = _full_prediction(state)
+        return _held_out_likelihood_score(
+            observed[validation_indices],
+            prediction[validation_indices],
+            state,
+            candidate_config,
+        )
+
+    return select_regularization_one_standard_error(
+        candidates,
+        folds,
+        score,
+        use_one_standard_error=bool(config.cv_one_standard_error),
+        group_labels=labels,
+    )
+
+
 class SurfaceMLEEstimator:
     """Fit count-domain or line-resolved spectral surface intensity maps."""
 
@@ -491,6 +883,41 @@ class SurfaceMLEEstimator:
         if tuple(batch.isotope_names) != tuple(self.config.isotope_names):
             raise ValueError(
                 "Observation isotope order must match MLEConfig.isotope_names."
+            )
+        if self.config.regularization_selection == "grouped_cv":
+            selection = _select_regularization(
+                batch,
+                environment,
+                kernel,
+                self.config,
+                obstacle_grid,
+            )
+            selected_config = replace(
+                self.config,
+                regularization_selection="fixed",
+                l1_weight=float(selection.selected.l1_weight),
+                tv_weight=float(selection.selected.tv_weight),
+            )
+            selected_estimate = SurfaceMLEEstimator(selected_config).fit(
+                batch,
+                environment,
+                kernel,
+                obstacle_grid=obstacle_grid,
+                initial_estimate=initial_estimate,
+            )
+            return replace(
+                selected_estimate,
+                diagnostics={
+                    **selected_estimate.diagnostics,
+                    "regularization_selection": {
+                        **selection.to_dict(),
+                        "grouping": self.config.cv_grouping,
+                        "tuning_environment_id": (self.config.tuning_environment_id),
+                        "final_holdout_environment_id": (
+                            self.config.final_holdout_environment_id
+                        ),
+                    },
+                },
             )
         kernel.use_gpu = bool(self.config.use_gpu)
         kernel.gpu_device = str(self.config.gpu_device)
@@ -578,10 +1005,24 @@ class SurfaceMLEEstimator:
             threshold_fraction=float(self.config.cluster_threshold_fraction),
             min_strength_cps_1m=float(self.config.cluster_min_strength_cps_1m),
         )
-        identifiability = response_identifiability_diagnostics(
-            state.response[state.fit_indices],
-            correlation_threshold=float(self.config.response_correlation_threshold),
-        )
+        if isinstance(state.response, ResponseOperator):
+            identifiability = _operator_identifiability(
+                state.response,
+                state.result.densities_cps_1m_m2,
+                state.fit_indices,
+                float(self.config.response_correlation_threshold),
+            )
+            response_shape = [
+                *state.response.observation_shape,
+                state.response.patch_count,
+                state.response.isotope_count,
+            ]
+        else:
+            identifiability = response_identifiability_diagnostics(
+                state.response[state.fit_indices],
+                correlation_threshold=float(self.config.response_correlation_threshold),
+            )
+            response_shape = [int(value) for value in state.response.shape]
         residual = observed - predicted
         diagnostics: dict[str, object] = {
             "provenance": estimator_provenance(variant=self.config.mode),
@@ -598,7 +1039,8 @@ class SurfaceMLEEstimator:
             "base_surface_dictionary_patch_count": base_patch_count,
             "base_surface_dictionary_patch_ids": base_patch_ids,
             "full_surface_dictionary_used": True,
-            "response_shape": [int(value) for value in state.response.shape],
+            "response_shape": response_shape,
+            "spectral_response_mode": self.config.spectral_response_mode,
             "observation_step_ids": batch.step_ids.astype(int).tolist(),
             "observation_action_ids": batch.action_ids.astype(int).tolist(),
             "observation_station_ids": batch.station_ids.astype(int).tolist(),
@@ -632,6 +1074,7 @@ class SurfaceMLEEstimator:
             "relative_change": float(state.result.relative_change),
             "relative_objective_change": float(state.result.relative_objective_change),
             "kkt_residual": float(state.result.kkt_residual),
+            "likelihood": dict(state.likelihood_diagnostics),
             "nuisance_names": list(state.nuisance_names),
             "isotope_covariance_preserved": batch.isotope_covariances is not None,
             "hotspot_clusters": [cluster.to_dict() for cluster in clusters],
@@ -646,6 +1089,15 @@ class SurfaceMLEEstimator:
                 key: list(values)
                 for key, values in state.spectral_details.line_weights_by_isotope.items()
             }
+            if isinstance(state.spectral_details, SpectralResponseOperatorResult):
+                diagnostics["response_operator"] = dict(
+                    state.spectral_details.operator.diagnostics
+                )
+                diagnostics["response_cache_directory"] = (
+                    None
+                    if state.spectral_details.cache_directory is None
+                    else state.spectral_details.cache_directory.as_posix()
+                )
 
         nuisance = state.result.nuisance_coefficients
         background_mask = np.asarray(
@@ -659,13 +1111,32 @@ class SurfaceMLEEstimator:
             predicted_isotope_counts = predicted
         else:
             predicted_spectra = predicted
-            predicted_isotope_counts = np.einsum(
-                "mbgi,gi->mi",
-                state.response,
-                state.result.integrated_strengths_cps_1m,
-                optimize=True,
-            )
-        return MLEEstimate(
+            if isinstance(state.response, ResponseOperator):
+                density = state.result.densities_cps_1m_m2
+                isotope_predictions: list[NDArray[np.float64]] = []
+                for isotope_index in range(state.response.isotope_count):
+                    selected = np.zeros_like(density)
+                    selected[:, isotope_index] = density[:, isotope_index]
+                    isotope_predictions.append(
+                        np.sum(
+                            state.response.matvec(selected.reshape(-1)).reshape(
+                                state.response.observation_shape
+                            ),
+                            axis=1,
+                        )
+                    )
+                predicted_isotope_counts = np.stack(
+                    isotope_predictions,
+                    axis=1,
+                )
+            else:
+                predicted_isotope_counts = np.einsum(
+                    "mbgi,gi->mi",
+                    state.response,
+                    state.result.integrated_strengths_cps_1m,
+                    optimize=True,
+                )
+        estimate = MLEEstimate(
             isotope_names=self.config.isotope_names,
             patches=state.patches.patches,
             density_by_isotope=state.result.densities_cps_1m_m2.T,
@@ -679,6 +1150,79 @@ class SurfaceMLEEstimator:
             iterations=int(state.result.iterations),
             converged=bool(state.result.converged),
             diagnostics=diagnostics,
+        )
+        if not bool(self.config.uncertainty_enable):
+            return estimate
+        laplace = active_support_laplace(
+            state.response,
+            observed,
+            predicted,
+            state.result.densities_cps_1m_m2,
+            state.patches.areas_m2,
+            state.fit_indices,
+            support_threshold_fraction=float(
+                self.config.laplace_support_threshold_fraction
+            ),
+            maximum_active_parameters=int(self.config.laplace_max_active_parameters),
+            ridge=float(self.config.laplace_ridge),
+            overdispersion_alpha_by_bin=(
+                state.overdispersion_alpha_by_bin
+                if state.overdispersion_alpha_by_bin.size
+                else None
+            ),
+        )
+        estimate = replace(
+            estimate,
+            diagnostics={
+                **estimate.diagnostics,
+                "hotspot_clusters": augment_clusters_with_laplace(
+                    estimate,
+                    laplace,
+                    confidence_level=float(self.config.bootstrap_confidence_level),
+                ),
+            },
+        )
+        bootstrap_estimates: list[MLEEstimate] = []
+        replicate_count = int(self.config.station_bootstrap_replicates)
+        if replicate_count:
+            rng = np.random.default_rng(int(self.config.bootstrap_seed))
+            bootstrap_config = replace(
+                self.config,
+                uncertainty_enable=False,
+                station_bootstrap_replicates=0,
+                regularization_selection="fixed",
+                held_out_fraction=0.0,
+            )
+            bootstrap_estimator = SurfaceMLEEstimator(bootstrap_config)
+            for _replicate in range(replicate_count):
+                replicate_batch = station_bootstrap_batch(batch, rng)
+                bootstrap_estimates.append(
+                    bootstrap_estimator.fit(
+                        replicate_batch,
+                        environment,
+                        kernel,
+                        obstacle_grid=obstacle_grid,
+                    )
+                )
+        bootstrap, augmented_clusters = bootstrap_uncertainty_summary(
+            estimate,
+            bootstrap_estimates,
+            confidence_level=float(self.config.bootstrap_confidence_level),
+        )
+        uncertainty = {
+            "laplace": laplace.to_dict(
+                patch_ids=state.patches.patch_ids.astype(int).tolist(),
+                isotope_names=self.config.isotope_names,
+            ),
+            "station_bootstrap": bootstrap,
+        }
+        return replace(
+            estimate,
+            diagnostics={
+                **estimate.diagnostics,
+                "hotspot_clusters": augmented_clusters,
+                "uncertainty": uncertainty,
+            },
         )
 
 

@@ -1,62 +1,218 @@
 # Radiation Surface MLE Estimator
 
-This repository contains the surface maximum-likelihood estimator only.
+This repository owns only the 3-D surface maximum-likelihood estimator. Physical
+acquisition, Geant4, detector/shield/obstacle physics, spectrum generation, and raw
+MeasurementLog v2 publication are provided by the versioned
+`rotating-shield-simulation-runtime` dependency.
 
-## Repository boundary
+## Online estimator
 
-The shared `Rotating-shield-simulation-runtime` repository owns:
+`OnlineMLESession` is the runtime-facing API. A controller passes each
+`runtime.records.MeasurementRecord` only after the shared runtime has durably staged
+it. The MLE buffers every shield-view record without fitting an incomplete station.
+When the final view marks `station_complete`, it performs exactly one coarse
+all-history warm fit for that measurement point and publishes the durable report.
+The final call rebuilds the configured full-resolution map and uncertainty result.
+The output is:
 
-- Geant4 and analytic transport runtimes;
-- environment, obstacle, detector, and rotating-shield physics;
-- isotope and full-spectrum response models;
-- observation generation; and
-- raw full-spectrum MeasurementLog schema version 2.
+```text
+OUTPUT_DIR/
+├── online_state.json
+├── index.html
+├── dashboard_data.json
+├── stations/
+│   └── station_000000_step_00000000/
+│       ├── mle_estimate.npz
+│       ├── mle_diagnostics.json
+│       └── hotspot_clusters.json
+└── final/
+    ├── mle_estimate.npz
+    ├── mle_diagnostics.json
+    └── hotspot_clusters.json
+```
 
-This repository owns:
+The class never generates observations and never writes a MeasurementLog. The runtime
+controller retains this ordering:
 
-- surface-patch construction used by MLE;
-- count/spectral response-matrix assembly for the MLE objective;
-- regularized optimization and debias refits;
-- MLE warm starts, diagnostics, and reports; and
-- the public `estimate-radiation-mle` CLI.
+```python
+observation_session.step(action)  # runtime simulates and durably stages first
+record = observation_session.writer.records[-1]
+online_mle.receive_persisted(
+    record,
+    station_complete=action.station_complete,
+)
+```
 
-There is intentionally no `native/`, `measurement/`, `sim/`, `spectrum/`, PF,
-planner, source-layout, obstacle-layout, or MeasurementLog-writer copy here.
-MLE imports the installed shared runtime package.
+For deterministic validation of the same online update path against an already
+published runtime log:
 
-## Replay a shared raw log
+```bash
+uv run estimate-radiation-mle online-replay \
+  --run-dir /path/to/measurement-log-v2 \
+  --mle-config configs/mle/default_spectral.json \
+  --output-dir /path/to/mle-online \
+  --cpu --json
+```
 
-The production MeasurementLog v2 contract stores raw integer spectra. Use the
-spectral MLE path for that contract:
+This command starts the live dashboard server by default and prints its URL before
+the first station fit. The page refreshes from atomically published MLE snapshots;
+it neither reads nor displays simulation truth. Use `--dashboard-port`,
+`--dashboard-host`, and `--dashboard-public-host` for remote delivery. Set
+`MLE_DASHBOARD_PUBLIC_HOST` when the externally reachable host should be discovered
+from the environment. `--no-serve` keeps the static dashboard files without opening
+a server, while `--no-dashboard` disables both.
+
+Production acquisition remains a shared-runtime operation:
+
+```bash
+uv run --project ../Rotating-shield-simulation-runtime \
+  rotating-shield-sim run-adaptive-session /private/physical-scenario.json
+```
+
+## MLE information planning
+
+After a completed station, the MLE can rank runtime-supplied detector positions and
+jointly choose a short Fe/Pb orientation program:
+
+```python
+planned = online_mle.plan_next_action(
+    candidate_poses_xyz=runtime_candidates_xyz,
+    travel_costs=runtime_travel_costs,
+    planning_config=MLEPlanningConfig.load(
+        "configs/mle/default_planning.json"
+    ),
+)
+next_action = planned.selected_action
+```
+
+This is MLE-specific local Fisher `D_s`-optimal design, not the PF particle EIG rule.
+Background and scatter are marginalized by a Schur determinant. The complete shield
+program is selected jointly as one station block, while also marginalizing one
+shared future station-rate nuisance. Thus complementary relative shield signatures,
+not merely independently strong views, determine the ordered program. Zero MLE
+regions remain represented by residual surface exploration modes. Direct floor/ceiling
+response separation, alternative-support separation, z-Fisher information, response
+correlation reduction, elevation diversity, and geometry exploration supplement the
+local determinant. Candidate generation, collision filtering, local spatial
+refinement, routes, and observation production stay in the shared runtime. The
+selected action includes detector xyz plus an ordered
+`measurement_program` with Fe/Pb indices, dwell times, and the final
+`station_complete` flag.
+
+The same operation is available for a saved station report:
+
+```bash
+uv run estimate-radiation-mle plan-next \
+  --run-dir /path/to/measurement-log-v2 \
+  --estimate /path/to/mle-online/stations/station_000003_step_00000015 \
+  --mle-config configs/mle/default_spectral.json \
+  --planning-config configs/mle/default_planning.json \
+  --candidates /path/from/runtime/candidates.json \
+  --output /path/to/next-mle-action.json \
+  --cpu --json
+```
+
+The online dashboard served at its existing URL shows the latest recommendation and
+marks its detector position. See [MLE information planning](docs/mle/information_planning.md)
+for the criterion, candidate JSON contract, and limitations.
+
+## RA-L full simulation
+
+The physical RA-L profile is owned by the shared runtime; this repository now has a
+strict launcher for runtime acquisition followed by spectral MLE replay. Verify the
+complete Geant4/model/config chain without starting a long run:
+
+```bash
+uv run estimate-radiation-mle ral-full-simulation \
+  --preflight-only --json
+```
+
+Run a private physical scenario under live MLE control and publish the dashboard:
+
+```bash
+uv run estimate-radiation-mle ral-full-simulation \
+  --scenario /secure/runtime/ral-mix9-scenario.json \
+  --output-dir /home/moeu/research/ral-runs/ral-mix9-mle \
+  --json
+```
+
+Use `--run-dir` instead of `--scenario` to replay an existing completed RA-L
+MeasurementLog. New acquisition uses `rotating-shield-sim run-adaptive-session`.
+The online coarse MLE fits once after the current shield program closes its station;
+intermediate spectra are buffered without changing the estimate. It can then ask the
+runtime to refine promising 3-D candidate neighborhoods, rerank the returned
+reachable poses, and select the next position and short Fe/Pb program. No station
+count, view count, record count,
+measurement route, or station list is fixed in advance. Source truth is never opened
+by the MLE process.
+
+The RA-L stop decision is compound: convergence/KKT, independent 3-D pose and height
+coverage, elevation span, held-history deviance/map/cluster stability, response
+correlation, floor/ceiling separation, systematic residuals, and a patience window of
+low expected information gain must all pass. `--max-measurements` remains only a
+safety bound.
+
+See [RA-L full-simulation launcher](docs/mle/ral_full_simulation.md) for ownership,
+persistent `tmux` execution, existing-log replay, and the adaptive-controller boundary.
+
+## Final-log replay
+
+Fit one authoritative cold spectral MLE from a finalized raw log:
 
 ```bash
 uv run estimate-radiation-mle fit-spectrum \
   --run-dir /path/to/measurement-log-v2 \
   --mle-config configs/mle/default_spectral.json \
-  --output-dir results/mle-spectral \
+  --output-dir /path/to/mle-spectral \
   --cpu --json
 ```
 
-The legacy `replay` command is the count-domain MLE and requires an explicitly
-derived count observation contract; it does not invent isotope counts from raw
-MeasurementLog v2 spectra.
+The `replay` command is retained only for an explicitly derived count observation
+contract. It does not derive isotope counts from raw MeasurementLog v2 spectra.
 
-Acquisition is run from the shared runtime or through the orchestrator, for
-example:
+For a final unseen-environment evaluation after regularization and calibration have
+been frozen:
 
 ```bash
-uv run --project ../Rotating-shield-simulation-runtime rotating-shield-sim \
-  run-plan --help
+uv run estimate-radiation-mle ral-holdout \
+  --tuning-run-dir /path/to/independent-tuning-log \
+  --holdout-run-dir /path/to/new-geant4-log \
+  --mle-config configs/mle/ral_full_spectral.json \
+  --output-dir /path/to/final-holdout-report
 ```
 
+This command fails closed if run IDs, environment realization IDs, or environment
+manifests are reused, if regularization is still being tuned, or if the final holdout
+was used to calibrate model discrepancy.
+
+## Repository layout
+
+```text
+configs/mle/             versioned estimator configurations
+docs/mle/                architecture and runtime data-contract notes
+examples/legacy/         archived IAS notebook, data, and figures
+fixtures/                small contract/conformance fixtures
+scripts/                 maintenance and conformance entry points only
+src/three_d_estimation/  online adapter, response assembly, solver, reporting
+tests/mle/                estimator and runtime-boundary tests
+```
+
+Generated `build/`, `dist/`, `results/`, `images/`, caches, and root-level script
+wrappers are intentionally absent. Use the installed `estimate-radiation-mle` entry
+point rather than `main.py` or `mle_main.py`.
+
+The IAS-era research workflow is preserved under `examples/legacy/`; its complete
+pre-runtime source snapshot is also retained by the Git tag
+`legacy-ias-mle-before-pf-runtime-import`. It is not imported by production code.
+
 ## Development
+
+Python 3.12 and `uv` are required.
 
 ```bash
 uv sync
 uv run python scripts/check_repository_boundary.py
 uv run pytest
 ```
-
-## License
 
 Released under the [MIT License](LICENSE).

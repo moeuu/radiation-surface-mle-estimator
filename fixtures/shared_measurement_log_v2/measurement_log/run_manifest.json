@@ -1,11 +1,11 @@
 {
   "artifact_hashes": {
     "environment.json": "523a7f7fd52accf6ce3921738ddb92e06a196691e1cb4e507cd2a8abfbc23a3f",
-    "forward_model_manifest.json": "b59492a57f513b9e2d19ba991a5cbadf2e5ae26478051e1120aeae81719d8282",
-    "observation_metadata.jsonl": "b25198f4537b8f4b290a679bdc68a69082f6155af1c4dd1e781fbb728d603b73",
+    "forward_model_manifest.json": "379ba6a9153663534ffd5003b5f44befcbff15b6c49c22b8e82087d851a76756",
+    "observation_metadata.jsonl": "9d37ce9ce6d67c0f2d8a492e72ec15e03b32a2bada980fef2fe8928a27f84e0a",
     "observations.npz": "f8d7594a3b716838f602a0e12f35c4484369e097e8fd1764bffe4d7067965a58",
     "repository_commit.txt": "5a84b79716842f146f7533d890cc7308cad7b21abdc29c1852c6b3bb8ad66672",
-    "runtime_config.resolved.json": "1346db95479db1e3b3f6b8a309b91d228bc79223bb0b2d6cdf537e9586e7e026"
+    "runtime_config.resolved.json": "98191b403d6f94f38c0fdc8d6d198953ab434cc9c0568b5e740decdb07621d3f"
   },
   "bin_width_keV": 2.0,
   "energy_bin_count": 851,
@@ -24,8 +24,8 @@
     "size_y": 2.0,
     "size_z": 1.5
   },
-  "forward_model_manifest_sha256": "b59492a57f513b9e2d19ba991a5cbadf2e5ae26478051e1120aeae81719d8282",
-  "full_spectrum_contract_hash_sha256": "a3d7be61bf990276c9e14fb20ddc2b09d0d8c47c02a0721744a312fb58bedaae",
+  "forward_model_manifest_sha256": "379ba6a9153663534ffd5003b5f44befcbff15b6c49c22b8e82087d851a76756",
+  "full_spectrum_contract_hash_sha256": "126e9a9968076c06439f49555050fcffa0fe4d0f0efe801bd73dcab609a0ce3c",
   "full_spectrum_contract_schema_version": 3,
   "index_conventions": {
     "action_id": "zero_based_unique_measurement_action",
@@ -54,11 +54,11 @@
     },
     "shield": {
       "id": "test-shield.v2",
-      "sha256": "c5e24ded41d8f15b59cbcb08d37c41d281a3867aa39e5fde4bf1bfb6004160f3"
+      "sha256": "1ed0bc22807316225e16787219073dbaf01e7c31488c97923d40aa5c2d958cc6"
     },
     "spectrum": {
       "id": "test-full-spectrum.v2",
-      "sha256": "555a4c412073680ccc9fd01f5087f9a9de156a221aafec18893900a61478a37f"
+      "sha256": "f146605bdae89ad9e689e7a12ae5e148f819780fbff0fe1044354c58b46926da"
     },
     "transport": {
       "id": "test-transport.v2",
@@ -69,7 +69,7 @@
   "obstacle_layout_path": null,
   "record_count": 12,
   "repository_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-  "resolved_config_sha256": "1346db95479db1e3b3f6b8a309b91d228bc79223bb0b2d6cdf537e9586e7e026",
+  "resolved_config_sha256": "98191b403d6f94f38c0fdc8d6d198953ab434cc9c0568b5e740decdb07621d3f",
   "run_id": "pure-pf-schema-v2-local-fixture",
   "schema_version": 2,
   "sim_backend": "analytic_test_fixture",

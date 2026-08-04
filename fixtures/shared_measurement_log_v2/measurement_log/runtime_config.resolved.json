@@ -14,7 +14,7 @@
   "energy_bin_count": 851,
   "energy_max_keV": 1700.0,
   "energy_min_keV": 0.0,
-  "full_spectrum_contract_hash_sha256": "a3d7be61bf990276c9e14fb20ddc2b09d0d8c47c02a0721744a312fb58bedaae",
+  "full_spectrum_contract_hash_sha256": "126e9a9968076c06439f49555050fcffa0fe4d0f0efe801bd73dcab609a0ce3c",
   "full_spectrum_generative_model": {
     "acceptance_contract_sha256": "0d55c31536052b27dc79e189239df10c52fcee033dbaf572dfc24192ea35d650",
     "additive_noncollided_transport_response": {
@@ -28,7 +28,7 @@
         0.05,
         0.025
       ],
-      "contract_hash_sha256": "a7e2e69d4c44abf6fa8c035632635eb08456416085d26dbb4c83ff3c8152636b",
+      "contract_hash_sha256": "c09d50f84dbdd97bb93ef78ea7e4a5077c107366d41484ff50e90b581c921cf4",
       "feature_order": [
         "fe_single_compton_probability",
         "pb_single_compton_probability",
@@ -58,6 +58,11 @@
       "tie_break": "largest_ridge_lambda_within_1e-12",
       "training": {
         "acceptance_contract_sha256": "0d55c31536052b27dc79e189239df10c52fcee033dbaf572dfc24192ea35d650",
+        "artifact_contract_sha256_by_scene": {
+          "2026072701": "e1af42085b2ed8161dac5d5414b09824071821321e1ca783639eb92fd7361b73",
+          "2026072702": "276041003f8e67735474c3540c7fe872089643b15aef24212139d87716aac076",
+          "2026072703": "4983614e185270529129020e22ba5b419662efd7b776ed634d3aa7199607b013"
+        },
         "artifact_sha256_by_scene": {
           "2026072701": "ac1df4585289d3b26f4dda6788a74481faf11bb3a9257e954d6da48b2c95cc8b",
           "2026072702": "ee04171630cc51309b5a8aafb2535f84beff8d131188a5eac29d68b035d1ab8e",
@@ -72,6 +77,7 @@
           "1": 2.0,
           "10": 11.0
         },
+        "detector_response_contract_sha256": "0ab48601e0965c2c9ea973505523558bf4dd5d394129397c3d4079c143787ae5",
         "fit_sample_count": 256,
         "label_space": "pre_dead_time_raw_incident_gamma_source_line_entry_class",
         "loso_scene_ids": [
@@ -79,6 +85,7 @@
           "2026072702",
           "2026072703"
         ],
+        "obstacle_material_contract_sha256": "a89258ca5b5d31973852c0b1b7ea16b278131b1637abdcdae9298d3d2ff1798d",
         "pair_ids_by_scene": {
           "2026072701": [
             0,
@@ -286,23 +293,25 @@
           "multi_isotope_superposition",
           "continuous_surface_perturbation_ranking"
         ],
-        "schema_version": 1,
+        "schema_version": 2,
         "selected_ridge_lambda": 0.1,
         "selected_validation_score": 0.5,
         "selection_completed": true,
         "selection_objective": "leave_one_training_scene_out_weighted_log1p_mse",
+        "shield_pose_contract_sha256": "0732f12d1f2aa83607560643484652da6ba942d02a0fdfdf4b0fda4e6d3116fd",
         "training_scene_seeds": [
           2026072701,
           2026072702,
           2026072703
-        ]
+        ],
+        "transport_physics_table_contract_sha256": "ad6afe5b05a91059db3e38192c1e9d3b9aad6bc86513c6dc0cfd04ab3406d814"
       }
     },
     "background_model": "native_geant4_background_shape_v1_bin_centres",
     "background_rate_cps": 5.0,
     "background_semantics": "independent_pre_dead_time_pulse_rate_added_once",
     "bin_width_keV": 2.0,
-    "contract_hash_sha256": "a3d7be61bf990276c9e14fb20ddc2b09d0d8c47c02a0721744a312fb58bedaae",
+    "contract_hash_sha256": "126e9a9968076c06439f49555050fcffa0fe4d0f0efe801bd73dcab609a0ce3c",
     "dead_time_application_count": 1,
     "dead_time_model": "nonparalyzable_event_time_renewal_total",
     "dead_time_tau_s": 5.813e-09,
@@ -640,6 +649,8 @@
     "mark_model": "source_fraction_dirichlet_multinomial",
     "maximum_scatter_order": 5,
     "model": "geometry_conditioned_full_spectrum",
+    "obstacle_material_contract_id": "known_composite_materials_xcom_v1",
+    "obstacle_material_contract_sha256": "a89258ca5b5d31973852c0b1b7ea16b278131b1637abdcdae9298d3d2ff1798d",
     "production_ready": true,
     "rate_scale_mixture": {
       "nodes": [
@@ -659,6 +670,8 @@
     "scatter_partition": "total_minus_direct",
     "scatter_shape": "klein_nishina_optical_depth_orders",
     "schema_version": 3,
+    "shield_pose_contract_id": "spherical_octant_positive_xyz_incoming_index_v1",
+    "shield_pose_contract_sha256": "0732f12d1f2aa83607560643484652da6ba942d02a0fdfdf4b0fda4e6d3116fd",
     "source_rate_semantics": "pre_dead_time_detector_pulse_rate_at_1m",
     "transport_feature_order": [
       "tau_fe",
@@ -666,10 +679,12 @@
       "tau_obstacle",
       "distance_m"
     ],
+    "transport_physics_table_contract_id": "klein_nishina_xcom_single_scatter_quadrature_v1",
+    "transport_physics_table_contract_sha256": "ad6afe5b05a91059db3e38192c1e9d3b9aad6bc86513c6dc0cfd04ab3406d814",
     "validation": {
-      "additive_scatter_contract_sha256": "a7e2e69d4c44abf6fa8c035632635eb08456416085d26dbb4c83ff3c8152636b",
+      "additive_scatter_contract_sha256": "c09d50f84dbdd97bb93ef78ea7e4a5077c107366d41484ff50e90b581c921cf4",
       "all_passed": true,
-      "approved_model_contract_sha256": "a3d7be61bf990276c9e14fb20ddc2b09d0d8c47c02a0721744a312fb58bedaae",
+      "approved_model_contract_sha256": "126e9a9968076c06439f49555050fcffa0fe4d0f0efe801bd73dcab609a0ce3c",
       "artifact_sha256_by_scene": {
         "2026072701": "3f671714b50c9155b973270f2449f4d12292b27bac5ca298374cd697423e0c34",
         "2026072702": "a144379fd3df7017e91e7f0816476be8d6e4983b8234b262e467e281f7af0bb0",
@@ -1225,7 +1240,7 @@
       ],
       "validation_contract_sha256": "0d55c31536052b27dc79e189239df10c52fcee033dbaf572dfc24192ea35d650"
     },
-    "validation_manifest_sha256": "53820f7463330e1d8fead988c5bfcc95f7dfc9808377c6465ee7ccbc716c63d5"
+    "validation_manifest_sha256": "c0956be9e28770dd20622cb50c78fdb1eba91bb8e6af9d96613b224c82c88ffc"
   },
   "line_resolved_shield_attenuation": true,
   "obstacle_attenuation_enabled": true,

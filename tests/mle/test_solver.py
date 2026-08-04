@@ -9,7 +9,49 @@ from three_d_estimation.solver import (
     SurfaceMapConfig,
     evaluate_surface_map_objective,
     fit_surface_map_poisson,
+    fit_surface_map_poisson_operator,
 )
+from three_d_estimation.response_operator import BlockResponseOperator, ResponseBlock
+
+
+def _dense_density_operator(
+    response: np.ndarray,
+    areas: np.ndarray,
+    isotope_count: int,
+) -> BlockResponseOperator:
+    """Return a multi-block operator equivalent to one materialized response."""
+    observation_shape = response.shape[:-2]
+    patch_count = response.shape[-2]
+    density_matrix = (
+        response * areas.reshape((1,) * len(observation_shape) + (-1, 1))
+    ).reshape(-1, patch_count * isotope_count)
+
+    def factory():
+        """Yield four blocks to exercise both streamed dimensions."""
+        row_split = max(1, density_matrix.shape[0] // 2)
+        column_split = max(1, density_matrix.shape[1] // 2)
+        for row_start, row_stop in (
+            (0, row_split),
+            (row_split, density_matrix.shape[0]),
+        ):
+            for column_start, column_stop in (
+                (0, column_split),
+                (column_split, density_matrix.shape[1]),
+            ):
+                if row_start == row_stop or column_start == column_stop:
+                    continue
+                yield ResponseBlock(
+                    np.arange(row_start, row_stop),
+                    np.arange(column_start, column_stop),
+                    density_matrix[row_start:row_stop, column_start:column_stop],
+                )
+
+    return BlockResponseOperator(
+        observation_shape,
+        patch_count,
+        isotope_count,
+        factory,
+    )
 
 
 def test_surface_map_recovers_piecewise_smooth_density() -> None:
@@ -155,9 +197,7 @@ def test_l1_reduces_redundant_surface_support() -> None:
     unregularized_support = np.count_nonzero(
         unregularized.integrated_strengths_cps_1m[:, 0] > 1.0e-3
     )
-    sparse_support = np.count_nonzero(
-        sparse.integrated_strengths_cps_1m[:, 0] > 1.0e-3
-    )
+    sparse_support = np.count_nonzero(sparse.integrated_strengths_cps_1m[:, 0] > 1.0e-3)
     assert sparse_support < unregularized_support
 
 
@@ -180,12 +220,8 @@ def test_graph_tv_reduces_patch_to_patch_fragmentation() -> None:
         config=SurfaceMapConfig(tv_weight=1.0, max_iterations=4000),
     )
 
-    raw_fragmentation = np.sum(
-        np.abs(np.diff(unregularized.densities_cps_1m_m2[:, 0]))
-    )
-    tv_fragmentation = np.sum(
-        np.abs(np.diff(smoothed.densities_cps_1m_m2[:, 0]))
-    )
+    raw_fragmentation = np.sum(np.abs(np.diff(unregularized.densities_cps_1m_m2[:, 0])))
+    tv_fragmentation = np.sum(np.abs(np.diff(smoothed.densities_cps_1m_m2[:, 0])))
     assert tv_fragmentation < 0.05 * raw_fragmentation
 
 
@@ -263,6 +299,142 @@ def test_surface_map_tensor_batch_matches_flattened_batch() -> None:
         abs=1.0e-11,
     )
     assert tensor_result.objective == pytest.approx(flat_result.objective, rel=1.0e-12)
+
+
+def test_matrix_free_solver_matches_materialized_tensor() -> None:
+    """Streamed CPU updates must reproduce the materialized solver result."""
+    response = np.asarray(
+        [
+            [
+                [[1.0, 0.1], [0.2, 0.0]],
+                [[0.8, 0.2], [0.1, 0.1]],
+                [[0.2, 0.7], [0.0, 0.2]],
+            ],
+            [
+                [[0.4, 0.1], [0.8, 0.0]],
+                [[0.1, 0.2], [0.7, 0.1]],
+                [[0.0, 0.4], [0.2, 0.9]],
+            ],
+        ],
+        dtype=float,
+    )
+    areas = np.asarray([2.0, 0.5])
+    truth = np.asarray([[12.0, 4.0], [3.0, 18.0]])
+    observed = np.einsum("mbgi,gi->mb", response, truth * areas[:, None])
+    config = SurfaceMapConfig(
+        l1_weight=1.0e-3,
+        tv_weight=2.0e-3,
+        max_iterations=3000,
+        tolerance=1.0e-7,
+        objective_tolerance=1.0e-8,
+    )
+    edges = np.asarray([[0, 1]], dtype=np.int64)
+    materialized = fit_surface_map_poisson(
+        observed,
+        response,
+        areas,
+        adjacency_edges=edges,
+        config=config,
+    )
+    operator = _dense_density_operator(response, areas, isotope_count=2)
+    streamed = fit_surface_map_poisson_operator(
+        observed,
+        operator,
+        areas,
+        adjacency_edges=edges,
+        config=config,
+    )
+
+    np.testing.assert_allclose(
+        streamed.densities_cps_1m_m2,
+        materialized.densities_cps_1m_m2,
+        rtol=2.0e-8,
+        atol=2.0e-8,
+    )
+    np.testing.assert_allclose(
+        streamed.expected_counts,
+        materialized.expected_counts,
+        rtol=2.0e-8,
+        atol=2.0e-8,
+    )
+    assert streamed.kkt_residual == pytest.approx(
+        materialized.kkt_residual,
+        rel=2.0e-7,
+        abs=2.0e-9,
+    )
+
+
+def test_matrix_free_cpu_gpu_solver_equivalence_when_available() -> None:
+    """CUDA and CPU must execute equivalent streamed primal-dual updates."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    response = np.asarray(
+        [[[1.0], [0.2]], [[0.3], [1.0]], [[0.8], [0.4]]],
+        dtype=float,
+    )
+    areas = np.asarray([1.0, 2.0])
+    truth = np.asarray([[10.0], [3.0]])
+    observed = np.einsum("mgi,gi->m", response, truth * areas[:, None])
+    operator = _dense_density_operator(response, areas, isotope_count=1)
+    config = SurfaceMapConfig(max_iterations=1500, tolerance=1.0e-8)
+
+    cpu = fit_surface_map_poisson_operator(
+        observed,
+        operator,
+        areas,
+        config=config,
+        gpu_dtype="float64",
+    )
+    gpu = fit_surface_map_poisson_operator(
+        observed,
+        operator,
+        areas,
+        config=config,
+        use_gpu=True,
+        gpu_device="cuda",
+        gpu_dtype="float64",
+    )
+
+    np.testing.assert_allclose(
+        gpu.densities_cps_1m_m2,
+        cpu.densities_cps_1m_m2,
+        rtol=1.0e-8,
+        atol=1.0e-9,
+    )
+
+
+def test_calibrated_negative_binomial_operator_fit_is_finite() -> None:
+    """Calibrated overdispersion must enter fitting rather than diagnostics only."""
+    response = np.asarray(
+        [[[1.0], [0.2]], [[0.3], [1.0]], [[0.8], [0.4]], [[0.2], [0.9]]],
+        dtype=float,
+    )
+    areas = np.asarray([1.0, 1.0])
+    truth = np.asarray([[20.0], [5.0]])
+    observed = np.einsum("mgi,gi->m", response, truth)
+    operator = _dense_density_operator(response, areas, isotope_count=1)
+
+    result = fit_surface_map_poisson_operator(
+        observed,
+        operator,
+        areas,
+        config=SurfaceMapConfig(
+            likelihood_family="negative_binomial",
+            overdispersion_alpha=(0.03, 0.03, 0.03, 0.03),
+            max_iterations=4000,
+            tolerance=1.0e-6,
+            objective_tolerance=1.0e-7,
+        ),
+    )
+
+    assert np.all(np.isfinite(result.densities_cps_1m_m2))
+    assert result.densities_cps_1m_m2[:, 0] == pytest.approx(
+        truth[:, 0],
+        rel=0.08,
+        abs=0.5,
+    )
+    assert result.deviance >= -1.0e-8
 
 
 def test_group_penalty_shrinks_patchwise_isotope_support() -> None:

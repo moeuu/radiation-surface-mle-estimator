@@ -4,27 +4,43 @@ This document describes the implemented all-history surface maximum-likelihood e
 
 ## Repository and estimator boundary
 
-Production acquisition is not owned by this repository. New shared experiments are
-generated once by `Rotating-shield-particle-filter` and enter the MLE through a
-truth-free raw MeasurementLog v2. This estimator remains independently installable:
-there is no sibling import, path dependency, package dependency, submodule, or source
-synchronization hook. The files
-[COMMON_RUNTIME_SNAPSHOT.json](../../COMMON_RUNTIME_SNAPSHOT.json) and
-[UPSTREAM_PF_COMMIT](../../UPSTREAM_PF_COMMIT) describe the archived local simulator
-snapshot only; they are not production inputs.
+Production acquisition is not owned by this repository. The versioned
+`rotating-shield-simulation-runtime` package produces and durably stages truth-free raw
+MeasurementLog v2 records. This estimator imports that package's public record,
+observation-model, continuous-kernel, asset-resolution, and log-reader APIs. It does
+not copy or synchronize runtime source.
 
-The MLE is deliberately separated from live-estimator state:
+There are three estimator execution paths:
 
-1. The PF-owned Geant4 runtime produces, finalizes, and durably publishes raw
-   observations.
-2. The MLE validates the complete MeasurementLog and producer-owned forward-model
-   identity before returning any record.
-3. Replay builds its estimator response from the logged physical contract, constructs
-   all surface responses, solves the MLE, and writes a self-contained report.
-4. Cross-repository forward-response conformance tests detect estimator-kernel drift;
-   they are not a simulator synchronization mechanism.
+1. `OnlineMLESession` accepts each already-persisted runtime record. Production RA-L
+   mode buffers all shield views at one point and performs one coarse all-history
+   warm fit only when the durable station marker closes that measurement point.
+   Finalization rebuilds the configured full-resolution grid and uncertainty result.
+2. `fit-spectrum` validates a complete immutable MeasurementLog, performs a cold
+   all-history fit, and publishes one authoritative final report. `online-replay`
+   drives the live station-update path from a finalized log for deterministic causal
+   testing.
+3. `OnlineMLESession.plan_next_action` and the `plan-next` CLI rank truth-free
+   runtime candidate poses and Fe/Pb programs from a station-complete spectral MLE.
+   They use local Fisher `D_s`-optimal design, explicit vertical/support ambiguity
+   criteria, and the shared physical kernel.
 
-The current MLE CLI is an offline replay path. It does not read live particle state, control the online planner, or mutate an acquisition log.
+No path reads PF state or PF candidates. Runtime candidate generation, route and
+traversability planning, acquisition execution, simulation, and MeasurementLog
+writing remain outside this package. This package owns only MLE-based candidate
+ranking and shield-program selection. Cross-repository forward-response conformance
+tests detect estimator/kernel drift. The planning derivation and action contract are
+documented in [MLE information planning](information_planning.md).
+
+The RA-L integration follows the same boundary. `ral-full-simulation` performs a
+strict physical/configuration preflight and passes a private scenario path directly
+to `rotating-shield-sim run-adaptive-session`. The runtime publishes reachable
+truth-free candidates and each durably staged spectrum. The MLE refits all causal
+history, asks the runtime for local candidate refinement when useful, and selects the
+next short station program. No action list, station count, shield program, or record
+count appears in the scenario. The immutable log is validated and bound to the final
+MLE report only after the compound stability/coverage/ambiguity/information stop rule
+fires. See the [RA-L closed-loop runbook](ral_full_simulation.md).
 
 ## Data contracts and dimensions
 
@@ -53,7 +69,13 @@ Replay converts the measurement log into one validated `ObservationBatch`:
 | `isotope_counts` | `M × I`, optional | processed `response_poisson` channels |
 | `isotope_covariances` | `M × I × I`, optional | preserved extraction covariance |
 
-All records must use exactly the same energy edges. Count and covariance fields must either be available consistently for all records or be absent. Count-domain replay requires `isotope_counts`; spectral replay uses `spectrum_counts`. The covariance is retained in the batch and reported as preserved, but the current reconstruction objective is a Poisson likelihood over the count values rather than a covariance-weighted likelihood.
+All records must use exactly the same energy edges. Count and covariance fields must
+either be available consistently for all records or be absent. Count-domain replay
+requires `isotope_counts`; spectral replay uses `spectrum_counts`. Count mode supports
+the historical Poisson diagnostic and covariance-aware Gaussian or multivariate
+Student-t fitting. Covariance matrices are regularized, condition-checked, and used
+jointly across isotope channels. Spectral MLE remains the authoritative result because
+count covariance cannot correct systematic spectrum-decomposition bias.
 
 ## Physical units
 
@@ -98,7 +120,12 @@ Patches have stable IDs, optional parent IDs, and refinement levels. Solver adja
 
 ## Shared physical kernel
 
-Both replay modes call the same local `ContinuousKernel` used by the runtime observation model. Its response includes detector/source geometry, finite detector and aperture settings, selected Fe/Pb shield geometry and attenuation, obstacle path attenuation, optional buildup and calibrated transport-response terms. Replay reconstructs the model from the resolved log configuration and local assets; it does not consult another repository.
+Both replay modes and the online backend call the shared runtime's
+`RuntimeObservationModel` and `ContinuousKernel`. Their response includes
+detector/source geometry, finite detector and aperture settings, selected Fe/Pb shield
+geometry and attenuation, obstacle path attenuation, optional buildup, and calibrated
+transport-response terms. File-backed assets are resolved by the runtime package from
+the MeasurementLog root or its versioned package assets.
 
 For measurement `m`, patch `g`, isotope `i`, and normalized quadrature point `r`, the integrated-strength count response is:
 
@@ -124,7 +151,7 @@ The background basis is optional and has one non-negative rate coefficient per i
 
 ### Line-resolved spectral response
 
-`build_spectral_response` constructs the full:
+`build_spectral_response` can construct the full diagnostic tensor:
 
 ```text
 M × B × G × I
@@ -142,6 +169,21 @@ mu[m,b] = sum_g sum_i R_spec[m,b,g,i] * s[g,i]
 ```
 
 The optional spectral nuisance bases are non-negative, live-time-scaled, normalized background and scatter shapes. They fit one background rate and one scatter rate, rather than one unconstrained value per bin.
+
+Production RA-L fitting instead creates a `ResponseOperator`. Its forward and adjoint
+products stream measurement, energy-bin, patch, quadrature, and isotope blocks without
+materializing the full tensor. Per-measurement physical blocks use content-addressed
+disk caching, so an extended causal prefix evaluates only new rows. The cache key binds
+the physical model, runtime manifest, detector/shield state, energy edges, patch
+geometry, and response settings.
+
+When a runtime discrepancy-calibration artifact is configured, spectral nuisance
+columns additionally cover calibrated background/scatter shapes, low-dimensional
+all-64-pair shield leakage, station/pose shared rate, signed low-rank residual modes,
+and optional gain/resolution derivatives. Family-specific L2 shrinkage prevents these
+columns from freely absorbing source response. The calibrated negative-binomial
+dispersion models remaining overdispersion. A real independent artifact is mandatory;
+the estimator never fabricates a run-specific correction.
 
 ## Objective and solver
 
@@ -165,7 +207,17 @@ The terms have distinct roles:
 - The isotope group penalty applies an L2 norm across isotopes at each patch, then sums those group norms with area weights. It promotes common spatial support while retaining isotope-specific amplitudes.
 - Nuisance L1/L2 terms control non-negative count background or spectral background/scatter rates.
 
-`fit_surface_map_poisson` uses a diagonally preconditioned Chambolle-Pock primal-dual iteration with a closed-form Poisson-conjugate proximal update, TV dual clipping, non-negative L1 steps, exact per-patch group shrinkage, and optional over-relaxation. It checks both relative state change and relative objective change at `check_interval`, and stops when both requested tolerances are met or `max_iterations` is reached.
+`fit_surface_map_poisson` uses a diagonally preconditioned Chambolle-Pock primal-dual
+iteration with a closed-form likelihood-conjugate proximal update, TV dual clipping,
+non-negative L1 steps, exact per-patch group shrinkage, and optional over-relaxation.
+The streamed solver supports Poisson and calibrated negative-binomial likelihoods on
+CPU or CUDA. It checks both relative state change and relative objective change at
+`check_interval`, and stops when both requested tolerances are met or
+`max_iterations` is reached.
+
+The covariance-aware count diagnostic uses constrained L-BFGS-B over the same
+non-negative density/nuisance variables with the full per-measurement isotope
+covariance. Multivariate Student-t is the robust default for this secondary mode.
 
 ## Coarse-to-fine and debias stages
 
@@ -202,12 +254,34 @@ Every estimate records:
 - L1, TV, group, and nuisance penalty contributions;
 - objective history, iteration count, convergence flag, relative state/objective changes, and normalized KKT residual;
 - fitted nuisance names;
-- whether isotope covariance was preserved in the input batch;
+- covariance-likelihood family, regularization, and per-row condition numbers in
+  count mode;
 - line energies and normalized line weights in spectral mode;
 - response matrix rank, nonzero-singular-value condition number, zero columns, and highly cosine-correlated source-column pairs;
-- connected hotspot clusters.
+- connected hotspot clusters;
+- active-support Laplace covariance, station-bootstrap patch selection frequencies,
+  cluster centroid/strength intervals, surface-mass probabilities, z intervals, and
+  ceiling probability when final uncertainty is enabled.
 
 Hotspot extraction thresholds each isotope relative to its own peak, forms connected components on the physical shared-edge graph, optionally filters by integrated `cps@1m`, and reports stable patch IDs, strength-weighted centroid, integrated strength, peak density, and involved surface kinds.
+
+## Regularization selection and uncertainty
+
+`regularization_selection: grouped_cv` evaluates the configured L1/TV grid using
+whole station or same-XY-height groups. It selects the strongest regularization within
+one standard error of the minimum validation deviance when requested. Final holdout
+execution requires `regularization_selection: fixed`, distinct tuning/holdout run and
+environment IDs, a different environment manifest, and exclusion of the holdout
+environment from discrepancy calibration.
+
+Final uncertainty is explicitly conditional on the selected support. The active
+response columns form a regularized Fisher/Laplace covariance; a hard parameter cap
+prevents accidental dense inversion. Station-block bootstrap estimates selection
+frequency and refits complete station groups. Reports aggregate these samples into
+patch selection frequencies, cluster centroid covariance, centroid and integrated
+strength intervals, isotope/surface mass probabilities, z intervals, and ceiling
+probability. This is not a claim of globally exact post-selection uncertainty; the
+selection frequencies and response-correlation diagnostics expose instability.
 
 ## Reporting
 
@@ -219,13 +293,27 @@ Hotspot extraction thresholds each isotope relative to its own peak, forms conne
 
 NPZ member order and ZIP timestamps are fixed. The NPZ includes the SHA-256 of the exact diagnostics JSON. Loading verifies that binding, schema versions, mirrored summary values, all array shapes, patch-level neighbor symmetry, and global adjacency. Existing report members are not overwritten unless `--overwrite` is supplied.
 
-## CPU, GPU, and memory
+## CPU, GPU, cache, and memory
 
-The checked-in MLE configurations set `use_gpu: false`, and `--cpu` forces this path. CPU response construction uses local NumPy implementations of the physical kernel.
+`--cpu` forces the NumPy streamed path. The RA-L physical profile requests CUDA and
+fails closed if the configured device is unavailable; smaller default profiles remain
+CPU-friendly.
 
-`--gpu` sets `use_gpu: true` and runs physical kernel evaluation through local PyTorch tensors on `gpu_device` (default `cuda`). The request is strict: missing PyTorch/device support raises an error rather than falling back. `gpu_dtype` accepts `float32` or `float64`; the `MLEConfig` default is `float64`. The optimizer and report construction remain NumPy/SciPy CPU operations.
+`--gpu` runs shared physical-kernel evaluation and streamed optimization through
+PyTorch tensors on `gpu_device` (default `cuda`). The request is strict: missing
+PyTorch/device support raises an error rather than falling back. `gpu_dtype` accepts
+`float32` or `float64`; the default is `float64`.
 
-`response_chunk_size` controls the maximum kernel-evaluation chunk for both count and spectral builders. Chunking reduces temporary kernel memory and preserves output ordering, but the final count response and especially the full `M × B × G × I` spectral tensor are materialized in host memory. Reduce patch count, energy bins, or use coarser initial spacing when that complete tensor is too large.
+`response_energy_chunk_size` and `response_patch_chunk_size` bound streamed spectral
+blocks. `response_cache_dir` stores content-addressed per-measurement blocks and
+prefix-reuse diagnostics. The solver reports peak block bytes, which is independent
+of total `M x B x G x I` size for fixed chunks. Materialized mode remains available
+only for small deterministic diagnostics and CPU/GPU equivalence tests.
+
+Online and final spatial budgets are separate: `online_patch_spacing_m` and
+`online_coarse_to_fine_levels` define low-latency causal fits, while
+`patch_spacing_m` and `coarse_to_fine_levels` define the final report. A coarse warm
+state is never silently applied to an incompatible final topology.
 
 ## Configuration map
 
@@ -236,11 +324,15 @@ The implemented public JSON fields are grouped below:
 | Mode/channels | `mode`, `isotope_names` |
 | Surface grid | `patch_spacing_m`, `quadrature_order`, `obstacle_height_m` |
 | Structural penalties | `l1_weight`, `tv_weight`, `isotope_group_weight` |
-| Nuisance model | `fit_background_nuisance`, `fit_scatter_nuisance`, `nuisance_l1_weight`, `nuisance_l2_weight` |
+| Nuisance model | background/scatter and calibrated leakage/station/low-rank/drift switches, `discrepancy_calibration_path`, nuisance penalties |
+| Likelihood | `spectral_likelihood`, `count_likelihood`, Student-t and covariance-conditioning fields |
+| Regularization selection | `regularization_selection`, grouped CV fields, tuning/final environment IDs |
 | Iteration | `max_iterations`, `tolerance`, `objective_tolerance`, `check_interval`, `step_safety`, `over_relaxation`, `min_mean` |
-| Compute | `response_chunk_size`, `use_gpu`, `gpu_device`, `gpu_dtype` |
+| Compute | response mode/chunk/cache fields, `use_gpu`, `gpu_device`, `gpu_dtype` |
+| Online/final split | `online_fit_scope=station_complete`, `online_patch_spacing_m`, `online_coarse_to_fine_levels` |
 | Spectral pulse | `continuum_to_peak`, `backscatter_fraction` |
 | Refinement/debias | `coarse_to_fine_levels`, `refinement_fraction`, `debias_refit`, `support_threshold_fraction` |
+| Uncertainty | Laplace support/ridge/cap and station-bootstrap fields |
 | Post-processing | `response_correlation_threshold`, `cluster_threshold_fraction`, `cluster_min_strength_cps_1m` |
 | Evaluation split | `held_out_fraction`, `held_out_grouping`, `held_out_xy_tolerance_m`, `random_seed` |
 

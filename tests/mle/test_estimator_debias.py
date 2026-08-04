@@ -52,10 +52,13 @@ def test_debias_cannot_preserve_initialized_density_outside_selected_support() -
         response=response,
         nuisance_response=np.zeros((1, 1, 0), dtype=float),
         nuisance_names=(),
+        nuisance_l2_weights=np.zeros(0, dtype=float),
+        overdispersion_alpha_by_bin=np.zeros(0, dtype=float),
         result=_seed_result(densities, patches.areas_m2),
         fit_indices=np.asarray([0], dtype=np.int64),
         held_out_indices=np.zeros(0, dtype=np.int64),
         spectral_details=None,
+        likelihood_diagnostics={"family": "poisson"},
     )
     config = MLEConfig(
         mode="count",

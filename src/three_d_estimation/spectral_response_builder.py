@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
+from hashlib import sha256
+import json
+from pathlib import Path
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -10,6 +13,7 @@ from numpy.typing import NDArray
 
 from measurement.continuous_kernels import ContinuousKernel
 from measurement.obstacles import ObstacleGrid
+from runtime.discrepancy_calibration import DiscrepancyCalibration
 from spectrum.library import default_library
 from spectrum.response_matrix import (
     BACKSCATTER_FRACTION,
@@ -19,6 +23,12 @@ from spectrum.response_matrix import (
     default_background_shape,
     default_resolution,
     detector_response_kernel_for_incident_gamma,
+)
+
+from .response_operator import (
+    BlockResponseOperator,
+    ResponseBlock,
+    atomic_save_npy,
 )
 
 
@@ -67,9 +77,7 @@ def _orientation_indices(
         raise TypeError(f"{name} must contain integer indices.")
     indices = np.asarray(raw, dtype=np.int64)
     if np.any(indices < 0) or np.any(indices >= orientation_count):
-        raise ValueError(
-            f"{name} entries must lie in [0, {orientation_count - 1}]."
-        )
+        raise ValueError(f"{name} entries must lie in [0, {orientation_count - 1}].")
     return np.ascontiguousarray(indices)
 
 
@@ -136,7 +144,9 @@ def _validated_observation_geometry(
         dtype=np.float64,
     )
     if edges.ndim != 1 or edges.size < 2:
-        raise ValueError("energy_bin_edges_keV must be a one-dimensional bin edge array.")
+        raise ValueError(
+            "energy_bin_edges_keV must be a one-dimensional bin edge array."
+        )
     if not np.all(np.isfinite(edges)) or np.any(np.diff(edges) <= 0.0):
         raise ValueError("energy_bin_edges_keV must be finite and strictly increasing.")
     edges = np.ascontiguousarray(edges)
@@ -159,8 +169,24 @@ class SpectralResponseResult:
     response_per_density: NDArray[np.float64]
     nuisance_response: NDArray[np.float64]
     nuisance_names: tuple[str, ...]
+    nuisance_l2_weights: NDArray[np.float64]
+    overdispersion_alpha_by_bin: NDArray[np.float64]
     line_energies_keV_by_isotope: dict[str, tuple[float, ...]]
     line_weights_by_isotope: dict[str, tuple[float, ...]]
+
+
+@dataclass(frozen=True)
+class SpectralResponseOperatorResult:
+    """Store a matrix-free density operator and compact nuisance responses."""
+
+    operator: BlockResponseOperator
+    nuisance_response: NDArray[np.float64]
+    nuisance_names: tuple[str, ...]
+    nuisance_l2_weights: NDArray[np.float64]
+    overdispersion_alpha_by_bin: NDArray[np.float64]
+    line_energies_keV_by_isotope: dict[str, tuple[float, ...]]
+    line_weights_by_isotope: dict[str, tuple[float, ...]]
+    cache_directory: Path | None
 
 
 def _validated_patch_quadrature(
@@ -216,9 +242,7 @@ def _validated_patch_quadrature(
         or points.shape[0] == 0
         or points.shape[1] == 0
     ):
-        raise ValueError(
-            "quadrature_points_xyz must have non-empty shape (G, Q, 3)."
-        )
+        raise ValueError("quadrature_points_xyz must have non-empty shape (G, Q, 3).")
     if weights.shape != points.shape[:2]:
         raise ValueError("quadrature_weights must have shape (G, Q).")
     if (
@@ -318,8 +342,7 @@ def _line_entries(
     if total_weight <= 0.0:
         raise ValueError(f"Gamma-line weights for {isotope} sum to zero.")
     return tuple(
-        {**entry, "weight": float(entry["weight"] / total_weight)}
-        for entry in entries
+        {**entry, "weight": float(entry["weight"] / total_weight)} for entry in entries
     )
 
 
@@ -401,7 +424,9 @@ def build_spectral_nuisance_response(
         raise ValueError("live_times_s must contain finite non-negative values.")
     edges = np.asarray(energy_bin_edges_keV, dtype=float)
     if edges.ndim != 1 or edges.size < 2:
-        raise ValueError("energy_bin_edges_keV must be a one-dimensional bin edge array.")
+        raise ValueError(
+            "energy_bin_edges_keV must be a one-dimensional bin edge array."
+        )
     if not np.all(np.isfinite(edges)) or np.any(np.diff(edges) <= 0.0):
         raise ValueError("energy_bin_edges_keV must be finite and strictly increasing.")
     centers = 0.5 * (edges[:-1] + edges[1:])
@@ -423,6 +448,133 @@ def build_spectral_nuisance_response(
     return np.stack(columns, axis=-1), tuple(names)
 
 
+def build_structured_spectral_nuisance_response(
+    live_times_s: NDArray[np.float64],
+    energy_bin_edges_keV: NDArray[np.float64],
+    fe_indices: NDArray[np.int64],
+    pb_indices: NDArray[np.int64],
+    station_ids: NDArray[np.int64],
+    calibration: DiscrepancyCalibration,
+    *,
+    include_background: bool = True,
+    include_scatter: bool = True,
+    include_shield_leakage: bool = True,
+    include_station_rate: bool = True,
+    include_low_rank_residual: bool = True,
+    include_gain_resolution_drift: bool = False,
+) -> tuple[
+    NDArray[np.float64],
+    tuple[str, ...],
+    NDArray[np.float64],
+    NDArray[np.float64],
+]:
+    """Build calibrated shared nuisance bases with family-specific shrinkage."""
+    if not isinstance(calibration, DiscrepancyCalibration):
+        raise TypeError("calibration must be a DiscrepancyCalibration.")
+    live_times = np.asarray(live_times_s, dtype=np.float64).reshape(-1)
+    edges = np.asarray(energy_bin_edges_keV, dtype=np.float64)
+    calibration.validate_energy_axis(edges)
+    measurement_count = live_times.size
+    fe = np.asarray(fe_indices, dtype=np.int64)
+    pb = np.asarray(pb_indices, dtype=np.int64)
+    stations = np.asarray(station_ids, dtype=np.int64)
+    if fe.shape != (measurement_count,) or pb.shape != (measurement_count,):
+        raise ValueError("Shield indices must contain one row per measurement.")
+    if stations.shape != (measurement_count,):
+        raise ValueError("station_ids must contain one row per measurement.")
+    pair_ids = 8 * fe + pb
+    if np.any(pair_ids < 0) or np.any(pair_ids >= 64):
+        raise ValueError("Shield pair IDs must lie in [0, 63].")
+    bin_count = edges.size - 1
+    columns: list[NDArray[np.float64]] = []
+    names: list[str] = []
+    weights: list[float] = []
+
+    def add_global_basis(
+        basis: NDArray[np.float64],
+        family: str,
+        prefix: str,
+    ) -> None:
+        """Add live-time-scaled run-global spectral basis columns."""
+        for index, shape in enumerate(np.asarray(basis, dtype=np.float64)):
+            columns.append(live_times[:, None] * shape[None, :])
+            names.append(f"{prefix}:{index}")
+            weights.append(float(calibration.shrinkage_l2_by_family[family]))
+
+    if include_background:
+        add_global_basis(calibration.background_basis, "background", "background")
+    if include_scatter:
+        add_global_basis(calibration.scatter_basis, "scatter", "scatter")
+    if include_shield_leakage:
+        features = calibration.shield_pair_feature_basis[pair_ids]
+        for feature_index in range(features.shape[1]):
+            for spectrum_index, shape in enumerate(calibration.shield_leakage_basis):
+                columns.append(
+                    live_times[:, None]
+                    * features[:, feature_index, None]
+                    * shape[None, :]
+                )
+                names.append(f"shield_leakage:f{feature_index}:s{spectrum_index}")
+                weights.append(
+                    float(calibration.shrinkage_l2_by_family["shield_leakage"])
+                )
+    if include_station_rate:
+        base_shapes = np.vstack(
+            [
+                calibration.background_basis,
+                calibration.scatter_basis,
+                calibration.low_rank_spectral_residual_basis[:1],
+            ]
+        )
+        station_shape = (
+            np.mean(base_shapes, axis=0)
+            if base_shapes.size
+            else np.full(bin_count, 1.0 / bin_count)
+        )
+        station_shape = station_shape / max(float(np.sum(station_shape)), 1.0e-30)
+        for station in np.unique(stations):
+            indicator = stations == station
+            columns.append(
+                live_times[:, None] * indicator[:, None] * station_shape[None, :]
+            )
+            names.append(f"station_rate:{int(station)}")
+            weights.append(float(calibration.shrinkage_l2_by_family["station_rate"]))
+    if include_low_rank_residual:
+        add_global_basis(
+            calibration.low_rank_spectral_residual_basis,
+            "low_rank_residual",
+            "low_rank_residual",
+        )
+    if include_gain_resolution_drift:
+        for family, prefix, basis in (
+            ("gain_drift", "gain_drift", calibration.gain_derivative_basis),
+            (
+                "resolution_drift",
+                "resolution_drift",
+                calibration.resolution_derivative_basis,
+            ),
+        ):
+            for index, derivative in enumerate(basis):
+                positive = np.maximum(derivative, 0.0)
+                negative = np.maximum(-derivative, 0.0)
+                for sign, shape in (("positive", positive), ("negative", negative)):
+                    if not np.any(shape):
+                        continue
+                    columns.append(live_times[:, None] * shape[None, :])
+                    names.append(f"{prefix}:{index}:{sign}")
+                    weights.append(float(calibration.shrinkage_l2_by_family[family]))
+    if not columns:
+        nuisance = np.zeros((measurement_count, bin_count, 0), dtype=np.float64)
+    else:
+        nuisance = np.stack(columns, axis=-1)
+    return (
+        nuisance,
+        tuple(names),
+        np.asarray(weights, dtype=np.float64),
+        calibration.overdispersion_alpha_by_bin,
+    )
+
+
 def build_spectral_response(
     observations: object,
     patches: object,
@@ -435,6 +587,11 @@ def build_spectral_response(
     require_line_resolved: bool = True,
     include_background_nuisance: bool = True,
     include_scatter_nuisance: bool = True,
+    discrepancy_calibration: DiscrepancyCalibration | None = None,
+    include_shield_leakage_nuisance: bool = True,
+    include_station_rate_nuisance: bool = True,
+    include_low_rank_residual_nuisance: bool = True,
+    include_gain_resolution_drift: bool = False,
 ) -> SpectralResponseResult:
     """Build ``M x B x G x I`` line-resolved count response tensors."""
     kernel_chunk_size = _positive_integer(chunk_size, name="chunk_size")
@@ -472,7 +629,9 @@ def build_spectral_response(
             isotope,
             require_line_resolved=require_line_resolved,
         )
-        energies_by_isotope[isotope] = tuple(float(line["energy_keV"]) for line in lines)
+        energies_by_isotope[isotope] = tuple(
+            float(line["energy_keV"]) for line in lines
+        )
         weights_by_isotope[isotope] = tuple(float(line["weight"]) for line in lines)
         for line_index, line in enumerate(lines):
             transport_line_index = int(
@@ -527,28 +686,407 @@ def build_spectral_response(
                 backscatter_fraction=float(backscatter_fraction),
             )
             if pulse.shape != centers.shape:
-                raise ValueError("Detector response returned an incompatible bin shape.")
+                raise ValueError(
+                    "Detector response returned an incompatible bin shape."
+                )
             if not np.all(np.isfinite(pulse)) or np.any(pulse < 0.0):
                 raise ValueError(
                     "Detector response must contain finite non-negative values."
                 )
             response[:, :, :, isotope_index] += (
-                float(line["weight"])
-                * spatial[:, None, :]
-                * pulse[None, :, None]
+                float(line["weight"]) * spatial[:, None, :] * pulse[None, :, None]
             )
 
-    nuisance, nuisance_names = build_spectral_nuisance_response(
-        live_times,
-        edges,
-        include_background=include_background_nuisance,
-        include_scatter=include_scatter_nuisance,
-    )
+    if discrepancy_calibration is None:
+        nuisance, nuisance_names = build_spectral_nuisance_response(
+            live_times,
+            edges,
+            include_background=include_background_nuisance,
+            include_scatter=include_scatter_nuisance,
+        )
+        nuisance_l2_weights = np.zeros(len(nuisance_names), dtype=np.float64)
+        overdispersion_alpha = np.zeros(centers.size, dtype=np.float64)
+    else:
+        nuisance, nuisance_names, nuisance_l2_weights, overdispersion_alpha = (
+            build_structured_spectral_nuisance_response(
+                live_times,
+                edges,
+                fe_indices,
+                pb_indices,
+                np.asarray(getattr(observations, "station_ids"), dtype=np.int64),
+                discrepancy_calibration,
+                include_background=include_background_nuisance,
+                include_scatter=include_scatter_nuisance,
+                include_shield_leakage=include_shield_leakage_nuisance,
+                include_station_rate=include_station_rate_nuisance,
+                include_low_rank_residual=include_low_rank_residual_nuisance,
+                include_gain_resolution_drift=include_gain_resolution_drift,
+            )
+        )
     return SpectralResponseResult(
         response_per_integrated_strength=response,
         response_per_density=response * areas[None, None, :, None],
         nuisance_response=nuisance,
         nuisance_names=nuisance_names,
+        nuisance_l2_weights=nuisance_l2_weights,
+        overdispersion_alpha_by_bin=overdispersion_alpha,
         line_energies_keV_by_isotope=energies_by_isotope,
         line_weights_by_isotope=weights_by_isotope,
     )
+
+
+def _hash_array(digest: object, values: NDArray[np.generic]) -> None:
+    """Update a SHA-256 digest with one canonical array description."""
+    array = np.ascontiguousarray(values)
+    digest.update(str(array.dtype).encode("ascii"))
+    digest.update(json.dumps(array.shape).encode("ascii"))
+    digest.update(array.tobytes(order="C"))
+
+
+def _spectral_cache_root(
+    cache_directory: str | Path | None,
+    *,
+    kernel: ContinuousKernel,
+    areas: NDArray[np.float64],
+    quadrature_points: NDArray[np.float64],
+    quadrature_weights: NDArray[np.float64],
+    edges: NDArray[np.float64],
+    isotope_lines: Mapping[str, Sequence[Mapping[str, float]]],
+    continuum_to_peak: float,
+    backscatter_fraction: float,
+) -> Path | None:
+    """Return a physical-model and patch-specific disk-cache namespace."""
+    if cache_directory is None:
+        return None
+    digest = sha256()
+    digest.update(b"spectral-response-block-v1\0")
+    # ContinuousKernel is owned by the shared runtime.  Hash its configured
+    # constructor fields while excluding execution-device choices and every
+    # mutable cache/counter.  This keeps a causal prefix in one cache namespace.
+    physical_kernel_fields = {
+        field.name: repr(getattr(kernel, field.name))
+        for field in fields(kernel)
+        if field.init and field.name not in {"use_gpu", "gpu_device", "gpu_dtype"}
+    }
+    digest.update(json.dumps(physical_kernel_fields, sort_keys=True).encode("utf-8"))
+    digest.update(json.dumps(dict(isotope_lines), sort_keys=True).encode("utf-8"))
+    digest.update(
+        repr((float(continuum_to_peak), float(backscatter_fraction))).encode()
+    )
+    for array in (areas, quadrature_points, quadrature_weights, edges):
+        _hash_array(digest, array)
+    root = Path(cache_directory).expanduser().resolve() / digest.hexdigest()
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _measurement_cache_key(
+    detector_position: NDArray[np.float64],
+    fe_index: int,
+    pb_index: int,
+    live_time_s: float,
+) -> str:
+    """Return a stable append-only key for one acquired response row."""
+    digest = sha256()
+    _hash_array(digest, np.asarray(detector_position, dtype=np.float64))
+    digest.update(
+        json.dumps(
+            {
+                "fe": int(fe_index),
+                "pb": int(pb_index),
+                "live_time_s": float(live_time_s),
+            },
+            allow_nan=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    return digest.hexdigest()
+
+
+def build_spectral_response_operator(
+    observations: object,
+    patches: object,
+    isotopes: Sequence[str],
+    kernel: ContinuousKernel,
+    *,
+    chunk_size: int = 262144,
+    energy_chunk_size: int = 128,
+    patch_chunk_size: int = 128,
+    cache_directory: str | Path | None = None,
+    continuum_to_peak: float = COMPTON_CONTINUUM_TO_PEAK,
+    backscatter_fraction: float = BACKSCATTER_FRACTION,
+    require_line_resolved: bool = True,
+    include_background_nuisance: bool = True,
+    include_scatter_nuisance: bool = True,
+    discrepancy_calibration: DiscrepancyCalibration | None = None,
+    include_shield_leakage_nuisance: bool = True,
+    include_station_rate_nuisance: bool = True,
+    include_low_rank_residual_nuisance: bool = True,
+    include_gain_resolution_drift: bool = False,
+) -> SpectralResponseOperatorResult:
+    """Build a disk-cacheable streaming ``A @ q`` and ``A.T @ r`` operator.
+
+    Blocks are one measurement by an energy-bin chunk by a patch chunk.  Cache
+    keys are per acquired row, so extending a causal observation prefix writes
+    only blocks belonging to newly appended measurements.
+    """
+    kernel_chunk_size = _positive_integer(chunk_size, name="chunk_size")
+    energy_step = _positive_integer(energy_chunk_size, name="energy_chunk_size")
+    patch_step = _positive_integer(patch_chunk_size, name="patch_chunk_size")
+    (
+        detector_positions,
+        fe_indices,
+        pb_indices,
+        live_times,
+        edges,
+    ) = _validated_observation_geometry(observations, kernel)
+    names = _isotope_names(isotopes)
+    areas, quadrature_points, quadrature_weights = _validated_patch_quadrature(patches)
+    measurement_count = int(detector_positions.shape[0])
+    patch_count, quadrature_count = quadrature_points.shape[:2]
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    bin_width = float(np.median(np.diff(edges)))
+    resolution = default_resolution()
+    lines_by_isotope = {
+        isotope: _line_entries(
+            kernel,
+            isotope,
+            require_line_resolved=require_line_resolved,
+        )
+        for isotope in names
+    }
+    energies_by_isotope = {
+        isotope: tuple(float(line["energy_keV"]) for line in lines)
+        for isotope, lines in lines_by_isotope.items()
+    }
+    weights_by_isotope = {
+        isotope: tuple(float(line["weight"]) for line in lines)
+        for isotope, lines in lines_by_isotope.items()
+    }
+    cache_root = _spectral_cache_root(
+        cache_directory,
+        kernel=kernel,
+        areas=areas,
+        quadrature_points=quadrature_points,
+        quadrature_weights=quadrature_weights,
+        edges=edges,
+        isotope_lines=lines_by_isotope,
+        continuum_to_peak=continuum_to_peak,
+        backscatter_fraction=backscatter_fraction,
+    )
+    cache_stats = {"hits": 0, "misses": 0, "blocks": 0}
+
+    def block_path(
+        measurement_index: int,
+        patch_start: int,
+        patch_stop: int,
+        energy_start: int,
+        energy_stop: int,
+    ) -> Path | None:
+        """Return one immutable per-row cache block path."""
+        if cache_root is None:
+            return None
+        row_key = _measurement_cache_key(
+            detector_positions[measurement_index],
+            int(fe_indices[measurement_index]),
+            int(pb_indices[measurement_index]),
+            float(live_times[measurement_index]),
+        )
+        return (
+            cache_root
+            / row_key
+            / f"g{patch_start}-{patch_stop}_b{energy_start}-{energy_stop}.npy"
+        )
+
+    def calculate_patch_chunk(
+        measurement_index: int,
+        patch_start: int,
+        patch_stop: int,
+    ) -> NDArray[np.float64]:
+        """Calculate one bounded full-energy density response patch chunk."""
+        selected_points = quadrature_points[patch_start:patch_stop]
+        selected_weights = quadrature_weights[patch_start:patch_stop]
+        selected_areas = areas[patch_start:patch_stop]
+        source_points = selected_points.reshape(-1, 3)
+        response = np.zeros(
+            (centers.size, patch_stop - patch_start, len(names)),
+            dtype=np.float64,
+        )
+        for isotope_index, isotope in enumerate(names):
+            for line_index, line in enumerate(lines_by_isotope[isotope]):
+                transport_line_index = int(
+                    line.get("transport_line_index", float(line_index))
+                )
+                line_kernel = _kernel_for_line(
+                    kernel,
+                    isotope,
+                    line,
+                    transport_line_index,
+                    require_line_resolved=require_line_resolved,
+                )
+                raw = np.asarray(
+                    line_kernel.kernel_values_selected_pairs_for_detectors(
+                        isotope=isotope,
+                        detector_positions=detector_positions[
+                            measurement_index : measurement_index + 1
+                        ],
+                        sources=source_points,
+                        fe_indices=fe_indices[
+                            measurement_index : measurement_index + 1
+                        ],
+                        pb_indices=pb_indices[
+                            measurement_index : measurement_index + 1
+                        ],
+                        chunk_size=kernel_chunk_size,
+                    ),
+                    dtype=np.float64,
+                )
+                expected_shape = (1, (patch_stop - patch_start) * quadrature_count)
+                if raw.shape != expected_shape:
+                    raise ValueError(
+                        f"Selected-pair kernel returned {raw.shape}, expected "
+                        f"{expected_shape}."
+                    )
+                values = raw.reshape(patch_stop - patch_start, quadrature_count)
+                spatial = float(live_times[measurement_index]) * np.einsum(
+                    "gq,gq->g",
+                    values,
+                    selected_weights,
+                    optimize=True,
+                )
+                pulse = detector_response_kernel_for_incident_gamma(
+                    centers,
+                    float(line["energy_keV"]),
+                    resolution,
+                    cebr3_efficiency,
+                    bin_width,
+                    continuum_to_peak=float(continuum_to_peak),
+                    backscatter_fraction=float(backscatter_fraction),
+                )
+                response[:, :, isotope_index] += (
+                    float(line["weight"])
+                    * pulse[:, None]
+                    * spatial[None, :]
+                    * selected_areas[None, :]
+                )
+        return response
+
+    def factory() -> object:
+        """Yield bounded density-response blocks, loading immutable cache files."""
+        for measurement_index in range(measurement_count):
+            for patch_start in range(0, patch_count, patch_step):
+                patch_stop = min(patch_start + patch_step, patch_count)
+                energy_ranges = tuple(
+                    (start, min(start + energy_step, centers.size))
+                    for start in range(0, centers.size, energy_step)
+                )
+                paths = tuple(
+                    block_path(
+                        measurement_index,
+                        patch_start,
+                        patch_stop,
+                        energy_start,
+                        energy_stop,
+                    )
+                    for energy_start, energy_stop in energy_ranges
+                )
+                missing = any(path is None or not path.exists() for path in paths)
+                calculated = (
+                    calculate_patch_chunk(measurement_index, patch_start, patch_stop)
+                    if missing
+                    else None
+                )
+                source_indices = np.asarray(
+                    [
+                        patch_index * len(names) + isotope_index
+                        for patch_index in range(patch_start, patch_stop)
+                        for isotope_index in range(len(names))
+                    ],
+                    dtype=np.int64,
+                )
+                for (energy_start, energy_stop), path in zip(
+                    energy_ranges,
+                    paths,
+                    strict=True,
+                ):
+                    if path is not None and path.exists():
+                        values = np.load(path, allow_pickle=False, mmap_mode="r")
+                        cache_stats["hits"] += 1
+                    else:
+                        assert calculated is not None
+                        values = calculated[energy_start:energy_stop].reshape(
+                            energy_stop - energy_start,
+                            -1,
+                        )
+                        if path is not None:
+                            atomic_save_npy(path, values)
+                        cache_stats["misses"] += 1
+                    cache_stats["blocks"] += 1
+                    observation_indices = measurement_index * centers.size + np.arange(
+                        energy_start, energy_stop, dtype=np.int64
+                    )
+                    yield ResponseBlock(
+                        observation_indices=observation_indices,
+                        source_indices=source_indices,
+                        values=np.asarray(values, dtype=np.float64),
+                    )
+
+    operator = BlockResponseOperator(
+        (measurement_count, centers.size),
+        patch_count,
+        len(names),
+        factory,
+        diagnostics={
+            "response_mode": "matrix_free",
+            "energy_chunk_size": energy_step,
+            "patch_chunk_size": patch_step,
+            "cache_enabled": cache_root is not None,
+            "cache_stats": cache_stats,
+        },
+    )
+    if discrepancy_calibration is None:
+        nuisance, nuisance_names = build_spectral_nuisance_response(
+            live_times,
+            edges,
+            include_background=include_background_nuisance,
+            include_scatter=include_scatter_nuisance,
+        )
+        nuisance_l2_weights = np.zeros(len(nuisance_names), dtype=np.float64)
+        overdispersion_alpha = np.zeros(centers.size, dtype=np.float64)
+    else:
+        nuisance, nuisance_names, nuisance_l2_weights, overdispersion_alpha = (
+            build_structured_spectral_nuisance_response(
+                live_times,
+                edges,
+                fe_indices,
+                pb_indices,
+                np.asarray(getattr(observations, "station_ids"), dtype=np.int64),
+                discrepancy_calibration,
+                include_background=include_background_nuisance,
+                include_scatter=include_scatter_nuisance,
+                include_shield_leakage=include_shield_leakage_nuisance,
+                include_station_rate=include_station_rate_nuisance,
+                include_low_rank_residual=include_low_rank_residual_nuisance,
+                include_gain_resolution_drift=include_gain_resolution_drift,
+            )
+        )
+    return SpectralResponseOperatorResult(
+        operator=operator,
+        nuisance_response=nuisance,
+        nuisance_names=nuisance_names,
+        nuisance_l2_weights=nuisance_l2_weights,
+        overdispersion_alpha_by_bin=overdispersion_alpha,
+        line_energies_keV_by_isotope=energies_by_isotope,
+        line_weights_by_isotope=weights_by_isotope,
+        cache_directory=cache_root,
+    )
+
+
+__all__ = [
+    "SpectralResponseOperatorResult",
+    "SpectralResponseResult",
+    "build_spectral_nuisance_response",
+    "build_spectral_response",
+    "build_spectral_response_operator",
+    "build_structured_spectral_nuisance_response",
+]

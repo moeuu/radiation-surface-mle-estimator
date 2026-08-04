@@ -4,13 +4,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, is_dataclass, replace
 import inspect
 import json
 import math
 from pathlib import Path
 import numpy as np
 
+from measurement.continuous_kernels import ContinuousKernel
 from measurement.model import EnvironmentConfig
 from measurement.observation_model import (
     build_runtime_observation_model,
@@ -24,9 +25,15 @@ from three_d_estimation.backend_contracts import (
     SurfaceMapSnapshot,
 )
 from runtime.records import MeasurementRecord, RunContext
+from runtime.forward_model_manifest import resolve_file_backed_model_asset
 
 from .config import MLEConfig
 from .estimator import SurfaceMLEEstimator
+from .information_planner import (
+    MLEPlanningConfig,
+    MLEPlanningResult,
+    plan_next_measurement,
+)
 from .observation_batch import observation_batch_from_records
 from .types import MLEEstimate
 
@@ -72,7 +79,9 @@ def _strict_json_dict(value: Mapping[str, object]) -> dict[str, object]:
     return safe
 
 
-def _positive_dimensions(payload: Mapping[str, object]) -> tuple[float, float, float] | None:
+def _positive_dimensions(
+    payload: Mapping[str, object],
+) -> tuple[float, float, float] | None:
     """Extract finite positive room dimensions from one mapping."""
     values: object | None = None
     if all(key in payload for key in ("size_x", "size_y", "size_z")):
@@ -87,7 +96,9 @@ def _positive_dimensions(payload: Mapping[str, object]) -> tuple[float, float, f
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
         raise ValueError("Room dimensions must be a sequence of three numbers.")
     parsed = tuple(float(value) for value in values)
-    if len(parsed) != 3 or any(not math.isfinite(value) or value <= 0.0 for value in parsed):
+    if len(parsed) != 3 or any(
+        not math.isfinite(value) or value <= 0.0 for value in parsed
+    ):
         raise ValueError("Room dimensions must contain three finite positive values.")
     return parsed
 
@@ -149,28 +160,45 @@ def _embedded_obstacle(context: RunContext) -> ObstacleGrid | None:
     if not candidates:
         return None
     if len(candidates) != 1 or not isinstance(candidates[0], Mapping):
-        raise ValueError("RunContext must contain at most one embedded obstacle-grid object.")
+        raise ValueError(
+            "RunContext must contain at most one embedded obstacle-grid object."
+        )
     return ObstacleGrid.from_dict(dict(candidates[0]))
 
 
-def _obstacle_from_context(context: RunContext) -> ObstacleGrid | None:
-    """Resolve obstacles only from shared-runtime embedded geometry."""
+def _obstacle_from_context(
+    context: RunContext,
+    *,
+    run_root: Path | None,
+) -> ObstacleGrid | None:
+    """Resolve shared-runtime embedded or file-backed obstacle geometry."""
     embedded = _embedded_obstacle(context)
     if embedded is not None:
         return embedded
     path_value = context.obstacle_layout_path
     if path_value is None or not str(path_value).strip():
         return None
-    raise ValueError(
-        "Live SurfaceMLEBackend requires the shared runtime to embed obstacle geometry."
+    if run_root is None:
+        raise ValueError(
+            "File-backed live obstacle geometry requires the shared runtime "
+            "MeasurementLog run root."
+        )
+    resolved = resolve_file_backed_model_asset(
+        path_value,
+        field_name="obstacle_layout_path",
+        run_root=run_root,
     )
+    return ObstacleGrid.load(resolved)
 
 
 def _runtime_config_from_context(context: RunContext) -> dict[str, object]:
     """Return an observation-model config with no external file dependency."""
-    payload = deepcopy(context.runtime_config)
+    payload = deepcopy(dict(context.runtime_config))
     configured_rate = payload.get("source_rate_model")
-    if configured_rate is not None and str(configured_rate).strip().lower() != _SOURCE_RATE_MODEL:
+    if (
+        configured_rate is not None
+        and str(configured_rate).strip().lower() != _SOURCE_RATE_MODEL
+    ):
         raise ValueError("Runtime config source_rate_model must be 'detector_cps_1m'.")
     payload["source_rate_model"] = _SOURCE_RATE_MODEL
 
@@ -198,7 +226,9 @@ def _cluster_source_modes(
             raise ValueError(f"hotspot_clusters[{index}] must be an object.")
         isotope = str(cluster.get("isotope", ""))
         if isotope not in grouped:
-            raise ValueError(f"hotspot_clusters[{index}] has unknown isotope {isotope!r}.")
+            raise ValueError(
+                f"hotspot_clusters[{index}] has unknown isotope {isotope!r}."
+            )
         centroid_raw = cluster.get("centroid_xyz")
         if isinstance(centroid_raw, (str, bytes)) or not isinstance(
             centroid_raw,
@@ -216,10 +246,17 @@ def _cluster_source_modes(
             for key, value in cluster.items()
             if key not in {"isotope", "centroid_xyz", "integrated_strength_cps_1m"}
         }
+        covariance_raw = cluster.get("centroid_covariance_xyz_m2")
+        covariance = (
+            None
+            if covariance_raw is None
+            else np.asarray(covariance_raw, dtype=np.float64)
+        )
         grouped[isotope].append(
             SourceMode(
                 position_xyz=centroid,
                 strength_cps_1m=strength,
+                covariance_xyz_m2=covariance,
                 metadata=metadata,
             )
         )
@@ -274,7 +311,9 @@ def _snapshot_from_estimate(
     predicted_spectrum = None
     if estimate.predicted_spectra is not None:
         if estimate.predicted_spectra.shape[0] != measurement_count:
-            raise ValueError("Predicted spectrum rows do not match buffered measurements.")
+            raise ValueError(
+                "Predicted spectrum rows do not match buffered measurements."
+            )
         predicted_spectrum = estimate.predicted_spectra[-1]
     diagnostics: dict[str, object] = {
         **estimate.diagnostics,
@@ -309,14 +348,16 @@ class SurfaceMLEBackend:
         config: MLEConfig,
         *,
         estimator_factory: EstimatorFactory = SurfaceMLEEstimator,
+        run_root: str | Path | None = None,
     ) -> None:
-        """Store configuration and an injectable estimator factory."""
+        """Store configuration, runtime asset root, and estimator factory."""
         if not isinstance(config, MLEConfig):
             raise TypeError("config must be MLEConfig.")
         if not callable(estimator_factory):
             raise TypeError("estimator_factory must be callable.")
         self.config = config
         self._estimator_factory = estimator_factory
+        self._run_root = None if run_root is None else Path(run_root).resolve()
         self._context: RunContext | None = None
         self._environment: EnvironmentConfig | None = None
         self._obstacle_grid: ObstacleGrid | None = None
@@ -325,6 +366,7 @@ class SurfaceMLEBackend:
         self._records: list[MeasurementRecord] = []
         self._step_ids: set[int] = set()
         self._latest_estimate: MLEEstimate | None = None
+        self._fit_estimates: list[MLEEstimate] = []
         self._latest_fit_kind: str | None = None
         self._latest_fit_measurement_count = 0
         self._latest_fit_step_id = -1
@@ -350,14 +392,21 @@ class SurfaceMLEBackend:
         if str(context.source_rate_model).strip().lower() != _SOURCE_RATE_MODEL:
             raise ValueError("RunContext source_rate_model must be 'detector_cps_1m'.")
         if tuple(context.isotopes) != tuple(self.config.isotope_names):
-            raise ValueError("RunContext isotopes must exactly match MLEConfig.isotope_names.")
+            raise ValueError(
+                "RunContext isotopes must exactly match MLEConfig.isotope_names."
+            )
         if self.config.mode == "count" and (
             str(context.spectrum_count_method).strip().lower() != "response_poisson"
         ):
-            raise ValueError("Count SurfaceMLEBackend requires response_poisson counts.")
+            raise ValueError(
+                "Count SurfaceMLEBackend requires response_poisson counts."
+            )
 
         environment = _environment_from_context(context)
-        obstacle_grid = _obstacle_from_context(context)
+        obstacle_grid = _obstacle_from_context(
+            context,
+            run_root=self._run_root,
+        )
         runtime_config = _runtime_config_from_context(context)
         observation_model = build_runtime_observation_model(
             runtime_config,
@@ -386,7 +435,7 @@ class SurfaceMLEBackend:
             raise RuntimeError("SurfaceMLEBackend is already finalized.")
 
     def update(self, measurement: MeasurementRecord) -> None:
-        """Buffer one finalized record without performing a per-record fit."""
+        """Buffer one record without fitting an incomplete measurement station."""
         self._ensure_active()
         if not isinstance(measurement, MeasurementRecord):
             raise TypeError("measurement must be MeasurementRecord.")
@@ -414,11 +463,39 @@ class SurfaceMLEBackend:
             parameter.kind == inspect.Parameter.VAR_KEYWORD
             for parameter in fit_signature.parameters.values()
         )
-        if self._latest_estimate is not None and (
-            "initial_estimate" in fit_signature.parameters or accepts_kwargs
+        warm_start_compatible = not (
+            fit_kind == "final"
+            and self.config.online_patch_spacing_m is not None
+            and tuple(self.config.online_patch_spacing_m)
+            != tuple(self.config.patch_spacing_m)
+        )
+        if (
+            self._latest_estimate is not None
+            and warm_start_compatible
+            and ("initial_estimate" in fit_signature.parameters or accepts_kwargs)
         ):
             fit_kwargs["initial_estimate"] = self._latest_estimate
-        estimate = self._estimator.fit(
+        active_estimator = self._estimator
+        if fit_kind != "final" and (
+            bool(self.config.uncertainty_enable)
+            or self.config.online_patch_spacing_m is not None
+            or int(self.config.online_coarse_to_fine_levels)
+            != int(self.config.coarse_to_fine_levels)
+        ):
+            active_estimator = self._estimator_factory(
+                replace(
+                    self.config,
+                    uncertainty_enable=False,
+                    station_bootstrap_replicates=0,
+                    patch_spacing_m=(
+                        self.config.patch_spacing_m
+                        if self.config.online_patch_spacing_m is None
+                        else self.config.online_patch_spacing_m
+                    ),
+                    coarse_to_fine_levels=int(self.config.online_coarse_to_fine_levels),
+                )
+            )
+        estimate = active_estimator.fit(
             batch,
             self._environment,
             self._kernel,
@@ -427,6 +504,7 @@ class SurfaceMLEBackend:
         if not isinstance(estimate, MLEEstimate):
             raise TypeError("SurfaceMLEEstimator.fit() must return MLEEstimate.")
         self._latest_estimate = estimate
+        self._fit_estimates.append(estimate)
         self._latest_fit_kind = fit_kind
         self._latest_fit_measurement_count = len(self._records)
         self._latest_fit_step_id = self._records[-1].step_id
@@ -443,7 +521,9 @@ class SurfaceMLEBackend:
         if not station_records:
             raise ValueError("Station completion requires at least one measurement.")
         if any(not isinstance(record, MeasurementRecord) for record in station_records):
-            raise TypeError("Station measurements must contain MeasurementRecord objects.")
+            raise TypeError(
+                "Station measurements must contain MeasurementRecord objects."
+            )
         if any(record.station_id != int(station_id) for record in station_records):
             raise ValueError("Station-complete measurements do not match station_id.")
         buffered_suffix = self._records[-len(station_records) :]
@@ -451,7 +531,9 @@ class SurfaceMLEBackend:
             supplied is not buffered
             for supplied, buffered in zip(station_records, buffered_suffix, strict=True)
         ):
-            raise ValueError("Station-complete measurements must be the buffered history suffix.")
+            raise ValueError(
+                "Station-complete measurements must be the buffered history suffix."
+            )
         if len(self._records) == self._last_station_fit_count:
             raise RuntimeError("No new measurements are available for a station fit.")
         self._fit_history(fit_kind="station_warm")
@@ -465,7 +547,9 @@ class SurfaceMLEBackend:
         if self._latest_estimate is None:
             return EstimatorSnapshot(
                 step_id=step_id,
-                source_modes_by_isotope={name: () for name in self.config.isotope_names},
+                source_modes_by_isotope={
+                    name: () for name in self.config.isotope_names
+                },
                 surface_map_by_isotope=None,
                 predicted_spectrum=None,
                 diagnostics={
@@ -479,6 +563,50 @@ class SurfaceMLEBackend:
             step_id=self._latest_fit_step_id,
             measurement_count=self._latest_fit_measurement_count,
             fit_kind=str(self._latest_fit_kind),
+        )
+
+    def plan_next_action(
+        self,
+        candidate_poses_xyz: object,
+        *,
+        planning_config: MLEPlanningConfig | None = None,
+        allowed_pair_ids: Sequence[int] | None = None,
+        travel_costs: object | None = None,
+        current_pair_id: int | None = None,
+    ) -> MLEPlanningResult:
+        """Rank runtime-supplied poses and Fe/Pb programs from the latest fit."""
+        self._ensure_active()
+        if self._latest_estimate is None:
+            raise RuntimeError("Complete an MLE station fit before planning.")
+        if self._latest_fit_measurement_count != len(self._records):
+            raise RuntimeError(
+                "Planning requires an MLE fit covering the current durable history."
+            )
+        if not isinstance(self._kernel, ContinuousKernel):
+            raise TypeError("MLE planning requires the shared ContinuousKernel.")
+        assert self._context is not None
+        batch = observation_batch_from_records(
+            self._records,
+            self._context.isotopes,
+        )
+        resolved_current_pair = current_pair_id
+        if resolved_current_pair is None:
+            orientation_count = int(len(self._kernel.orientations))
+            latest = self._records[-1]
+            resolved_current_pair = int(
+                latest.fe_orientation_index
+            ) * orientation_count + int(latest.pb_orientation_index)
+        return plan_next_measurement(
+            self._latest_estimate,
+            batch,
+            self._kernel,
+            self.config,
+            candidate_poses_xyz,
+            planning_config=planning_config,
+            allowed_pair_ids=allowed_pair_ids,
+            travel_costs=travel_costs,
+            current_pair_id=resolved_current_pair,
+            alternative_estimates=tuple(self._fit_estimates[-4:-1]),
         )
 
     def finalize(self) -> EstimatorResult:

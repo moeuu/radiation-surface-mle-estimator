@@ -1,0 +1,18 @@
+{
+  "height_tolerance_m": 0.001,
+  "low_information_patience": 3,
+  "maximum_cluster_centroid_change_m": 0.5,
+  "maximum_expected_information_gain_nats": 0.001,
+  "maximum_kkt_residual": 0.001,
+  "maximum_relative_deviance_range": 0.02,
+  "maximum_relative_map_change": 0.05,
+  "maximum_response_correlation": 0.98,
+  "maximum_systematic_residual_z": 5.0,
+  "minimum_elevation_span_rad": 0.35,
+  "minimum_floor_ceiling_separation": 0.001,
+  "minimum_height_levels": 3,
+  "minimum_independent_poses": 6,
+  "minimum_measurements": 16,
+  "pose_tolerance_m": 0.001,
+  "stability_window": 3
+}

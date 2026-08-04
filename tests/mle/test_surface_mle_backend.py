@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import json
+from types import MappingProxyType
 import unittest
 from unittest.mock import patch
 
@@ -20,6 +21,11 @@ from runtime.records import MeasurementRecord, RunContext
 from spectrum.transport_spectral import GeometryConditionedSpectralModel
 from three_d_estimation.config import MLEConfig
 from three_d_estimation.estimator_backend import SurfaceMLEBackend
+from three_d_estimation.information_planner import (
+    MLEPlanningAction,
+    MLEPlanningConfig,
+    MLEPlanningResult,
+)
 from three_d_estimation.types import MLEEstimate, ObservationBatch, SurfacePatch
 
 
@@ -194,13 +200,16 @@ def _initialize_with_test_kernel(
 ) -> None:
     """Initialize the adapter without constructing the production physics kernel."""
     kernel = ContinuousKernel(use_gpu=False)
-    with patch(
-        "three_d_estimation.estimator_backend.build_runtime_observation_model",
-        return_value=object(),
-    ), patch(
-        "three_d_estimation.estimator_backend."
-        "continuous_kernel_from_observation_model",
-        return_value=kernel,
+    with (
+        patch(
+            "three_d_estimation.estimator_backend.build_runtime_observation_model",
+            return_value=object(),
+        ),
+        patch(
+            "three_d_estimation.estimator_backend."
+            "continuous_kernel_from_observation_model",
+            return_value=kernel,
+        ),
     ):
         backend.initialize(context)
 
@@ -223,7 +232,9 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         first = _record(0, 7)
         second = _record(1, 7)
         backend.update(first)
+        self.assertEqual(recorder.measurement_counts, [])
         backend.update(second)
+        self.assertEqual(recorder.measurement_counts, [])
         backend.on_station_complete(7, (first, second))
 
         self.assertEqual(recorder.measurement_counts, [2])
@@ -255,7 +266,22 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         self.assertEqual(recorder.measurement_counts, [2, 3])
         self.assertEqual(result.final_snapshot.step_id, 2)
         self.assertEqual(result.final_snapshot.diagnostics["fit_kind"], "final")
-        np.testing.assert_array_equal(result.final_snapshot.predicted_spectrum, [3.0, 4.0])
+        np.testing.assert_array_equal(
+            result.final_snapshot.predicted_spectrum, [3.0, 4.0]
+        )
+
+    def test_runtime_mapping_proxy_is_normalized_before_model_build(self) -> None:
+        """A RunContext produced by MeasurementLog must initialize directly."""
+        context = _context()
+        readonly_context = replace(
+            context,
+            runtime_config=MappingProxyType(dict(context.runtime_config)),
+        )
+        backend = _backend(_RecordingEstimator())
+
+        _initialize_with_test_kernel(backend, readonly_context)
+
+        self.assertEqual(backend.snapshot().step_id, -1)
 
     def test_estimate_is_converted_to_surface_map_modes_and_strict_json(self) -> None:
         """MLE-specific arrays and clusters should satisfy generic output contracts."""
@@ -281,6 +307,49 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         )
         json.dumps(snapshot.diagnostics, allow_nan=False)
         json.dumps(result.diagnostics, allow_nan=False)
+
+    def test_planning_uses_the_latest_station_complete_mle(self) -> None:
+        """Backend planning should pass only fitted durable history and candidates."""
+        recorder = _RecordingEstimator()
+        backend = _backend(recorder)
+        _initialize_with_test_kernel(backend, _context())
+        record = _record(0, 4)
+        backend.update(record)
+        backend.on_station_complete(4, (record,))
+        action = MLEPlanningAction(
+            candidate_index=0,
+            detector_pose_xyz=(1.0, 1.0, 1.0),
+            shield_pair_ids=(1,),
+            fe_orientation_indices=(0,),
+            pb_orientation_indices=(1,),
+            information_gain_nats=1.0,
+            travel_cost=0.0,
+            rotation_radians=0.0,
+            score=1.0,
+            live_time_s_by_view=(2.0,),
+            expected_total_counts_by_view=(10.0,),
+        )
+        planned = MLEPlanningResult(
+            selected_action=action,
+            ranked_actions=(action,),
+            diagnostics={},
+        )
+        candidates = np.asarray([[1.0, 1.0, 1.0]])
+        planning_config = MLEPlanningConfig(shield_program_length=1)
+
+        with patch(
+            "three_d_estimation.estimator_backend.plan_next_measurement",
+            return_value=planned,
+        ) as planner:
+            result = backend.plan_next_action(
+                candidates,
+                planning_config=planning_config,
+            )
+
+        self.assertIs(result, planned)
+        self.assertIs(planner.call_args.args[0], backend.latest_estimate)
+        np.testing.assert_array_equal(planner.call_args.args[4], candidates)
+        self.assertEqual(planner.call_args.kwargs["current_pair_id"], 1)
 
     def test_station_hook_requires_the_exact_new_buffer_suffix(self) -> None:
         """A caller cannot warm-fit fabricated or already-completed station rows."""
@@ -326,9 +395,7 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "response_poisson"):
             _initialize_with_test_kernel(
                 count_backend,
-                _context(
-                    spectrum_count_method="joint_full_spectrum_generative"
-                ),
+                _context(spectrum_count_method="joint_full_spectrum_generative"),
             )
 
 
