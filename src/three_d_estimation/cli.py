@@ -192,8 +192,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help=(
-            "Private runtime scenario containing truth/environment/config/output, "
-            "but no acquisition actions."
+            "Private runtime scenario authored explicitly for this run, containing "
+            "truth/environment/config/output but no acquisition actions. The MLE "
+            "does not discover or generate this file."
         ),
     )
     ral_source.add_argument(
