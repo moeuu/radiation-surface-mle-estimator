@@ -56,3 +56,7 @@ uv sync
 uv run python scripts/check_repository_boundary.py
 uv run pytest
 ```
+
+## License
+
+Released under the [MIT License](LICENSE).
