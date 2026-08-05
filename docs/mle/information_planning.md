@@ -95,11 +95,12 @@ in the nuisance Schur complement. This stops common absolute-count changes from
 being mistaken for directional information.
 
 Shield pairs at each pose are optimized as a complete ordered station program with a
-bounded beam search, without repeating a pair. With the checked-in two-view RA-L
-program and beam width 64, all possible first views survive to the second expansion.
-Pair-specific vertical/support ambiguity utility participates in this search instead
-of being added only after the shield angles have already been chosen. The final
-station score is
+bounded beam search, without repeating a pair. The checked-in default and RA-L
+profiles select eight measurements per planned station. With beam width 64, the
+planner retains the best 64 partial programs after each expansion instead of
+enumerating every eight-pair permutation. Pair-specific vertical/support ambiguity
+utility participates in this search instead of being added only after the shield
+angles have already been chosen. The final station score is
 
 ```text
 score = IG + mean_selected_pair_ambiguity_utility

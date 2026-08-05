@@ -5,6 +5,12 @@ acquisition, Geant4, detector/shield/obstacle physics, spectrum generation, and 
 MeasurementLog v2 publication are provided by the versioned
 `rotating-shield-simulation-runtime` dependency.
 
+Sharing the runtime does not mean sharing estimator settings. MLE keeps its own
+surface dictionary, optimizer, Fisher planner, measurement budget, and compound
+stopping rule; PF keeps separate particles, SMC/RJ kernels, EIG planner, budgets,
+and stopping criteria. Only the physical workspace, action-execution protocol, and
+raw observation contract are common.
+
 ## Online estimator
 
 `OnlineMLESession` is the runtime-facing API. A controller passes each
@@ -72,7 +78,7 @@ uv run --project ../Rotating-shield-simulation-runtime \
 ## MLE information planning
 
 After a completed station, the MLE can rank runtime-supplied detector positions and
-jointly choose a short Fe/Pb orientation program:
+jointly choose an eight-measurement Fe/Pb orientation program:
 
 ```python
 planned = online_mle.plan_next_action(
@@ -146,8 +152,8 @@ MeasurementLog. New acquisition uses `rotating-shield-sim run-adaptive-session`.
 The online coarse MLE fits once after the current shield program closes its station;
 intermediate spectra are buffered without changing the estimate. It can then ask the
 runtime to refine promising 3-D candidate neighborhoods, rerank the returned
-reachable poses, and select the next position and short Fe/Pb program. No station
-count, view count, record count,
+reachable poses, and select the next position and eight-measurement Fe/Pb program.
+No station count, view count, record count,
 measurement route, or station list is fixed in advance. Source truth is never opened
 by the MLE process.
 

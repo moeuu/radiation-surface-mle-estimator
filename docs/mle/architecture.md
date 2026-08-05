@@ -37,10 +37,11 @@ strict physical/configuration preflight and passes a private scenario path direc
 to `rotating-shield-sim run-adaptive-session`. The runtime publishes reachable
 truth-free candidates and each durably staged spectrum. The MLE refits all causal
 history, asks the runtime for local candidate refinement when useful, and selects the
-next short station program. No action list, station count, shield program, or record
-count appears in the scenario. The immutable log is validated and bound to the final
-MLE report only after the compound stability/coverage/ambiguity/information stop rule
-fires. See the [RA-L closed-loop runbook](ral_full_simulation.md).
+next eight-measurement station program. No action list, station count, shield program,
+or record count appears in the scenario. The immutable log is validated and bound to
+the final MLE report only after the compound
+stability/coverage/ambiguity/information stop rule fires. See the [RA-L closed-loop
+runbook](ral_full_simulation.md).
 
 ## Data contracts and dimensions
 

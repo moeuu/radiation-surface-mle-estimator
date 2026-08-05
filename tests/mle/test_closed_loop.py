@@ -8,15 +8,17 @@ from typing import Any
 
 import numpy as np
 import pytest
+from runtime.adaptive_client import (
+    adaptive_step_request,
+    parse_adaptive_record,
+    parse_candidate_snapshot,
+    parse_run_context,
+)
 from runtime.measurement_log import MeasurementLogValidationError
 
 from three_d_estimation.closed_loop import (
     MLEStopConfig,
     RALClosedLoopResult,
-    _candidates,
-    _measurement_record,
-    _run_context,
-    _step_request,
     evaluate_mle_stop,
     run_ral_closed_loop,
 )
@@ -48,7 +50,7 @@ def _context_payload() -> dict[str, object]:
 
 def test_live_context_has_no_source_layout_or_precomputed_actions() -> None:
     """Estimator input should contain only truth-free context, never a plan."""
-    context = _run_context(_context_payload())
+    context = parse_run_context(_context_payload())
 
     assert context.run_id == "adaptive-test"
     assert context.source_layout_path is None
@@ -61,7 +63,7 @@ def test_live_context_rejects_realized_source_truth() -> None:
     payload["sources"] = [{"position": [1.0, 1.0, 0.0]}]
 
     with pytest.raises(MeasurementLogValidationError, match="realized truth"):
-        _run_context(payload)
+        parse_run_context(payload)
 
 
 def test_runtime_candidate_snapshot_is_shape_and_cost_checked() -> None:
@@ -69,15 +71,15 @@ def test_runtime_candidate_snapshot_is_shape_and_cost_checked() -> None:
     payload = {
         "candidate_poses_xyz": [[0.5, 0.5, 1.0], [1.5, 0.5, 1.0]],
         "travel_costs": [0.0, 1.0],
-        "allowed_pair_ids": [0, 7, 63],
+        "allowed_pair_ids": list(range(64)),
         "current_pair_id": 7,
     }
 
-    parsed = _candidates(payload)
+    parsed = parse_candidate_snapshot(payload)
 
     assert parsed == payload
     with pytest.raises(ValueError, match="align"):
-        _candidates({**payload, "travel_costs": [0.0]})
+        parse_candidate_snapshot({**payload, "travel_costs": [0.0]})
 
 
 def test_persisted_record_parser_preserves_exact_integer_spectrum() -> None:
@@ -101,7 +103,7 @@ def test_persisted_record_parser_preserves_exact_integer_spectrum() -> None:
         },
     }
 
-    record = _measurement_record(payload)
+    record = parse_adaptive_record(payload)
 
     assert record.spectrum_counts.dtype == np.dtype(np.int64)
     np.testing.assert_array_equal(record.spectrum_counts, [2, 3])
@@ -109,12 +111,13 @@ def test_persisted_record_parser_preserves_exact_integer_spectrum() -> None:
 
 def test_each_closed_loop_request_contains_exactly_one_observation() -> None:
     """MLE should re-fit after each runtime observation, not pre-plan a program."""
-    request = _step_request(
+    request = adaptive_step_request(
         candidate_index=4,
         fe_orientation_index=3,
         pb_orientation_index=6,
         dwell_time_s=30.0,
         station_id=9,
+        station_complete=True,
     )
 
     assert request == {
@@ -310,7 +313,7 @@ class _FakeRuntimeClient:
         self.candidates = {
             "candidate_poses_xyz": [[0.5, 0.5, 1.0]],
             "travel_costs": [0.0],
-            "allowed_pair_ids": [0],
+            "allowed_pair_ids": list(range(64)),
             "current_pair_id": 0,
         }
 
@@ -434,7 +437,7 @@ def test_closed_loop_sends_bootstrap_then_one_mle_selected_action(
     planning_path = tmp_path / "planning.json"
     mle_path.write_text("{}\n", encoding="utf-8")
     planning_path.write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(closed_loop, "_AdaptiveRuntimeClient", _FakeRuntimeClient)
+    monkeypatch.setattr(closed_loop, "AdaptiveRuntimeClient", _FakeRuntimeClient)
     monkeypatch.setattr(closed_loop, "OnlineMLESession", _FakeOnlineSession)
     monkeypatch.setattr(
         closed_loop.MLEConfig,
@@ -486,7 +489,7 @@ def test_closed_loop_groups_same_pose_shield_views_into_one_station(
     planning_path = tmp_path / "planning.json"
     mle_path.write_text("{}\n", encoding="utf-8")
     planning_path.write_text("{}\n", encoding="utf-8")
-    monkeypatch.setattr(closed_loop, "_AdaptiveRuntimeClient", _FakeRuntimeClient)
+    monkeypatch.setattr(closed_loop, "AdaptiveRuntimeClient", _FakeRuntimeClient)
     monkeypatch.setattr(closed_loop, "OnlineMLESession", _FakeOnlineProgramSession)
     monkeypatch.setattr(
         closed_loop.MLEConfig,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -13,6 +15,16 @@ from three_d_estimation.information_planner import (
     select_fisher_action,
 )
 from three_d_estimation.types import MLEEstimate, ObservationBatch, SurfacePatch
+
+
+def test_default_profiles_use_eight_measurements_per_station() -> None:
+    """Default MLE planning profiles must retain eight-view station blocks."""
+    root = Path(__file__).resolve().parents[2]
+
+    assert MLEPlanningConfig().shield_program_length == 8
+    for name in ("default_planning.json", "ral_full_planning.json"):
+        config = MLEPlanningConfig.load(root / "configs" / "mle" / name)
+        assert config.shield_program_length == 8
 
 
 def _orientations() -> np.ndarray:

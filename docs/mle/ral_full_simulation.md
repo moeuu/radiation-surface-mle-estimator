@@ -162,12 +162,13 @@ The live loop is:
 8. Steps 3--7 repeat until the compound stop rule passes or an emergency safety bound
    is reached.
 
-`ral_full_planning.json` currently uses `shield_program_length = 2`. This is a short,
-newly selected program—not the former fixed eight-view design. Its views are jointly
-optimized by station-block beam search rather than selected greedily one at a time.
-The estimate remains unchanged until both views are durable and the station closes,
-which preserves the statistical block used by fitting, grouped validation, and
-bootstrap.
+`ral_full_planning.json` uses `shield_program_length = 8`. These are eight newly
+selected measurements at one detector pose, not a fixed legacy shield sequence. The
+eight distinct Fe/Pb pairs are jointly optimized by station-block beam search rather
+than selected greedily one at a time. The estimate remains unchanged until all eight
+views are durable and the station closes, which preserves the statistical block used
+by fitting, grouped validation, and bootstrap. The initial bootstrap station remains
+a single measurement because no data-conditioned MLE exists before it.
 
 The stop rule is estimator-owned and loaded from `ral_full_stop.json`. It requires all
 of the following, rather than information gain alone:

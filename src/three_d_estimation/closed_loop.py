@@ -3,23 +3,26 @@
 from __future__ import annotations
 
 import json
-import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 import numpy as np
-from runtime.measurement_log import MeasurementLogRecord
-from runtime.records import RunContext, validate_truth_free_estimator_input
+from runtime.adaptive_client import (
+    AdaptiveRuntimeClient,
+    adaptive_step_request,
+    candidate_index_for_pose,
+    parse_adaptive_record,
+    parse_candidate_snapshot,
+    parse_run_context,
+)
 
 from .config import MLEConfig
 from .information_planner import MLEPlanningConfig, MLEPlanningResult
 from .online import OnlineMLESession
 from .ral import validate_ral_measurement_log
-
-_EVENT_PREFIX = "adaptive-session "
 
 
 @dataclass(frozen=True, slots=True)
@@ -366,249 +369,6 @@ def _strict_fields(
         )
 
 
-def _run_context(payload: object) -> RunContext:
-    """Parse one truth-free runtime handshake context."""
-    if not isinstance(payload, dict):
-        raise TypeError("Adaptive runtime context must be an object.")
-    validate_truth_free_estimator_input(payload, path="adaptive.context")
-    expected = {
-        "repository_commit",
-        "runtime_config",
-        "environment",
-        "sim_backend",
-        "spectrum_count_method",
-        "isotopes",
-        "obstacle_layout_path",
-        "source_rate_model",
-        "metadata",
-        "run_id",
-        "source_rate_semantics",
-        "forward_model_manifest",
-        "runtime_config_sha256",
-        "schema_version",
-    }
-    _strict_fields(payload, expected, name="adaptive context")
-    return RunContext(
-        repository_commit=payload["repository_commit"],
-        runtime_config=payload["runtime_config"],
-        environment=payload["environment"],
-        sim_backend=payload["sim_backend"],
-        spectrum_count_method=payload["spectrum_count_method"],
-        isotopes=tuple(payload["isotopes"]),
-        obstacle_layout_path=payload["obstacle_layout_path"],
-        source_layout_path=None,
-        source_rate_model=payload["source_rate_model"],
-        metadata=payload["metadata"],
-        run_id=payload["run_id"],
-        source_rate_semantics=payload["source_rate_semantics"],
-        forward_model_manifest=payload["forward_model_manifest"],
-        runtime_config_sha256=payload["runtime_config_sha256"],
-        schema_version=payload["schema_version"],
-    )
-
-
-def _measurement_record(payload: object) -> MeasurementLogRecord:
-    """Parse one already-persisted runtime record without numeric coercion."""
-    if not isinstance(payload, dict):
-        raise TypeError("Adaptive runtime record must be an object.")
-    validate_truth_free_estimator_input(payload, path="adaptive.record")
-    expected = {
-        "step_id",
-        "action_id",
-        "station_id",
-        "detector_pose_xyz",
-        "detector_quat_wxyz",
-        "fe_orientation_index",
-        "pb_orientation_index",
-        "live_time_s",
-        "travel_time_s",
-        "shield_actuation_time_s",
-        "energy_bin_edges_keV",
-        "spectrum_counts",
-        "metadata",
-    }
-    _strict_fields(payload, expected, name="adaptive record")
-    raw_counts = np.asarray(payload["spectrum_counts"])
-    if raw_counts.ndim != 1 or not np.issubdtype(raw_counts.dtype, np.integer):
-        raise TypeError("Adaptive spectrum_counts must contain exact integers.")
-    return MeasurementLogRecord(
-        step_id=payload["step_id"],
-        action_id=payload["action_id"],
-        station_id=payload["station_id"],
-        detector_pose_xyz=payload["detector_pose_xyz"],
-        detector_quat_wxyz=payload["detector_quat_wxyz"],
-        fe_orientation_index=payload["fe_orientation_index"],
-        pb_orientation_index=payload["pb_orientation_index"],
-        live_time_s=payload["live_time_s"],
-        travel_time_s=payload["travel_time_s"],
-        shield_actuation_time_s=payload["shield_actuation_time_s"],
-        energy_bin_edges_keV=np.asarray(
-            payload["energy_bin_edges_keV"],
-            dtype=np.float64,
-        ),
-        spectrum_counts=np.asarray(raw_counts, dtype=np.int64),
-        metadata=payload["metadata"],
-    )
-
-
-def _candidates(payload: object) -> dict[str, object]:
-    """Validate one runtime-owned candidate snapshot."""
-    if not isinstance(payload, dict):
-        raise TypeError("Adaptive candidates must be an object.")
-    validate_truth_free_estimator_input(payload, path="adaptive.candidates")
-    _strict_fields(
-        payload,
-        {
-            "candidate_poses_xyz",
-            "travel_costs",
-            "allowed_pair_ids",
-            "current_pair_id",
-        },
-        name="adaptive candidates",
-    )
-    poses = np.asarray(payload["candidate_poses_xyz"], dtype=np.float64)
-    costs = np.asarray(payload["travel_costs"], dtype=np.float64)
-    if poses.ndim != 2 or poses.shape[1:] != (3,) or not len(poses):
-        raise ValueError("Runtime candidate poses must have nonempty shape (C, 3).")
-    if costs.shape != (len(poses),) or np.any(costs < 0.0):
-        raise ValueError("Runtime travel costs must align with candidate poses.")
-    return dict(payload)
-
-
-class _AdaptiveRuntimeClient:
-    """Drive the shared runtime CLI without reading its private scenario."""
-
-    def __init__(
-        self,
-        scenario_path: str | Path,
-        *,
-        runtime_root: str | Path,
-        output_hook: Callable[[str], None],
-    ) -> None:
-        """Start one persistent runtime-owned adaptive session."""
-        scenario = Path(scenario_path).expanduser().resolve()
-        if not scenario.is_file():
-            raise FileNotFoundError(f"Private RA-L scenario is missing: {scenario}")
-        root = Path(runtime_root).expanduser().resolve()
-        command = [
-            "uv",
-            "run",
-            "--project",
-            root.as_posix(),
-            "rotating-shield-sim",
-            "run-adaptive-session",
-            scenario.as_posix(),
-            "--private-scene-profile",
-            "ral-mix9",
-        ]
-        self.command = command
-        self.output_hook = output_hook
-        self.process = subprocess.Popen(
-            command,
-            cwd=root,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-        )
-        self.input: TextIO | None = self.process.stdin
-        self.output: TextIO | None = self.process.stdout
-        if self.input is None or self.output is None:
-            self.process.kill()
-            raise RuntimeError("Shared runtime did not expose adaptive pipes.")
-
-    def read_event(self) -> dict[str, Any]:
-        """Read the next framed runtime event while relaying diagnostic output."""
-        assert self.output is not None
-        for raw_line in self.output:
-            line = raw_line.rstrip("\n")
-            if not line.startswith(_EVENT_PREFIX):
-                self.output_hook(line)
-                continue
-            payload = json.loads(line.removeprefix(_EVENT_PREFIX))
-            if not isinstance(payload, dict):
-                raise TypeError("Adaptive runtime event must be an object.")
-            return payload
-        return_code = self.process.poll()
-        raise RuntimeError(
-            "Shared adaptive runtime closed before its next event; "
-            f"return_code={return_code}."
-        )
-
-    def request(self, payload: Mapping[str, object]) -> dict[str, Any]:
-        """Send one controller decision and wait for its causal response."""
-        if self.input is None:
-            raise RuntimeError("Adaptive runtime input is closed.")
-        self.input.write(json.dumps(dict(payload), allow_nan=False) + "\n")
-        self.input.flush()
-        return self.read_event()
-
-    def finalize(self) -> dict[str, Any]:
-        """Finalize the runtime log and require a clean process exit."""
-        event = self.request({"type": "finalize"})
-        if self.input is not None:
-            self.input.close()
-            self.input = None
-        return_code = self.process.wait()
-        if return_code != 0:
-            raise subprocess.CalledProcessError(return_code, self.command)
-        return event
-
-    def abort(self) -> None:
-        """Best-effort close of an incomplete acquisition session."""
-        if self.process.poll() is not None:
-            return
-        try:
-            self.request({"type": "abort"})
-        except (BrokenPipeError, OSError, RuntimeError, ValueError):
-            self.process.terminate()
-        finally:
-            try:
-                self.process.wait(timeout=10.0)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
-
-
-def _step_request(
-    *,
-    candidate_index: int,
-    fe_orientation_index: int,
-    pb_orientation_index: int,
-    dwell_time_s: float,
-    station_id: int,
-    station_complete: bool = True,
-) -> dict[str, object]:
-    """Build one observation request within a dynamic pose station."""
-    return {
-        "type": "step",
-        "candidate_index": int(candidate_index),
-        "fe_orientation_index": int(fe_orientation_index),
-        "pb_orientation_index": int(pb_orientation_index),
-        "dwell_time_s": float(dwell_time_s),
-        "station_id": int(station_id),
-        "station_complete": bool(station_complete),
-    }
-
-
-def _candidate_index_for_pose(
-    candidates: Mapping[str, object],
-    pose_xyz: Sequence[float],
-) -> int:
-    """Locate one exact runtime-owned candidate pose after a causal update."""
-    poses = np.asarray(candidates["candidate_poses_xyz"], dtype=float)
-    target = np.asarray(pose_xyz, dtype=float)
-    matches = np.flatnonzero(
-        np.all(np.isclose(poses, target[None, :], rtol=0.0, atol=1.0e-10), axis=1)
-    )
-    if matches.size != 1:
-        raise RuntimeError(
-            "The runtime candidate domain did not preserve the selected station pose."
-        )
-    return int(matches[0])
-
-
 def run_ral_closed_loop(
     scenario_path: str | Path,
     *,
@@ -646,9 +406,10 @@ def run_ral_closed_loop(
         maximum_expected_information_gain_nats=threshold,
         low_information_patience=int(low_information_patience),
     )
-    client = _AdaptiveRuntimeClient(
+    client = AdaptiveRuntimeClient(
         scenario_path,
         runtime_root=runtime_root,
+        private_scene_profile="ral-mix9",
         output_hook=output_hook,
     )
     online: OnlineMLESession | None = None
@@ -663,8 +424,8 @@ def run_ral_closed_loop(
             raise ValueError(
                 "Shared runtime returned an incompatible adaptive handshake."
             )
-        context = _run_context(ready["context"])
-        candidates = _candidates(ready["candidates"])
+        context = parse_run_context(ready["context"])
+        candidates = parse_candidate_snapshot(ready["candidates"])
         bootstrap = ready["bootstrap"]
         if not isinstance(bootstrap, dict):
             raise TypeError("Runtime bootstrap selection must be an object.")
@@ -693,12 +454,13 @@ def run_ral_closed_loop(
         )
         if online.dashboard_url is not None and dashboard_url_hook is not None:
             dashboard_url_hook(online.dashboard_url)
-        request = _step_request(
+        request = adaptive_step_request(
             candidate_index=bootstrap["candidate_index"],
             fe_orientation_index=bootstrap["fe_orientation_index"],
             pb_orientation_index=bootstrap["pb_orientation_index"],
             dwell_time_s=planning_config.live_time_s,
             station_id=0,
+            station_complete=True,
         )
         pending_program: list[tuple[int, int, float]] = []
         pending_pose: tuple[float, float, float] | None = None
@@ -710,8 +472,8 @@ def run_ral_closed_loop(
             _strict_fields(event, {"type", "record", "candidates"}, name="record event")
             if event.get("type") != "record":
                 raise ValueError("Shared runtime did not return a record event.")
-            record = _measurement_record(event["record"])
-            candidates = _candidates(event["candidates"])
+            record = parse_adaptive_record(event["record"])
+            candidates = parse_candidate_snapshot(event["candidates"])
             station_complete = record.metadata.get("station_complete") is True
             online.receive_persisted(record, station_complete=station_complete)
             if len(online.records) >= int(max_measurements):
@@ -722,8 +484,8 @@ def run_ral_closed_loop(
                         "Pending station program lost its pose metadata."
                     )
                 fe_index, pb_index, dwell_time = pending_program.pop(0)
-                request = _step_request(
-                    candidate_index=_candidate_index_for_pose(candidates, pending_pose),
+                request = adaptive_step_request(
+                    candidate_index=candidate_index_for_pose(candidates, pending_pose),
                     fe_orientation_index=fe_index,
                     pb_orientation_index=pb_index,
                     dwell_time_s=dwell_time,
@@ -762,7 +524,7 @@ def run_ral_closed_loop(
                     raise ValueError(
                         "Shared runtime did not return refined candidates."
                     )
-                candidates = _candidates(refined_event["candidates"])
+                candidates = parse_candidate_snapshot(refined_event["candidates"])
                 plan = online.plan_next_action(
                     candidates["candidate_poses_xyz"],
                     planning_config=planning_config,
@@ -798,7 +560,7 @@ def run_ral_closed_loop(
             pending_pose = selected.detector_pose_xyz
             pending_station_id = int(record.station_id) + 1
             fe_index, pb_index, dwell_time = pending_program.pop(0)
-            request = _step_request(
+            request = adaptive_step_request(
                 candidate_index=selected.candidate_index,
                 fe_orientation_index=fe_index,
                 pb_orientation_index=pb_index,

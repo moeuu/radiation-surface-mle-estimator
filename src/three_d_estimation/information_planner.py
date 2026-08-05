@@ -27,7 +27,7 @@ class MLEPlanningConfig:
     """Configure local-Fisher measurement-pose and shield-program selection."""
 
     live_time_s: float = 10.0
-    shield_program_length: int = 2
+    shield_program_length: int = 8
     max_active_source_parameters: int = 48
     max_total_source_parameters: int = 96
     active_strength_fraction: float = 1.0e-3

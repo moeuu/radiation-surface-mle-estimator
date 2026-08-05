@@ -17,7 +17,7 @@
   "ranked_action_limit": 32,
   "response_correlation_reduction_weight": 0.25,
   "rotation_cost_weight": 0.0,
-  "shield_program_length": 2,
+  "shield_program_length": 8,
   "shield_program_beam_width": 64,
   "source_strength_scale_floor_cps_1m": 1.0,
   "support_hypothesis_separation_weight": 0.5,
