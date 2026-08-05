@@ -18,6 +18,9 @@ def _dense_density_operator(
     response: np.ndarray,
     areas: np.ndarray,
     isotope_count: int,
+    *,
+    diagnostics: dict[str, object] | None = None,
+    traversal_count: list[int] | None = None,
 ) -> BlockResponseOperator:
     """Return a multi-block operator equivalent to one materialized response."""
     observation_shape = response.shape[:-2]
@@ -28,6 +31,8 @@ def _dense_density_operator(
 
     def factory():
         """Yield four blocks to exercise both streamed dimensions."""
+        if traversal_count is not None:
+            traversal_count[0] += 1
         row_split = max(1, density_matrix.shape[0] // 2)
         column_split = max(1, density_matrix.shape[1] // 2)
         for row_start, row_stop in (
@@ -51,7 +56,28 @@ def _dense_density_operator(
         patch_count,
         isotope_count,
         factory,
+        diagnostics=diagnostics,
     )
+
+
+def test_response_sums_share_one_operator_traversal() -> None:
+    """Row and column scaling sums must be accumulated in one block pass."""
+    response = np.arange(1.0, 13.0).reshape(3, 2, 2, 1)
+    traversals = [0]
+    operator = _dense_density_operator(
+        response,
+        np.ones(2),
+        isotope_count=1,
+        traversal_count=traversals,
+    )
+
+    row_sums = operator.row_sums()
+    column_sums = operator.column_sums()
+
+    assert traversals == [1]
+    matrix = response.reshape(6, 2)
+    np.testing.assert_array_equal(row_sums, np.sum(matrix, axis=1))
+    np.testing.assert_array_equal(column_sums, np.sum(matrix, axis=0))
 
 
 def test_surface_map_recovers_piecewise_smooth_density() -> None:
@@ -401,6 +427,100 @@ def test_matrix_free_cpu_gpu_solver_equivalence_when_available() -> None:
         cpu.densities_cps_1m_m2,
         rtol=1.0e-8,
         atol=1.0e-9,
+    )
+    solver_performance = operator.diagnostics["performance"]["solver"]
+    assert solver_performance["response_cache"]["mode"] == "dense_cuda_cache"
+    assert solver_performance["response_product_calls"] > 0
+
+
+def test_cuda_response_cache_appends_and_gathers_measurement_rows() -> None:
+    """Online prefixes and bootstrap resamples must reuse resident float64 rows."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    areas = np.asarray([1.0, 1.5])
+    response = np.asarray(
+        [
+            [[[1.0], [0.2]], [[0.7], [0.4]]],
+            [[[0.3], [1.1]], [[0.8], [0.5]]],
+        ],
+        dtype=np.float64,
+    )
+    cache: dict[str, object] = {}
+    common = {
+        "device_cache_key": "test-response-geometry",
+    }
+    first = _dense_density_operator(
+        response[:1],
+        areas,
+        isotope_count=1,
+        diagnostics={**common, "measurement_row_keys": ["a"]},
+    )
+    extended = _dense_density_operator(
+        response,
+        areas,
+        isotope_count=1,
+        diagnostics={**common, "measurement_row_keys": ["a", "b"]},
+    )
+    config = SurfaceMapConfig(max_iterations=40, check_interval=10)
+    first_observed = np.asarray([[7.0, 5.0]])
+    fit_surface_map_poisson_operator(
+        first_observed,
+        first,
+        areas,
+        config=config,
+        use_gpu=True,
+        persistent_response_cache=cache,
+    )
+    fit_surface_map_poisson_operator(
+        np.asarray([[7.0, 5.0], [4.0, 6.0]]),
+        extended,
+        areas,
+        config=config,
+        use_gpu=True,
+        persistent_response_cache=cache,
+    )
+    prefix_cache = extended.diagnostics["performance"]["solver"]["response_cache"]
+
+    assert prefix_cache["mode"] == "persistent_cuda_prefix_append"
+    assert prefix_cache["persistent_prefix_measurements"] == 1
+    assert prefix_cache["host_to_device_bytes"] == response[1:].nbytes
+
+    resampled_indices = np.asarray([1, 0, 1])
+    resampled = _dense_density_operator(
+        response[resampled_indices],
+        areas,
+        isotope_count=1,
+        diagnostics={
+            **common,
+            "measurement_row_keys": ["b", "a", "b"],
+        },
+    )
+    gpu = fit_surface_map_poisson_operator(
+        np.asarray([[4.0, 6.0], [7.0, 5.0], [4.0, 6.0]]),
+        resampled,
+        areas,
+        config=config,
+        use_gpu=True,
+        persistent_response_cache=cache,
+    )
+    cpu = fit_surface_map_poisson_operator(
+        np.asarray([[4.0, 6.0], [7.0, 5.0], [4.0, 6.0]]),
+        resampled,
+        areas,
+        config=config,
+    )
+    gathered_cache = resampled.diagnostics["performance"]["solver_calls"][0][
+        "response_cache"
+    ]
+
+    assert gathered_cache["mode"] == "persistent_cuda_row_gather"
+    assert gathered_cache["host_to_device_bytes"] == 0
+    np.testing.assert_allclose(
+        gpu.densities_cps_1m_m2,
+        cpu.densities_cps_1m_m2,
+        rtol=2.0e-12,
+        atol=2.0e-12,
     )
 
 

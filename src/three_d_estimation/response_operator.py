@@ -74,6 +74,11 @@ class ResponseOperator(Protocol):
     def column_sums(self) -> NDArray[np.float64]:
         """Return non-negative absolute column sums."""
 
+    def response_sums(
+        self,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return row and column sums from one shared traversal."""
+
     def select_measurements(self, indices: Sequence[int]) -> "ResponseOperator":
         """Return a view containing complete selected measurement rows."""
 
@@ -156,23 +161,31 @@ class BlockResponseOperator:
 
     def row_sums(self) -> NDArray[np.float64]:
         """Return cached streamed absolute row sums."""
-        if self._row_sums is None:
-            values = np.zeros(self.observation_count, dtype=np.float64)
-            for block in self.iter_blocks():
-                values[block.observation_indices] += np.sum(block.values, axis=1)
-            values.setflags(write=False)
-            self._row_sums = values
+        self.response_sums()
+        assert self._row_sums is not None
         return self._row_sums
 
     def column_sums(self) -> NDArray[np.float64]:
         """Return cached streamed absolute column sums."""
-        if self._column_sums is None:
-            values = np.zeros(self.source_count, dtype=np.float64)
-            for block in self.iter_blocks():
-                values[block.source_indices] += np.sum(block.values, axis=0)
-            values.setflags(write=False)
-            self._column_sums = values
+        self.response_sums()
+        assert self._column_sums is not None
         return self._column_sums
+
+    def response_sums(
+        self,
+    ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+        """Return cached row and column sums using at most one traversal."""
+        if self._row_sums is None or self._column_sums is None:
+            row_values = np.zeros(self.observation_count, dtype=np.float64)
+            column_values = np.zeros(self.source_count, dtype=np.float64)
+            for block in self.iter_blocks():
+                row_values[block.observation_indices] += np.sum(block.values, axis=1)
+                column_values[block.source_indices] += np.sum(block.values, axis=0)
+            row_values.setflags(write=False)
+            column_values.setflags(write=False)
+            self._row_sums = row_values
+            self._column_sums = column_values
+        return self._row_sums, self._column_sums
 
     def materialize(self, *, maximum_bytes: int | None = None) -> NDArray[np.float64]:
         """Materialize the operator for tests and bounded diagnostics only."""

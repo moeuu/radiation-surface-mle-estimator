@@ -300,16 +300,37 @@ NPZ member order and ZIP timestamps are fixed. The NPZ includes the SHA-256 of t
 fails closed if the configured device is unavailable; smaller default profiles remain
 CPU-friendly.
 
-`--gpu` runs shared physical-kernel evaluation and streamed optimization through
-PyTorch tensors on `gpu_device` (default `cuda`). The request is strict: missing
+`--gpu` runs shared physical-kernel evaluation and optimization through PyTorch
+tensors on `gpu_device` (default `cuda`). The request is strict: missing
 PyTorch/device support raises an error rather than falling back. `gpu_dtype` accepts
-`float32` or `float64`; the default is `float64`.
+`float32` or `float64`; the RA-L profiles retain `float64`.
 
-`response_energy_chunk_size` and `response_patch_chunk_size` bound streamed spectral
-blocks. `response_cache_dir` stores content-addressed per-measurement blocks and
-prefix-reuse diagnostics. The solver reports peak block bytes, which is independent
-of total `M x B x G x I` size for fixed chunks. Materialized mode remains available
-only for small deterministic diagnostics and CPU/GPU equivalence tests.
+`response_measurement_chunk_size`, `response_energy_chunk_size`, and
+`response_patch_chunk_size` bound streamed spectral blocks. The default measurement
+chunk is eight, so one complete station enters each shared-runtime kernel call
+together. Gamma-line detector pulses are constructed once per line and reused across
+all measurement/patch chunks. `response_cache_dir` stores content-addressed
+per-measurement blocks and
+prefix-reuse diagnostics. CPU cache misses are distributed over a bounded process
+pool controlled by `response_worker_count`; zero selects the hardware-aware default,
+while CUDA kernel construction remains single-launch-streamed to avoid competing
+allocations. During a CUDA solve, the exact float64 response is opportunistically
+cached as one device matrix when it fits within
+`response_device_cache_fraction` of currently free VRAM. This removes all iterative
+host-to-device response transfers. If it does not fit, the solver preserves the same
+objective and falls back to bounded streamed blocks. Construction time, solver time,
+cache bytes, response-product calls, and estimated iterative transfer bytes are
+included in response-operator diagnostics. Materialized builder mode remains
+available only for small deterministic diagnostics and equivalence tests.
+
+The device cache persists across causal station fits. A station extension copies the
+resident prefix device-to-device and transfers only the new eight rows; bootstrap
+station permutations and duplicate rows are gathered from the same resident matrix
+without rebuilding physics or transferring response blocks from the host. Row sums,
+column sums, and device-cache population share one block traversal. Final bootstrap
+replicates are scheduled in exact concurrent batches controlled by
+`bootstrap_batch_size`; each replicate retains its original station resample,
+float64 solver, convergence checks, refinement, and debias path.
 
 Online and final spatial budgets are separate: `online_patch_spacing_m` and
 `online_coarse_to_fine_levels` define low-latency causal fits, while

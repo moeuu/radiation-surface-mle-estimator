@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass, fields, replace
 from hashlib import sha256
 import json
+from multiprocessing import get_context
+import os
 from pathlib import Path
+from time import perf_counter
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -30,6 +35,119 @@ from .response_operator import (
     ResponseBlock,
     atomic_save_npy,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedSpectralLine:
+    """Store one position-independent pulse and its line-specific kernel."""
+
+    isotope_index: int
+    isotope: str
+    weight: float
+    kernel: ContinuousKernel
+    pulse: NDArray[np.float64]
+
+
+@dataclass(frozen=True, slots=True)
+class _SpectralProcessContext:
+    """Store immutable inputs shared by CPU response worker processes."""
+
+    detector_positions: NDArray[np.float64]
+    fe_indices: NDArray[np.int64]
+    pb_indices: NDArray[np.int64]
+    live_times: NDArray[np.float64]
+    areas: NDArray[np.float64]
+    quadrature_points: NDArray[np.float64]
+    quadrature_weights: NDArray[np.float64]
+    isotope_count: int
+    prepared_lines: tuple[_PreparedSpectralLine, ...]
+    kernel_chunk_size: int
+
+
+_SPECTRAL_PROCESS_CONTEXT: _SpectralProcessContext | None = None
+
+
+def _initialize_spectral_process(context: _SpectralProcessContext) -> None:
+    """Initialize one CPU worker without nested Torch oversubscription."""
+    global _SPECTRAL_PROCESS_CONTEXT
+    _SPECTRAL_PROCESS_CONTEXT = context
+    try:
+        import torch
+
+        torch.set_num_threads(1)
+    except (ImportError, RuntimeError):
+        pass
+
+
+def _calculate_spectral_context_task(
+    context: _SpectralProcessContext,
+    task: tuple[tuple[int, ...], int, int],
+) -> NDArray[np.float64]:
+    """Calculate one exact measurement-batched response chunk."""
+    measurement_indices, patch_start, patch_stop = task
+    selected_measurements = np.asarray(measurement_indices, dtype=np.int64)
+    selected_points = context.quadrature_points[patch_start:patch_stop]
+    selected_weights = context.quadrature_weights[patch_start:patch_stop]
+    selected_areas = context.areas[patch_start:patch_stop]
+    quadrature_count = int(selected_points.shape[1])
+    source_points = selected_points.reshape(-1, 3)
+    response = np.zeros(
+        (
+            selected_measurements.size,
+            context.prepared_lines[0].pulse.size,
+            patch_stop - patch_start,
+            context.isotope_count,
+        ),
+        dtype=np.float64,
+    )
+    for prepared in context.prepared_lines:
+        raw = np.asarray(
+            prepared.kernel.kernel_values_selected_pairs_for_detectors(
+                isotope=prepared.isotope,
+                detector_positions=context.detector_positions[selected_measurements],
+                sources=source_points,
+                fe_indices=context.fe_indices[selected_measurements],
+                pb_indices=context.pb_indices[selected_measurements],
+                chunk_size=context.kernel_chunk_size,
+            ),
+            dtype=np.float64,
+        )
+        expected_shape = (
+            selected_measurements.size,
+            (patch_stop - patch_start) * quadrature_count,
+        )
+        if raw.shape != expected_shape:
+            raise ValueError(
+                f"Selected-pair kernel returned {raw.shape}, expected {expected_shape}."
+            )
+        values = raw.reshape(
+            selected_measurements.size,
+            patch_stop - patch_start,
+            quadrature_count,
+        )
+        spatial = context.live_times[selected_measurements, None] * np.einsum(
+            "mgq,gq->mg",
+            values,
+            selected_weights,
+            optimize=True,
+        )
+        response[:, :, :, prepared.isotope_index] += (
+            prepared.weight
+            * prepared.pulse[None, :, None]
+            * spatial[:, None, :]
+            * selected_areas[None, None, :]
+        )
+    return response
+
+
+def _calculate_spectral_process_task(
+    task: tuple[tuple[int, ...], int, int],
+) -> NDArray[np.float64]:
+    """Calculate one measurement-batched response chunk in a CPU worker."""
+    context = _SPECTRAL_PROCESS_CONTEXT
+    if context is None:
+        raise RuntimeError("Spectral response worker context is unavailable.")
+    return _calculate_spectral_context_task(context, task)
 
 
 def _positive_integer(value: object, *, name: str) -> int:
@@ -810,8 +928,10 @@ def build_spectral_response_operator(
     kernel: ContinuousKernel,
     *,
     chunk_size: int = 262144,
+    measurement_chunk_size: int = 8,
     energy_chunk_size: int = 128,
     patch_chunk_size: int = 128,
+    worker_count: int = 0,
     cache_directory: str | Path | None = None,
     continuum_to_peak: float = COMPTON_CONTINUUM_TO_PEAK,
     backscatter_fraction: float = BACKSCATTER_FRACTION,
@@ -831,8 +951,20 @@ def build_spectral_response_operator(
     only blocks belonging to newly appended measurements.
     """
     kernel_chunk_size = _positive_integer(chunk_size, name="chunk_size")
+    measurement_step = _positive_integer(
+        measurement_chunk_size,
+        name="measurement_chunk_size",
+    )
     energy_step = _positive_integer(energy_chunk_size, name="energy_chunk_size")
     patch_step = _positive_integer(patch_chunk_size, name="patch_chunk_size")
+    if isinstance(worker_count, (bool, np.bool_)) or not isinstance(
+        worker_count,
+        (int, np.integer),
+    ):
+        raise TypeError("worker_count must be an integer.")
+    if int(worker_count) < 0:
+        raise ValueError("worker_count must be nonnegative.")
+    resolved_workers = 1 if int(worker_count) == 0 else int(worker_count)
     (
         detector_positions,
         fe_indices,
@@ -855,6 +987,43 @@ def build_spectral_response_operator(
         )
         for isotope in names
     }
+    prepared_lines = tuple(
+        _PreparedSpectralLine(
+            isotope_index=isotope_index,
+            isotope=isotope,
+            weight=float(line["weight"]),
+            kernel=_kernel_for_line(
+                kernel,
+                isotope,
+                line,
+                int(line.get("transport_line_index", float(line_index))),
+                require_line_resolved=require_line_resolved,
+            ),
+            pulse=detector_response_kernel_for_incident_gamma(
+                centers,
+                float(line["energy_keV"]),
+                resolution,
+                cebr3_efficiency,
+                bin_width,
+                continuum_to_peak=float(continuum_to_peak),
+                backscatter_fraction=float(backscatter_fraction),
+            ),
+        )
+        for isotope_index, isotope in enumerate(names)
+        for line_index, line in enumerate(lines_by_isotope[isotope])
+    )
+    work_items = (
+        measurement_count
+        * patch_count
+        * quadrature_count
+        * sum(len(lines) for lines in lines_by_isotope.values())
+    )
+    if int(worker_count) == 0 and work_items >= 250_000:
+        resolved_workers = min(4, max(1, (os.cpu_count() or 1) // 2))
+    if bool(kernel.use_gpu):
+        # Concurrent launches through one shared runtime kernel increase device
+        # memory pressure and do not improve the already-batched CUDA path.
+        resolved_workers = 1
     energies_by_isotope = {
         isotope: tuple(float(line["energy_keV"]) for line in lines)
         for isotope, lines in lines_by_isotope.items()
@@ -875,6 +1044,17 @@ def build_spectral_response_operator(
         backscatter_fraction=backscatter_fraction,
     )
     cache_stats = {"hits": 0, "misses": 0, "blocks": 0}
+    performance: dict[str, object] = {
+        "response_construction": {
+            "worker_count": resolved_workers,
+            "measurement_chunk_size": measurement_step,
+            "estimated_kernel_work_items": work_items,
+            "iterations": 0,
+            "kernel_batch_calls": 0,
+            "kernel_batched_measurements": 0,
+            "elapsed_seconds": 0.0,
+        }
+    }
 
     def block_path(
         measurement_index: int,
@@ -898,138 +1078,229 @@ def build_spectral_response_operator(
             / f"g{patch_start}-{patch_stop}_b{energy_start}-{energy_stop}.npy"
         )
 
-    def calculate_patch_chunk(
-        measurement_index: int,
+    def calculate_patch_batch(
+        measurement_indices: tuple[int, ...],
         patch_start: int,
         patch_stop: int,
     ) -> NDArray[np.float64]:
-        """Calculate one bounded full-energy density response patch chunk."""
-        selected_points = quadrature_points[patch_start:patch_stop]
-        selected_weights = quadrature_weights[patch_start:patch_stop]
-        selected_areas = areas[patch_start:patch_stop]
-        source_points = selected_points.reshape(-1, 3)
-        response = np.zeros(
-            (centers.size, patch_stop - patch_start, len(names)),
-            dtype=np.float64,
+        """Calculate one bounded measurement and patch response batch."""
+        return _calculate_spectral_context_task(
+            process_context,
+            (measurement_indices, patch_start, patch_stop),
         )
-        for isotope_index, isotope in enumerate(names):
-            for line_index, line in enumerate(lines_by_isotope[isotope]):
-                transport_line_index = int(
-                    line.get("transport_line_index", float(line_index))
+
+    tasks = tuple(
+        (measurement_index, patch_start, min(patch_start + patch_step, patch_count))
+        for measurement_index in range(measurement_count)
+        for patch_start in range(0, patch_count, patch_step)
+    )
+    process_context = _SpectralProcessContext(
+        detector_positions=detector_positions,
+        fe_indices=fe_indices,
+        pb_indices=pb_indices,
+        live_times=live_times,
+        areas=areas,
+        quadrature_points=quadrature_points,
+        quadrature_weights=quadrature_weights,
+        isotope_count=len(names),
+        prepared_lines=prepared_lines,
+        kernel_chunk_size=kernel_chunk_size,
+    )
+
+    def task_requires_calculation(task: tuple[int, int, int]) -> bool:
+        """Return whether any energy block for one patch task is absent."""
+        measurement_index, patch_start, patch_stop = task
+        return any(
+            path is None or not path.exists()
+            for path in (
+                block_path(
+                    measurement_index,
+                    patch_start,
+                    patch_stop,
+                    energy_start,
+                    min(energy_start + energy_step, centers.size),
                 )
-                line_kernel = _kernel_for_line(
-                    kernel,
-                    isotope,
-                    line,
-                    transport_line_index,
-                    require_line_resolved=require_line_resolved,
+                for energy_start in range(0, centers.size, energy_step)
+            )
+        )
+
+    def build_task(
+        task: tuple[int, int, int],
+        calculated_response: NDArray[np.float64] | None = None,
+    ) -> tuple[tuple[ResponseBlock, ...], int, int]:
+        """Build or load one patch chunk and return deterministic energy blocks."""
+        measurement_index, patch_start, patch_stop = task
+        energy_ranges = tuple(
+            (start, min(start + energy_step, centers.size))
+            for start in range(0, centers.size, energy_step)
+        )
+        paths = tuple(
+            block_path(
+                measurement_index,
+                patch_start,
+                patch_stop,
+                energy_start,
+                energy_stop,
+            )
+            for energy_start, energy_stop in energy_ranges
+        )
+        missing = any(path is None or not path.exists() for path in paths)
+        calculated = calculated_response
+        if missing and calculated is None:
+            calculated = calculate_patch_batch(
+                (measurement_index,),
+                patch_start,
+                patch_stop,
+            )[0]
+        source_indices = np.arange(
+            patch_start * len(names),
+            patch_stop * len(names),
+            dtype=np.int64,
+        )
+        blocks: list[ResponseBlock] = []
+        hits = 0
+        misses = 0
+        for (energy_start, energy_stop), path in zip(
+            energy_ranges,
+            paths,
+            strict=True,
+        ):
+            if path is not None and path.exists():
+                values = np.load(path, allow_pickle=False, mmap_mode="r")
+                hits += 1
+            else:
+                assert calculated is not None
+                values = calculated[energy_start:energy_stop].reshape(
+                    energy_stop - energy_start,
+                    -1,
                 )
-                raw = np.asarray(
-                    line_kernel.kernel_values_selected_pairs_for_detectors(
-                        isotope=isotope,
-                        detector_positions=detector_positions[
-                            measurement_index : measurement_index + 1
-                        ],
-                        sources=source_points,
-                        fe_indices=fe_indices[
-                            measurement_index : measurement_index + 1
-                        ],
-                        pb_indices=pb_indices[
-                            measurement_index : measurement_index + 1
-                        ],
-                        chunk_size=kernel_chunk_size,
-                    ),
-                    dtype=np.float64,
+                if path is not None:
+                    atomic_save_npy(path, values)
+                misses += 1
+            observation_indices = measurement_index * centers.size + np.arange(
+                energy_start,
+                energy_stop,
+                dtype=np.int64,
+            )
+            blocks.append(
+                ResponseBlock(
+                    observation_indices=observation_indices,
+                    source_indices=source_indices,
+                    values=np.asarray(values, dtype=np.float64),
                 )
-                expected_shape = (1, (patch_stop - patch_start) * quadrature_count)
-                if raw.shape != expected_shape:
-                    raise ValueError(
-                        f"Selected-pair kernel returned {raw.shape}, expected "
-                        f"{expected_shape}."
-                    )
-                values = raw.reshape(patch_stop - patch_start, quadrature_count)
-                spatial = float(live_times[measurement_index]) * np.einsum(
-                    "gq,gq->g",
-                    values,
-                    selected_weights,
-                    optimize=True,
-                )
-                pulse = detector_response_kernel_for_incident_gamma(
-                    centers,
-                    float(line["energy_keV"]),
-                    resolution,
-                    cebr3_efficiency,
-                    bin_width,
-                    continuum_to_peak=float(continuum_to_peak),
-                    backscatter_fraction=float(backscatter_fraction),
-                )
-                response[:, :, isotope_index] += (
-                    float(line["weight"])
-                    * pulse[:, None]
-                    * spatial[None, :]
-                    * selected_areas[None, :]
-                )
-        return response
+            )
+        return tuple(blocks), hits, misses
 
     def factory() -> object:
-        """Yield bounded density-response blocks, loading immutable cache files."""
-        for measurement_index in range(measurement_count):
+        """Yield bounded blocks with deterministic bounded CPU parallelism."""
+        started = perf_counter()
+        construction = performance["response_construction"]
+
+        def emit(result: tuple[tuple[ResponseBlock, ...], int, int]) -> object:
+            """Record cache counters and yield one task's ordered blocks."""
+            blocks, hits, misses = result
+            cache_stats["hits"] += hits
+            cache_stats["misses"] += misses
+            cache_stats["blocks"] += len(blocks)
+            yield from blocks
+
+        try:
+            missing_tasks = tuple(
+                task for task in tasks if task_requires_calculation(task)
+            )
+            cached_tasks = tuple(
+                task for task in tasks if not task_requires_calculation(task)
+            )
+            calculation_groups: list[tuple[tuple[int, ...], int, int]] = []
             for patch_start in range(0, patch_count, patch_step):
                 patch_stop = min(patch_start + patch_step, patch_count)
-                energy_ranges = tuple(
-                    (start, min(start + energy_step, centers.size))
-                    for start in range(0, centers.size, energy_step)
+                missing_measurements = tuple(
+                    measurement_index
+                    for measurement_index, task_patch_start, _ in missing_tasks
+                    if task_patch_start == patch_start
                 )
-                paths = tuple(
-                    block_path(
-                        measurement_index,
+                calculation_groups.extend(
+                    (
+                        missing_measurements[start : start + measurement_step],
                         patch_start,
                         patch_stop,
-                        energy_start,
-                        energy_stop,
                     )
-                    for energy_start, energy_stop in energy_ranges
+                    for start in range(0, len(missing_measurements), measurement_step)
                 )
-                missing = any(path is None or not path.exists() for path in paths)
-                calculated = (
-                    calculate_patch_chunk(measurement_index, patch_start, patch_stop)
-                    if missing
-                    else None
-                )
-                source_indices = np.asarray(
-                    [
-                        patch_index * len(names) + isotope_index
-                        for patch_index in range(patch_start, patch_stop)
-                        for isotope_index in range(len(names))
-                    ],
-                    dtype=np.int64,
-                )
-                for (energy_start, energy_stop), path in zip(
-                    energy_ranges,
-                    paths,
-                    strict=True,
-                ):
-                    if path is not None and path.exists():
-                        values = np.load(path, allow_pickle=False, mmap_mode="r")
-                        cache_stats["hits"] += 1
-                    else:
-                        assert calculated is not None
-                        values = calculated[energy_start:energy_stop].reshape(
-                            energy_stop - energy_start,
-                            -1,
+            if isinstance(construction, dict):
+                construction["kernel_batch_calls"] = int(
+                    construction["kernel_batch_calls"]
+                ) + len(calculation_groups)
+                construction["kernel_batched_measurements"] = int(
+                    construction["kernel_batched_measurements"]
+                ) + sum(len(group[0]) for group in calculation_groups)
+
+            def emit_group(
+                group: tuple[tuple[int, ...], int, int],
+                calculated: NDArray[np.float64],
+            ) -> object:
+                """Yield one measurement batch as immutable row blocks."""
+                measurement_indices, patch_start, patch_stop = group
+                for local_index, measurement_index in enumerate(measurement_indices):
+                    yield from emit(
+                        build_task(
+                            (measurement_index, patch_start, patch_stop),
+                            calculated[local_index],
                         )
-                        if path is not None:
-                            atomic_save_npy(path, values)
-                        cache_stats["misses"] += 1
-                    cache_stats["blocks"] += 1
-                    observation_indices = measurement_index * centers.size + np.arange(
-                        energy_start, energy_stop, dtype=np.int64
                     )
-                    yield ResponseBlock(
-                        observation_indices=observation_indices,
-                        source_indices=source_indices,
-                        values=np.asarray(values, dtype=np.float64),
+
+            if resolved_workers == 1 or len(calculation_groups) <= 1:
+                for group in calculation_groups:
+                    calculated = calculate_patch_batch(*group)
+                    yield from emit_group(group, calculated)
+                for task in cached_tasks:
+                    yield from emit(build_task(task))
+                return
+            with ProcessPoolExecutor(
+                max_workers=resolved_workers,
+                initializer=_initialize_spectral_process,
+                initargs=(process_context,),
+                mp_context=get_context("spawn"),
+            ) as executor:
+                remaining = iter(calculation_groups)
+                pending: deque[
+                    tuple[
+                        tuple[tuple[int, ...], int, int],
+                        Future[NDArray[np.float64]],
+                    ]
+                ] = deque()
+                for _ in range(min(len(calculation_groups), 2 * resolved_workers)):
+                    group = next(remaining, None)
+                    if group is None:
+                        break
+                    pending.append(
+                        (
+                            group,
+                            executor.submit(_calculate_spectral_process_task, group),
+                        )
                     )
+                while pending:
+                    group, future = pending.popleft()
+                    yield from emit_group(group, future.result())
+                    next_group = next(remaining, None)
+                    if next_group is not None:
+                        pending.append(
+                            (
+                                next_group,
+                                executor.submit(
+                                    _calculate_spectral_process_task,
+                                    next_group,
+                                ),
+                            )
+                        )
+                for task in cached_tasks:
+                    yield from emit(build_task(task))
+        finally:
+            if isinstance(construction, dict):
+                construction["iterations"] = int(construction["iterations"]) + 1
+                construction["elapsed_seconds"] = float(
+                    construction["elapsed_seconds"]
+                ) + (perf_counter() - started)
 
     operator = BlockResponseOperator(
         (measurement_count, centers.size),
@@ -1042,6 +1313,17 @@ def build_spectral_response_operator(
             "patch_chunk_size": patch_step,
             "cache_enabled": cache_root is not None,
             "cache_stats": cache_stats,
+            "device_cache_key": (None if cache_root is None else cache_root.as_posix()),
+            "measurement_row_keys": [
+                _measurement_cache_key(
+                    detector_positions[index],
+                    int(fe_indices[index]),
+                    int(pb_indices[index]),
+                    float(live_times[index]),
+                )
+                for index in range(measurement_count)
+            ],
+            "performance": performance,
         },
     )
     if discrepancy_calibration is None:

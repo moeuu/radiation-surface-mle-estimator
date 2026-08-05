@@ -363,6 +363,8 @@ class SurfaceMLEBackend:
         self._obstacle_grid: ObstacleGrid | None = None
         self._kernel: object | None = None
         self._estimator: SurfaceMLEEstimator | None = None
+        self._online_estimator: SurfaceMLEEstimator | None = None
+        self._planning_response_cache: dict[str, object] = {}
         self._records: list[MeasurementRecord] = []
         self._step_ids: set[int] = set()
         self._latest_estimate: MLEEstimate | None = None
@@ -482,19 +484,23 @@ class SurfaceMLEBackend:
             or int(self.config.online_coarse_to_fine_levels)
             != int(self.config.coarse_to_fine_levels)
         ):
-            active_estimator = self._estimator_factory(
-                replace(
-                    self.config,
-                    uncertainty_enable=False,
-                    station_bootstrap_replicates=0,
-                    patch_spacing_m=(
-                        self.config.patch_spacing_m
-                        if self.config.online_patch_spacing_m is None
-                        else self.config.online_patch_spacing_m
-                    ),
-                    coarse_to_fine_levels=int(self.config.online_coarse_to_fine_levels),
+            if self._online_estimator is None:
+                self._online_estimator = self._estimator_factory(
+                    replace(
+                        self.config,
+                        uncertainty_enable=False,
+                        station_bootstrap_replicates=0,
+                        patch_spacing_m=(
+                            self.config.patch_spacing_m
+                            if self.config.online_patch_spacing_m is None
+                            else self.config.online_patch_spacing_m
+                        ),
+                        coarse_to_fine_levels=int(
+                            self.config.online_coarse_to_fine_levels
+                        ),
+                    )
                 )
-            )
+            active_estimator = self._online_estimator
         estimate = active_estimator.fit(
             batch,
             self._environment,
@@ -607,6 +613,7 @@ class SurfaceMLEBackend:
             travel_costs=travel_costs,
             current_pair_id=resolved_current_pair,
             alternative_estimates=tuple(self._fit_estimates[-4:-1]),
+            historical_response_cache=self._planning_response_cache,
         )
 
     def finalize(self) -> EstimatorResult:

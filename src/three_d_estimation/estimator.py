@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from time import perf_counter
 from typing import Sequence
 
 import numpy as np
@@ -270,6 +272,7 @@ def _fit_problem(
     *,
     initial_densities: NDArray[np.float64] | None = None,
     initial_nuisance: NDArray[np.float64] | None = None,
+    persistent_response_cache: dict[str, object] | None = None,
 ) -> _FitState:
     """Build the configured forward model and solve one patch resolution."""
     if config.mode == "count":
@@ -307,8 +310,10 @@ def _fit_problem(
             config.isotope_names,
             kernel,
             chunk_size=int(config.response_chunk_size),
+            measurement_chunk_size=int(config.response_measurement_chunk_size),
             energy_chunk_size=int(config.response_energy_chunk_size),
             patch_chunk_size=int(config.response_patch_chunk_size),
+            worker_count=int(config.response_worker_count),
             cache_directory=config.response_cache_dir,
             continuum_to_peak=float(config.continuum_to_peak),
             backscatter_fraction=float(config.backscatter_fraction),
@@ -427,6 +432,8 @@ def _fit_problem(
             use_gpu=bool(config.use_gpu),
             gpu_device=str(config.gpu_device),
             gpu_dtype=str(config.gpu_dtype),
+            response_device_cache_fraction=float(config.response_device_cache_fraction),
+            persistent_response_cache=persistent_response_cache,
         )
     else:
         fitted = fit_surface_map_poisson(
@@ -498,6 +505,7 @@ def _debias_state(
     state: _FitState,
     observed: NDArray[np.float64],
     config: MLEConfig,
+    persistent_response_cache: dict[str, object] | None = None,
 ) -> _FitState:
     """Refit selected support without L1, TV, or group shrinkage bias."""
     if state.likelihood_diagnostics.get("family") in {
@@ -534,6 +542,8 @@ def _debias_state(
             use_gpu=bool(config.use_gpu),
             gpu_device=str(config.gpu_device),
             gpu_dtype=str(config.gpu_dtype),
+            response_device_cache_fraction=float(config.response_device_cache_fraction),
+            persistent_response_cache=persistent_response_cache,
         )
         return replace(state, response=masked_response, result=result)
     if state.response.ndim == 4:
@@ -864,11 +874,19 @@ def _select_regularization(
 class SurfaceMLEEstimator:
     """Fit count-domain or line-resolved spectral surface intensity maps."""
 
-    def __init__(self, config: MLEConfig) -> None:
-        """Store immutable estimator configuration."""
+    def __init__(
+        self,
+        config: MLEConfig,
+        *,
+        persistent_response_cache: dict[str, object] | None = None,
+    ) -> None:
+        """Store configuration and an optional exact device response cache."""
         if not isinstance(config, MLEConfig):
             raise TypeError("config must be an MLEConfig.")
         self.config = config
+        self._persistent_response_cache = (
+            {} if persistent_response_cache is None else persistent_response_cache
+        )
 
     def fit(
         self,
@@ -953,6 +971,7 @@ class SurfaceMLEEstimator:
             held_out_indices,
             initial_densities=initial_densities,
             initial_nuisance=initial_nuisance,
+            persistent_response_cache=self._persistent_response_cache,
         )
         for _level in range(int(self.config.coarse_to_fine_levels)):
             selected = _refinement_patch_ids(state, self.config.refinement_fraction)
@@ -977,6 +996,7 @@ class SurfaceMLEEstimator:
                 held_out_indices,
                 initial_densities=warm,
                 initial_nuisance=state.result.nuisance_coefficients,
+                persistent_response_cache=self._persistent_response_cache,
             )
 
         observed = (
@@ -987,7 +1007,12 @@ class SurfaceMLEEstimator:
         if observed is None:  # guarded by _fit_problem; keeps static typing explicit
             raise ValueError("Configured observation domain is unavailable.")
         if self.config.debias_refit:
-            state = _debias_state(state, observed, self.config)
+            state = _debias_state(
+                state,
+                observed,
+                self.config,
+                self._persistent_response_cache,
+            )
         predicted = _full_prediction(state)
         held_out_deviance = (
             poisson_deviance(
@@ -1184,7 +1209,9 @@ class SurfaceMLEEstimator:
         )
         bootstrap_estimates: list[MLEEstimate] = []
         replicate_count = int(self.config.station_bootstrap_replicates)
+        bootstrap_seconds = 0.0
         if replicate_count:
+            bootstrap_started = perf_counter()
             rng = np.random.default_rng(int(self.config.bootstrap_seed))
             bootstrap_config = replace(
                 self.config,
@@ -1193,22 +1220,86 @@ class SurfaceMLEEstimator:
                 regularization_selection="fixed",
                 held_out_fraction=0.0,
             )
-            bootstrap_estimator = SurfaceMLEEstimator(bootstrap_config)
-            for _replicate in range(replicate_count):
-                replicate_batch = station_bootstrap_batch(batch, rng)
-                bootstrap_estimates.append(
+            replicate_batches = tuple(
+                station_bootstrap_batch(batch, rng)
+                for _replicate in range(replicate_count)
+            )
+            batch_size = min(
+                int(self.config.bootstrap_batch_size),
+                replicate_count,
+            )
+            if batch_size == 1:
+                bootstrap_estimator = SurfaceMLEEstimator(
+                    bootstrap_config,
+                    persistent_response_cache=self._persistent_response_cache,
+                )
+                bootstrap_estimates.extend(
                     bootstrap_estimator.fit(
                         replicate_batch,
                         environment,
                         kernel,
                         obstacle_grid=obstacle_grid,
                     )
+                    for replicate_batch in replicate_batches
                 )
+            else:
+                cached_entries = self._persistent_response_cache.get("entries")
+                response_entries = (
+                    dict(cached_entries) if isinstance(cached_entries, dict) else {}
+                )
+
+                def fit_replicate(
+                    replicate_batch: ObservationBatch,
+                ) -> MLEEstimate:
+                    """Fit one exact replicate with shared immutable GPU rows."""
+                    local_cache: dict[str, object] = {"entries": dict(response_entries)}
+                    replicate_estimator = SurfaceMLEEstimator(
+                        bootstrap_config,
+                        persistent_response_cache=local_cache,
+                    )
+                    if not bootstrap_config.use_gpu:
+                        return replicate_estimator.fit(
+                            replicate_batch,
+                            environment,
+                            kernel,
+                            obstacle_grid=obstacle_grid,
+                        )
+                    import torch
+
+                    device = torch.device(str(bootstrap_config.gpu_device))
+                    stream = torch.cuda.Stream(device=device)
+                    with torch.cuda.stream(stream):
+                        result = replicate_estimator.fit(
+                            replicate_batch,
+                            environment,
+                            kernel,
+                            obstacle_grid=obstacle_grid,
+                        )
+                    stream.synchronize()
+                    return result
+
+                with ThreadPoolExecutor(max_workers=batch_size) as executor:
+                    bootstrap_estimates.extend(
+                        executor.map(fit_replicate, replicate_batches)
+                    )
+            bootstrap_seconds = perf_counter() - bootstrap_started
         bootstrap, augmented_clusters = bootstrap_uncertainty_summary(
             estimate,
             bootstrap_estimates,
             confidence_level=float(self.config.bootstrap_confidence_level),
         )
+        if replicate_count:
+            bootstrap = {
+                **bootstrap,
+                "execution": {
+                    "batch_size": min(
+                        int(self.config.bootstrap_batch_size),
+                        replicate_count,
+                    ),
+                    "shared_response_cache": True,
+                    "elapsed_seconds": bootstrap_seconds,
+                },
+            }
         uncertainty = {
             "laplace": laplace.to_dict(
                 patch_ids=state.patches.patch_ids.astype(int).tolist(),

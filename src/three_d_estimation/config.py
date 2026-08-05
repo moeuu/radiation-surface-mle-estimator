@@ -37,6 +37,7 @@ class MLEConfig:
     laplace_max_active_parameters: int = 256
     laplace_ridge: float = 1.0e-8
     station_bootstrap_replicates: int = 0
+    bootstrap_batch_size: int = 1
     bootstrap_confidence_level: float = 0.95
     bootstrap_seed: int = 173
     fit_background_nuisance: bool = True
@@ -64,9 +65,12 @@ class MLEConfig:
     min_mean: float = 1.0e-12
     response_chunk_size: int = 262144
     spectral_response_mode: Literal["materialized", "matrix_free"] = "materialized"
+    response_measurement_chunk_size: int = 8
     response_energy_chunk_size: int = 128
     response_patch_chunk_size: int = 128
+    response_worker_count: int = 0
     response_cache_dir: str | None = None
+    response_device_cache_fraction: float = 0.6
     online_fit_scope: Literal["station_complete"] = "station_complete"
     online_patch_spacing_m: tuple[float, float, float] | None = None
     online_coarse_to_fine_levels: int = 0
@@ -233,10 +237,23 @@ class MLEConfig:
                 "spectral_response_mode must be materialized or matrix_free."
             )
         if (
-            int(self.response_energy_chunk_size) < 1
+            int(self.response_measurement_chunk_size) < 1
+            or int(self.response_energy_chunk_size) < 1
             or int(self.response_patch_chunk_size) < 1
         ):
-            raise ValueError("Response energy and patch chunk sizes must be positive.")
+            raise ValueError(
+                "Response measurement, energy, and patch chunk sizes must be positive."
+            )
+        if (
+            isinstance(self.response_worker_count, bool)
+            or int(self.response_worker_count) < 0
+        ):
+            raise ValueError("response_worker_count must be a nonnegative integer.")
+        if (
+            not np.isfinite(self.response_device_cache_fraction)
+            or not 0.0 <= float(self.response_device_cache_fraction) < 1.0
+        ):
+            raise ValueError("response_device_cache_fraction must lie in [0, 1).")
         if self.response_cache_dir is not None and (
             not isinstance(self.response_cache_dir, str)
             or not self.response_cache_dir.strip()
@@ -295,6 +312,11 @@ class MLEConfig:
             or int(self.station_bootstrap_replicates) < 0
         ):
             raise ValueError("station_bootstrap_replicates must be nonnegative.")
+        if (
+            isinstance(self.bootstrap_batch_size, bool)
+            or int(self.bootstrap_batch_size) < 1
+        ):
+            raise ValueError("bootstrap_batch_size must be a positive integer.")
         if not 0.0 < float(self.bootstrap_confidence_level) < 1.0:
             raise ValueError("bootstrap_confidence_level must lie in (0, 1).")
         if not 0.0 <= float(self.laplace_support_threshold_fraction) <= 1.0:

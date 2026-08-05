@@ -163,6 +163,8 @@ def test_mle_config_rejects_invalid_online_and_laplace_controls() -> None:
         MLEConfig(online_coarse_to_fine_levels=True)
     with pytest.raises(ValueError, match="laplace_support_threshold_fraction"):
         MLEConfig(laplace_support_threshold_fraction=1.1)
+    with pytest.raises(ValueError, match="bootstrap_batch_size"):
+        MLEConfig(bootstrap_batch_size=True)
 
 
 def test_mle_config_resolves_calibration_relative_to_config_file(

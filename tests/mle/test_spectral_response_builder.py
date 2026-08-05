@@ -22,6 +22,7 @@ from spectrum.response_matrix import (
     default_resolution,
     detector_response_kernel_for_incident_gamma,
 )
+import three_d_estimation.spectral_response_builder as spectral_builder
 from three_d_estimation.spectral_response_builder import (
     build_spectral_nuisance_response,
     build_spectral_response,
@@ -667,6 +668,105 @@ def test_matrix_free_cache_appends_only_new_measurement_rows(tmp_path: Path) -> 
         (cache / relative).read_bytes() == content
         for relative, content in original_bytes.items()
     )
+
+
+def test_matrix_free_cpu_workers_preserve_exact_response() -> None:
+    """Parallel CPU patch tasks must preserve deterministic float64 blocks."""
+    edges = np.arange(0.0, 805.0, 10.0)
+    observations = _observations(
+        np.asarray(
+            [
+                [0.0, 0.0, 0.5],
+                [0.25, 0.0, 0.5],
+                [0.0, 0.25, 1.5],
+                [0.25, 0.25, 1.5],
+            ]
+        ),
+        edges,
+    )
+    points = np.zeros((8, 1, 3), dtype=float)
+    points[:, 0, 0] = np.linspace(1.0, 2.0, 8)
+    points[:, 0, 2] = 0.5
+    patches = _patches(points)
+    serial = build_spectral_response_operator(
+        observations,
+        patches,
+        ("Cs-137",),
+        _kernel({"Cs-137": _CS_LINE}),
+        energy_chunk_size=16,
+        patch_chunk_size=2,
+        worker_count=1,
+    )
+    parallel = build_spectral_response_operator(
+        observations,
+        patches,
+        ("Cs-137",),
+        _kernel({"Cs-137": _CS_LINE}),
+        energy_chunk_size=16,
+        patch_chunk_size=2,
+        worker_count=4,
+    )
+
+    np.testing.assert_array_equal(
+        parallel.operator.materialize(),
+        serial.operator.materialize(),
+    )
+    construction = parallel.operator.diagnostics["performance"]["response_construction"]
+    assert construction["worker_count"] == 4
+    assert construction["iterations"] == 1
+
+
+def test_matrix_free_batches_eight_measurements_and_precomputes_line_pulses(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Eight rows must share one kernel call and one pulse per gamma line."""
+    edges = np.arange(0.0, 1505.0, 10.0)
+    positions = np.zeros((8, 3), dtype=np.float64)
+    positions[:, 0] = np.linspace(0.0, 0.7, 8)
+    positions[:, 2] = 0.5
+    observations = _observations(positions, edges)
+    patches = _patches(np.asarray([[[1.0, 0.0, 0.5]], [[2.0, 0.0, 0.5]]]))
+    scalar = build_spectral_response_operator(
+        observations,
+        patches,
+        ("Co-60",),
+        _kernel({"Co-60": _CO_LINES_UNATTENUATED}),
+        measurement_chunk_size=1,
+        patch_chunk_size=2,
+        worker_count=1,
+    )
+    scalar_values = scalar.operator.materialize()
+    original_pulse = spectral_builder.detector_response_kernel_for_incident_gamma
+    pulse_energies: list[float] = []
+
+    def counted_pulse(*args: object, **kwargs: object) -> NDArray[np.float64]:
+        """Record one position-independent gamma-line pulse construction."""
+        energy = kwargs.get("incident_energy_keV", args[1] if len(args) > 1 else None)
+        assert energy is not None
+        pulse_energies.append(float(energy))
+        return original_pulse(*args, **kwargs)
+
+    monkeypatch.setattr(
+        spectral_builder,
+        "detector_response_kernel_for_incident_gamma",
+        counted_pulse,
+    )
+    batched = build_spectral_response_operator(
+        observations,
+        patches,
+        ("Co-60",),
+        _kernel({"Co-60": _CO_LINES_UNATTENUATED}),
+        measurement_chunk_size=8,
+        patch_chunk_size=2,
+        worker_count=1,
+    )
+    batched_values = batched.operator.materialize()
+    construction = batched.operator.diagnostics["performance"]["response_construction"]
+
+    np.testing.assert_array_equal(batched_values, scalar_values)
+    assert pulse_energies == [1173.2, 1332.5]
+    assert construction["kernel_batch_calls"] == 1
+    assert construction["kernel_batched_measurements"] == 8
 
 
 def test_operator_peak_memory_is_bounded_by_response_blocks() -> None:

@@ -60,6 +60,19 @@ Poisson Fisher information is
 F = J^T diag(1 / max(mu, mu_floor)) J.
 ```
 
+The spectral response currently returns from the shared runtime as a float64 NumPy
+array. Fisher contractions therefore stay in optimized CPU `einsum`, avoiding a
+second full response transfer to CUDA. Historical response rows are retained across
+causal prefixes, so only a newly acquired station is assembled. Historical Fisher
+precision is also appended when the fitted source/nuisance state is unchanged; a new
+MLE state invalidates it and triggers an exact full Fisher rebuild because every
+Poisson denominator then changes. For planning bases of at least 24 parameters, all
+candidate poses in a chunk share one eight-level CUDA beam sequence of exact float64
+log-determinants. The 64-by-64 shield-pair rotation matrix is computed once per
+planning call. Small bases remain on CPU because launch and transfer overhead
+dominate. The planning artifact records response, Fisher, beam-search, cache modes,
+and total elapsed time together with the selected backend.
+
 Historical measurements are rebuilt with the same shared kernel. With stabilizing
 Laplace precision `lambda I`, the current precision is
 

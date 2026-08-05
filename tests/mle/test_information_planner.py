@@ -8,9 +8,14 @@ import numpy as np
 import pytest
 
 from three_d_estimation.cli import _estimate_history_indices, build_argument_parser
+from three_d_estimation.config import MLEConfig
+import three_d_estimation.information_planner as information_planner
 from three_d_estimation.information_planner import (
     MLEPlanningConfig,
     _ambiguity_metrics,
+    _fisher_information,
+    _historical_fisher_precision,
+    _historical_spectral_design,
     _source_basis,
     select_fisher_action,
 )
@@ -172,6 +177,251 @@ def test_joint_program_uses_pair_specific_ambiguity_utility() -> None:
     )
 
     assert selected.shield_pair_ids == (2,)
+
+
+def test_planner_cpu_gpu_equivalence_when_cuda_is_available() -> None:
+    """Float64 CUDA Fisher and eight-view beam results must match CPU results."""
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is not available")
+    rng = np.random.default_rng(20260806)
+    response = rng.uniform(1.0e-5, 1.0e-2, size=(9, 12, 3, 2))
+    nuisance = rng.uniform(1.0e-4, 1.0e-2, size=(9, 12, 2))
+    basis = rng.uniform(0.0, 1.0, size=(3, 2, 4))
+    strengths = rng.uniform(0.1, 4.0, size=(3, 2))
+    coefficients = np.asarray([0.5, 1.5])
+    scales = np.asarray([1.0, 1.5])
+    cpu_fisher = _fisher_information(
+        response,
+        nuisance,
+        basis,
+        strengths,
+        coefficients,
+        scales,
+        minimum_expected_count=1.0e-3,
+    )
+    gpu_fisher = _fisher_information(
+        response,
+        nuisance,
+        basis,
+        strengths,
+        coefficients,
+        scales,
+        minimum_expected_count=1.0e-3,
+        use_gpu=True,
+    )
+    for gpu_values, cpu_values in zip(gpu_fisher, cpu_fisher, strict=True):
+        np.testing.assert_allclose(
+            gpu_values,
+            cpu_values,
+            rtol=2.0e-12,
+            atol=2.0e-13,
+        )
+
+    pair_count = 9
+    parameter_count = 24
+    jacobian = rng.normal(size=(2, pair_count, parameter_count, 3))
+    information = (
+        np.einsum(
+            "cpik,cpjk->cpij",
+            jacobian,
+            jacobian,
+            optimize=True,
+        )
+        * 1.0e-3
+    )
+    poses = np.asarray([[0.0, 0.0, 1.0], [1.0, 0.0, 1.0]])
+    orientations = np.eye(3, dtype=np.float64)
+    expected = rng.uniform(1.0, 10.0, size=(2, pair_count))
+    bonuses = rng.uniform(0.0, 0.1, size=(2, pair_count))
+    config = MLEPlanningConfig(
+        shield_program_length=8,
+        shield_program_beam_width=64,
+    )
+    cpu_selected, cpu_ranked = select_fisher_action(
+        poses,
+        range(pair_count),
+        information,
+        expected,
+        np.eye(parameter_count),
+        orientations,
+        nuisance_count=2,
+        config=config,
+        pair_utility_bonus=bonuses,
+    )
+    gpu_selected, gpu_ranked = select_fisher_action(
+        poses,
+        range(pair_count),
+        information,
+        expected,
+        np.eye(parameter_count),
+        orientations,
+        nuisance_count=2,
+        config=config,
+        pair_utility_bonus=bonuses,
+        use_gpu=True,
+    )
+
+    assert gpu_selected.shield_pair_ids == cpu_selected.shield_pair_ids
+    assert [action.shield_pair_ids for action in gpu_ranked] == [
+        action.shield_pair_ids for action in cpu_ranked
+    ]
+    assert gpu_selected.score == pytest.approx(cpu_selected.score, abs=1.0e-12)
+    assert gpu_selected.information_gain_nats == pytest.approx(
+        cpu_selected.information_gain_nats,
+        abs=1.0e-12,
+    )
+
+
+def test_historical_design_appends_only_new_station_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A causal history extension must compute only its new response rows."""
+    estimate = MLEEstimate(
+        isotope_names=("Cs-137",),
+        patches=(_floor_patch(0, 0.0),),
+        density_by_isotope=np.asarray([[1.0]]),
+        patch_strength_by_isotope=np.asarray([[1.0]]),
+        predicted_spectra=None,
+        predicted_isotope_counts=None,
+        background_parameters=np.asarray([0.5]),
+        nuisance_parameters=np.zeros(0),
+        objective_value=1.0,
+        poisson_deviance=0.0,
+        iterations=1,
+        converged=True,
+        diagnostics={},
+    )
+
+    def history(count: int) -> ObservationBatch:
+        """Return a deterministic causal spectrum prefix."""
+        positions = np.zeros((count, 3), dtype=np.float64)
+        positions[:, 0] = np.arange(count, dtype=np.float64)
+        return ObservationBatch(
+            detector_positions_xyz=positions,
+            detector_quaternions_wxyz=np.tile(
+                np.asarray([[1.0, 0.0, 0.0, 0.0]]),
+                (count, 1),
+            ),
+            fe_indices=np.zeros(count, dtype=np.int64),
+            pb_indices=np.zeros(count, dtype=np.int64),
+            live_times_s=np.ones(count),
+            spectrum_counts=np.ones((count, 2)),
+            spectrum_variances=None,
+            energy_bin_edges_keV=np.asarray([0.0, 1.0, 2.0]),
+            isotope_counts=np.ones((count, 1)),
+            isotope_covariances=np.ones((count, 1, 1)),
+            station_ids=np.arange(count, dtype=np.int64),
+            isotope_names=("Cs-137",),
+        )
+
+    computed_counts: list[int] = []
+
+    def fake_design(
+        observations: object,
+        _estimate: MLEEstimate,
+        _kernel: object,
+        _config: MLEConfig,
+    ) -> tuple[np.ndarray, np.ndarray, tuple[str, ...]]:
+        """Return row-identifiable arrays while recording computed rows."""
+        positions = np.asarray(observations.detector_positions_xyz)
+        count = int(positions.shape[0])
+        computed_counts.append(count)
+        values = positions[:, 0, None, None, None] + np.ones((count, 2, 1, 1))
+        nuisance = positions[:, 0, None, None] + np.ones((count, 2, 1))
+        return values, nuisance, ("background_rate_cps",)
+
+    monkeypatch.setattr(information_planner, "_spectral_design", fake_design)
+    cache: dict[str, object] = {}
+    kernel = object()
+    config = MLEConfig(mode="spectral", isotope_names=("Cs-137",))
+    first = _historical_spectral_design(
+        history(2),
+        estimate,
+        kernel,
+        config,
+        cache,  # type: ignore[arg-type]
+    )
+    extended = _historical_spectral_design(
+        history(3),
+        estimate,
+        kernel,
+        config,
+        cache,  # type: ignore[arg-type]
+    )
+    hit = _historical_spectral_design(
+        history(3),
+        estimate,
+        kernel,
+        config,
+        cache,  # type: ignore[arg-type]
+    )
+
+    assert computed_counts == [2, 1]
+    assert first[3]["mode"] == "full_rebuild"
+    assert extended[3] == {
+        "mode": "prefix_append",
+        "reused_measurements": 2,
+        "computed_measurements": 1,
+    }
+    assert hit[3]["mode"] == "prefix_hit"
+    np.testing.assert_array_equal(extended[0], hit[0])
+    np.testing.assert_array_equal(extended[0][:2], first[0])
+
+    fisher_cache: dict[str, object] = {}
+    basis = np.ones((1, 1, 1), dtype=np.float64)
+    strengths = np.ones((1, 1), dtype=np.float64)
+    coefficients = np.asarray([0.5])
+    scales = np.asarray([1.0])
+    first_fisher = _historical_fisher_precision(
+        first[0],
+        first[1],
+        basis,
+        strengths,
+        coefficients,
+        scales,
+        (0, 1),
+        minimum_expected_count=1.0e-6,
+        cache=fisher_cache,
+    )
+    extended_fisher = _historical_fisher_precision(
+        extended[0],
+        extended[1],
+        basis,
+        strengths,
+        coefficients,
+        scales,
+        (0, 1, 2),
+        minimum_expected_count=1.0e-6,
+        cache=fisher_cache,
+    )
+    full_fisher = _historical_fisher_precision(
+        extended[0],
+        extended[1],
+        basis,
+        strengths,
+        coefficients,
+        scales,
+        (0, 1, 2),
+        minimum_expected_count=1.0e-6,
+        cache=None,
+    )
+    changed_estimate_fisher = _historical_fisher_precision(
+        extended[0],
+        extended[1],
+        basis,
+        2.0 * strengths,
+        coefficients,
+        scales,
+        (0, 1, 2),
+        minimum_expected_count=1.0e-6,
+        cache=fisher_cache,
+    )
+
+    assert first_fisher[1]["mode"] == "full_rebuild"
+    assert extended_fisher[1]["mode"] == "prefix_append"
+    np.testing.assert_allclose(extended_fisher[0], full_fisher[0], rtol=1.0e-15)
+    assert changed_estimate_fisher[1]["mode"] == "full_rebuild"
 
 
 def test_zero_mle_regions_remain_in_the_exploration_basis() -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+from time import perf_counter
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -831,10 +832,13 @@ def _torch_response_product(
     *,
     transpose: bool,
     torch_module: object,
+    dense_response: object | None = None,
 ) -> object:
     """Apply a streamed response operator while retaining state on one device."""
     torch = torch_module
     vector = values
+    if dense_response is not None:
+        return dense_response.T @ vector if transpose else dense_response @ vector
     if transpose:
         result = torch.zeros(
             operator.source_count,
@@ -884,6 +888,306 @@ def _torch_response_product(
     return result
 
 
+def _prepare_dense_torch_response(
+    operator: ResponseOperator,
+    *,
+    device: object,
+    dtype: object,
+    cache_fraction: float,
+    torch_module: object,
+    persistent_cache: dict[str, object] | None = None,
+) -> tuple[
+    object | None,
+    dict[str, object],
+    NDArray[np.float64] | None,
+    NDArray[np.float64] | None,
+]:
+    """Materialize an exact response matrix on CUDA when it safely fits.
+
+    The response remains matrix-free on disk and during construction.  This
+    opportunistic device cache only replaces repeated host-to-device block
+    transfers inside the iterative solver.  Falling back to streamed blocks is
+    deterministic when the required matrix does not fit the configured share
+    of currently free device memory.
+    """
+    torch = torch_module
+    required_bytes = (
+        int(operator.observation_count)
+        * int(operator.source_count)
+        * int(torch.empty((), dtype=dtype).element_size())
+    )
+    diagnostics: dict[str, object] = {
+        "mode": "streamed_host_blocks",
+        "required_bytes": required_bytes,
+        "cached_bytes": 0,
+        "preparation_seconds": 0.0,
+        "host_to_device_bytes": 0,
+    }
+    if getattr(device, "type", None) != "cuda" or float(cache_fraction) <= 0.0:
+        return None, diagnostics, None, None
+    operator_diagnostics = getattr(operator, "diagnostics", {})
+    cache_key = operator_diagnostics.get("device_cache_key")
+    row_keys_raw = operator_diagnostics.get("measurement_row_keys")
+    selected_measurements = operator_diagnostics.get("selected_measurements")
+    row_keys = (
+        tuple(str(value) for value in row_keys_raw)
+        if isinstance(row_keys_raw, list)
+        else ()
+    )
+    complete_selection = selected_measurements is None or selected_measurements == list(
+        range(len(row_keys))
+    )
+    persistent_eligible = bool(
+        persistent_cache is not None
+        and isinstance(cache_key, str)
+        and cache_key
+        and row_keys
+        and complete_selection
+        and not operator_diagnostics.get("source_masked", False)
+    )
+    persistent_identity = (str(device), str(dtype), str(cache_key))
+    previous: dict[str, object] | None = None
+    reusable: dict[str, object] | None = None
+    if persistent_eligible:
+        entries = persistent_cache.get("entries")
+        candidate = (
+            entries.get(persistent_identity) if isinstance(entries, dict) else None
+        )
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("identity") == (persistent_identity)
+            and int(candidate.get("source_count", -1)) == operator.source_count
+        ):
+            reusable = candidate
+            previous_keys = candidate.get("row_keys")
+            if (
+                isinstance(previous_keys, tuple)
+                and row_keys[: len(previous_keys)] == previous_keys
+            ):
+                previous = candidate
+    if previous is not None and previous.get("row_keys") == row_keys:
+        cached_matrix = previous.get("matrix")
+        cached_rows = previous.get("row_sums")
+        cached_columns = previous.get("column_sums")
+        if (
+            isinstance(cached_rows, np.ndarray)
+            and isinstance(cached_columns, np.ndarray)
+            and cached_matrix is not None
+        ):
+            diagnostics.update(
+                {
+                    "mode": "persistent_cuda_cache_hit",
+                    "cached_bytes": required_bytes,
+                    "persistent_prefix_measurements": len(row_keys),
+                }
+            )
+            return cached_matrix, diagnostics, cached_rows, cached_columns
+
+    if reusable is not None:
+        reusable_keys = reusable.get("row_keys")
+        reusable_matrix = reusable.get("matrix")
+        reusable_rows = reusable.get("row_sums_by_measurement")
+        reusable_columns = reusable.get("column_sums_by_measurement")
+        if (
+            isinstance(reusable_keys, tuple)
+            and reusable_matrix is not None
+            and isinstance(reusable_rows, np.ndarray)
+            and isinstance(reusable_columns, np.ndarray)
+            and all(key in reusable_keys for key in row_keys)
+        ):
+            key_to_index = {key: index for index, key in enumerate(reusable_keys)}
+            selected = np.asarray(
+                [key_to_index[key] for key in row_keys],
+                dtype=np.int64,
+            )
+            selected_t = torch.as_tensor(
+                selected,
+                dtype=torch.long,
+                device=device,
+            )
+            trailing = int(np.prod(operator.observation_shape[1:], dtype=np.int64))
+            gathered = reusable_matrix.reshape(
+                len(reusable_keys),
+                trailing,
+                operator.source_count,
+            ).index_select(0, selected_t)
+            gathered = gathered.reshape(
+                operator.observation_count,
+                operator.source_count,
+            )
+            row_sums = np.asarray(reusable_rows[selected], dtype=np.float64).reshape(-1)
+            column_sums = np.sum(
+                reusable_columns[selected],
+                axis=0,
+                dtype=np.float64,
+            )
+            row_sums.setflags(write=False)
+            column_sums.setflags(write=False)
+            diagnostics.update(
+                {
+                    "mode": "persistent_cuda_row_gather",
+                    "cached_bytes": required_bytes,
+                    "persistent_reused_measurements": len(row_keys),
+                }
+            )
+            return gathered, diagnostics, row_sums, column_sums
+
+    free_bytes, _ = torch.cuda.mem_get_info(device)
+    budget_bytes = int(float(cache_fraction) * int(free_bytes))
+    diagnostics["free_device_bytes_at_prepare"] = int(free_bytes)
+    diagnostics["budget_bytes"] = budget_bytes
+    if required_bytes > budget_bytes:
+        diagnostics["fallback_reason"] = "response_exceeds_device_cache_budget"
+        return None, diagnostics, None, None
+
+    started = perf_counter()
+    matrix = None
+    row_sums = np.zeros(operator.observation_count, dtype=np.float64)
+    column_sums = np.zeros(operator.source_count, dtype=np.float64)
+    trailing = int(np.prod(operator.observation_shape[1:], dtype=np.int64))
+    measurement_count = int(operator.observation_shape[0])
+    row_sums_by_measurement = np.zeros(
+        (measurement_count, trailing),
+        dtype=np.float64,
+    )
+    column_sums_by_measurement = np.zeros(
+        (measurement_count, operator.source_count),
+        dtype=np.float64,
+    )
+    old_observation_count = 0
+    try:
+        matrix = torch.zeros(
+            (operator.observation_count, operator.source_count),
+            dtype=dtype,
+            device=device,
+        )
+        if previous is not None:
+            previous_matrix = previous.get("matrix")
+            previous_rows = previous.get("row_sums")
+            previous_columns = previous.get("column_sums")
+            previous_rows_by_measurement = previous.get("row_sums_by_measurement")
+            previous_columns_by_measurement = previous.get("column_sums_by_measurement")
+            previous_keys = previous.get("row_keys")
+            if (
+                previous_matrix is not None
+                and isinstance(previous_rows, np.ndarray)
+                and isinstance(previous_columns, np.ndarray)
+                and isinstance(previous_keys, tuple)
+            ):
+                old_observation_count = int(previous_rows.size)
+                matrix[:old_observation_count].copy_(
+                    previous_matrix[:old_observation_count]
+                )
+                row_sums[:old_observation_count] = previous_rows
+                column_sums[:] = previous_columns
+                old_measurement_count = len(previous_keys)
+                if isinstance(previous_rows_by_measurement, np.ndarray):
+                    row_sums_by_measurement[:old_measurement_count] = (
+                        previous_rows_by_measurement
+                    )
+                if isinstance(previous_columns_by_measurement, np.ndarray):
+                    column_sums_by_measurement[:old_measurement_count] = (
+                        previous_columns_by_measurement
+                    )
+        for block in operator.iter_blocks():
+            rows = np.asarray(block.observation_indices, dtype=np.int64)
+            columns = np.asarray(block.source_indices, dtype=np.int64)
+            if rows.size and int(rows[-1]) < old_observation_count:
+                continue
+            block_values = torch.as_tensor(
+                np.array(block.values, dtype=np.float64, copy=True),
+                dtype=dtype,
+                device=device,
+            )
+            row_sums[rows] += np.sum(block.values, axis=1)
+            column_sums[columns] += np.sum(block.values, axis=0)
+            measurement_indices = rows // trailing
+            local_rows = rows % trailing
+            row_sums_by_measurement[measurement_indices, local_rows] += np.sum(
+                block.values,
+                axis=1,
+            )
+            for measurement_index in np.unique(measurement_indices):
+                selected_rows = measurement_indices == measurement_index
+                column_sums_by_measurement[measurement_index, columns] += np.sum(
+                    block.values[selected_rows],
+                    axis=0,
+                )
+            diagnostics["host_to_device_bytes"] = int(
+                diagnostics["host_to_device_bytes"]
+            ) + int(block.values.nbytes)
+            contiguous_rows = bool(
+                rows.size
+                and np.array_equal(rows, np.arange(rows[0], rows[0] + rows.size))
+            )
+            contiguous_columns = bool(
+                columns.size
+                and np.array_equal(
+                    columns,
+                    np.arange(columns[0], columns[0] + columns.size),
+                )
+            )
+            if contiguous_rows and contiguous_columns:
+                matrix[
+                    int(rows[0]) : int(rows[-1]) + 1,
+                    int(columns[0]) : int(columns[-1]) + 1,
+                ].copy_(block_values)
+            else:
+                row_indices = torch.as_tensor(rows, dtype=torch.long, device=device)
+                column_indices = torch.as_tensor(
+                    columns,
+                    dtype=torch.long,
+                    device=device,
+                )
+                matrix[row_indices[:, None], column_indices[None, :]] = block_values
+    except torch.OutOfMemoryError:
+        del matrix
+        torch.cuda.empty_cache()
+        diagnostics.update(
+            {
+                "fallback_reason": "cuda_out_of_memory_during_cache_prepare",
+                "preparation_seconds": perf_counter() - started,
+            }
+        )
+        return None, diagnostics, None, None
+    torch.cuda.synchronize(device)
+    diagnostics.update(
+        {
+            "mode": (
+                "persistent_cuda_prefix_append"
+                if old_observation_count
+                else "dense_cuda_cache"
+            ),
+            "cached_bytes": required_bytes,
+            "preparation_seconds": perf_counter() - started,
+            "persistent_prefix_measurements": (
+                0
+                if old_observation_count == 0
+                else old_observation_count // int(operator.observation_shape[1])
+            ),
+        }
+    )
+    row_sums.setflags(write=False)
+    column_sums.setflags(write=False)
+    row_sums_by_measurement.setflags(write=False)
+    column_sums_by_measurement.setflags(write=False)
+    if persistent_eligible and persistent_cache is not None:
+        entries = persistent_cache.setdefault("entries", {})
+        if not isinstance(entries, dict):
+            raise TypeError("Persistent response cache entries must be a dictionary.")
+        entries[persistent_identity] = {
+            "identity": persistent_identity,
+            "row_keys": row_keys,
+            "source_count": operator.source_count,
+            "matrix": matrix,
+            "row_sums": row_sums,
+            "column_sums": column_sums,
+            "row_sums_by_measurement": row_sums_by_measurement,
+            "column_sums_by_measurement": column_sums_by_measurement,
+        }
+    return matrix, diagnostics, row_sums, column_sums
+
+
 def fit_surface_map_poisson_operator(
     observed_counts: ArrayLike,
     response_operator: ResponseOperator,
@@ -899,6 +1203,8 @@ def fit_surface_map_poisson_operator(
     use_gpu: bool = False,
     gpu_device: str = "cuda",
     gpu_dtype: str = "float64",
+    response_device_cache_fraction: float = 0.6,
+    persistent_response_cache: dict[str, object] | None = None,
 ) -> SurfaceMapResult:
     """Fit Poisson surface density using streamed response products.
 
@@ -906,7 +1212,9 @@ def fit_surface_map_poisson_operator(
     unlike :func:`fit_surface_map_poisson`, patch areas are therefore already
     included in each response block.  Areas remain explicit for L1, group
     regularization, and integrated-strength reporting.  CPU and CUDA execute
-    the same Torch primal-dual updates while response blocks stay bounded.
+    the same Torch primal-dual updates. CUDA opportunistically caches the exact
+    response matrix within a bounded share of free VRAM and otherwise streams
+    the same response blocks.
     """
     if not isinstance(response_operator, ResponseOperator):
         raise TypeError("response_operator must implement ResponseOperator.")
@@ -991,10 +1299,16 @@ def fit_surface_map_poisson_operator(
             raise ValueError("Initial nuisance values must match nuisance columns.")
     if gpu_dtype not in {"float32", "float64"}:
         raise ValueError("gpu_dtype must be float32 or float64.")
+    if (
+        not np.isfinite(response_device_cache_fraction)
+        or not 0.0 <= float(response_device_cache_fraction) < 1.0
+    ):
+        raise ValueError("response_device_cache_fraction must lie in [0, 1).")
     device = torch.device(gpu_device if use_gpu else "cpu")
     if use_gpu and device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA matrix-free solve requested but CUDA is unavailable.")
     dtype = torch.float32 if gpu_dtype == "float32" else torch.float64
+    solve_started = perf_counter()
 
     def tensor(values: ArrayLike, *, integer: bool = False) -> object:
         """Copy one bounded array to the selected solver device."""
@@ -1004,6 +1318,19 @@ def fit_surface_map_poisson_operator(
             device=device,
         )
 
+    (
+        dense_response,
+        response_cache_diagnostics,
+        prepared_row_sums,
+        prepared_column_sums,
+    ) = _prepare_dense_torch_response(
+        response_operator,
+        device=device,
+        dtype=dtype,
+        cache_fraction=float(response_device_cache_fraction),
+        torch_module=torch,
+        persistent_cache=persistent_response_cache,
+    )
     observed = tensor(observed_vector)
     alpha_t = tensor(alpha_vector)
     background_t = tensor(background_vector)
@@ -1023,13 +1350,17 @@ def fit_surface_map_poisson_operator(
         check_invariants=False,
     ).coalesce()
 
-    row_sums = response_operator.row_sums()
+    if prepared_row_sums is None or prepared_column_sums is None:
+        row_sums, flat_column_sums = response_operator.response_sums()
+    else:
+        row_sums = prepared_row_sums
+        flat_column_sums = prepared_column_sums
     if nuisance_count:
         row_sums = row_sums + np.sum(nuisance_matrix, axis=1)
     observation_steps = tensor(
         float(solver_config.step_safety) / np.maximum(row_sums, 1.0e-12)
     )
-    column_sums = response_operator.column_sums().reshape(density_shape)
+    column_sums = flat_column_sums.reshape(density_shape)
     if tv_active:
         degrees = np.asarray(np.abs(incidence).sum(axis=0)).reshape(-1)
         column_sums = column_sums + degrees[:, None]
@@ -1079,23 +1410,30 @@ def fit_surface_map_poisson_operator(
     converged = False
     iterations = 0
     objective_history: list[float] = []
+    response_product_calls = 0
 
     def forward(density_values: object) -> object:
         """Apply the streamed density operator on the solver device."""
+        nonlocal response_product_calls
+        response_product_calls += 1
         return _torch_response_product(
             response_operator,
             density_values.reshape(-1),
             transpose=False,
             torch_module=torch,
+            dense_response=dense_response,
         )
 
     def transpose(observation_values: object) -> object:
         """Apply the streamed transpose on the solver device."""
+        nonlocal response_product_calls
+        response_product_calls += 1
         return _torch_response_product(
             response_operator,
             observation_values,
             transpose=True,
             torch_module=torch,
+            dense_response=dense_response,
         ).reshape(density_shape)
 
     def expected_counts(density_values: object, nuisance_values: object) -> object:
@@ -1390,6 +1728,32 @@ def fit_surface_map_poisson_operator(
     densities_numpy = densities.detach().cpu().numpy().astype(np.float64, copy=False)
     nuisance_numpy = nuisance.detach().cpu().numpy().astype(np.float64, copy=False)
     expected_numpy = expected.detach().cpu().numpy().astype(np.float64, copy=False)
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    performance = getattr(response_operator, "diagnostics", {}).setdefault(
+        "performance",
+        {},
+    )
+    if isinstance(performance, dict):
+        response_cache_diagnostics[
+            "estimated_iterative_host_to_device_bytes_upper_bound"
+        ] = (
+            0
+            if dense_response is not None or device.type != "cuda"
+            else int(response_cache_diagnostics["required_bytes"])
+            * int(response_product_calls)
+        )
+        solver_diagnostics = {
+            "device": str(device),
+            "dtype": str(gpu_dtype),
+            "elapsed_seconds": perf_counter() - solve_started,
+            "response_product_calls": int(response_product_calls),
+            "response_cache": response_cache_diagnostics,
+        }
+        performance["solver"] = solver_diagnostics
+        solver_calls = performance.setdefault("solver_calls", [])
+        if isinstance(solver_calls, list):
+            solver_calls.append(solver_diagnostics)
     return SurfaceMapResult(
         densities_cps_1m_m2=densities_numpy,
         integrated_strengths_cps_1m=densities_numpy * areas[:, None],

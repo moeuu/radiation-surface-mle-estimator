@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, replace
 import json
 import os
 from pathlib import Path
+from time import perf_counter
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -568,6 +569,125 @@ def _spectral_design(
     )
 
 
+def _historical_spectral_design(
+    observations: ObservationBatch,
+    estimate: MLEEstimate,
+    kernel: ContinuousKernel,
+    mle_config: MLEConfig,
+    cache: dict[str, object] | None,
+) -> tuple[
+    NDArray[np.float64],
+    NDArray[np.float64],
+    tuple[str, ...],
+    dict[str, object],
+]:
+    """Build or append the exact historical design for a causal prefix."""
+    step_ids = tuple(int(value) for value in observations.step_ids)
+    identity = (
+        tuple(
+            (
+                int(patch.patch_id),
+                np.asarray(patch.centroid_xyz, dtype=np.float64).tobytes(),
+                float(patch.area_m2),
+                np.asarray(
+                    patch.quadrature_points_xyz,
+                    dtype=np.float64,
+                ).tobytes(),
+                np.asarray(
+                    patch.quadrature_weights,
+                    dtype=np.float64,
+                ).tobytes(),
+            )
+            for patch in estimate.patches
+        ),
+        tuple(estimate.isotope_names),
+        id(kernel),
+        observations.energy_bin_edges_keV.tobytes(),
+        float(mle_config.continuum_to_peak),
+        float(mle_config.backscatter_fraction),
+        bool(mle_config.fit_background_nuisance),
+        bool(mle_config.fit_scatter_nuisance),
+        bool(mle_config.fit_shield_leakage_nuisance),
+        bool(mle_config.fit_low_rank_residual_nuisance),
+        bool(mle_config.fit_gain_resolution_drift),
+        mle_config.discrepancy_calibration_path,
+    )
+    entry = None if cache is None else cache.get("historical_design")
+    previous_count = 0
+    if isinstance(entry, dict) and entry.get("identity") == identity:
+        previous_steps = entry.get("step_ids")
+        if isinstance(previous_steps, tuple) and step_ids[: len(previous_steps)] == (
+            previous_steps
+        ):
+            previous_count = len(previous_steps)
+            if previous_count == len(step_ids):
+                return (
+                    np.asarray(entry["source"], dtype=np.float64),
+                    np.asarray(entry["nuisance"], dtype=np.float64),
+                    tuple(entry["nuisance_names"]),
+                    {
+                        "mode": "prefix_hit",
+                        "reused_measurements": previous_count,
+                        "computed_measurements": 0,
+                    },
+                )
+    if previous_count and not mle_config.fit_gain_resolution_drift:
+        selected = slice(previous_count, len(step_ids))
+        suffix = _PlanningGeometry(
+            detector_positions_xyz=observations.detector_positions_xyz[selected],
+            fe_indices=observations.fe_indices[selected],
+            pb_indices=observations.pb_indices[selected],
+            live_times_s=observations.live_times_s[selected],
+            energy_bin_edges_keV=observations.energy_bin_edges_keV,
+            station_ids=observations.station_ids[selected],
+        )
+        suffix_source, suffix_nuisance, nuisance_names = _spectral_design(
+            suffix,
+            estimate,
+            kernel,
+            mle_config,
+        )
+        assert isinstance(entry, dict)
+        if tuple(entry["nuisance_names"]) == tuple(nuisance_names):
+            source = np.concatenate(
+                (np.asarray(entry["source"], dtype=np.float64), suffix_source),
+                axis=0,
+            )
+            nuisance = np.concatenate(
+                (np.asarray(entry["nuisance"], dtype=np.float64), suffix_nuisance),
+                axis=0,
+            )
+            mode = "prefix_append"
+        else:
+            previous_count = 0
+    if previous_count == 0:
+        source, nuisance, nuisance_names = _spectral_design(
+            observations,
+            estimate,
+            kernel,
+            mle_config,
+        )
+        mode = "full_rebuild"
+    if cache is not None:
+        cache["historical_design"] = {
+            "identity": identity,
+            "step_ids": step_ids,
+            "source": source,
+            "nuisance": nuisance,
+            "nuisance_names": tuple(nuisance_names),
+        }
+    return (
+        source,
+        nuisance,
+        tuple(nuisance_names),
+        {
+            "mode": mode,
+            "reused_measurements": previous_count,
+            "computed_measurements": len(step_ids) - previous_count,
+        },
+    )
+
+
 def _fisher_information(
     source_response: NDArray[np.float64],
     nuisance_response: NDArray[np.float64],
@@ -577,6 +697,8 @@ def _fisher_information(
     nuisance_scales: NDArray[np.float64],
     *,
     minimum_expected_count: float,
+    use_gpu: bool = False,
+    gpu_device: str = "cuda",
 ) -> tuple[
     NDArray[np.float64],
     NDArray[np.float64],
@@ -599,39 +721,168 @@ def _fisher_information(
         nuisance_coefficients.shape != nuisance_scales.shape
     ):
         raise ValueError("Nuisance response, coefficients, and scales must align.")
-    source_jacobian = np.einsum(
-        "abgi,gik->abk",
-        response,
-        source_basis,
-        optimize=True,
-    )
-    nuisance_jacobian = nuisance * nuisance_scales[None, None, :]
-    jacobian = np.concatenate((source_jacobian, nuisance_jacobian), axis=2)
-    expected = np.einsum(
-        "abgi,gi->ab",
-        response,
-        source_strengths,
-        optimize=True,
-    )
-    if nuisance_coefficients.size:
-        expected = expected + np.einsum(
-            "abn,n->ab",
-            nuisance,
-            nuisance_coefficients,
+    if use_gpu:
+        import torch
+
+        device = torch.device(gpu_device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA Fisher planning requested but CUDA is unavailable."
+            )
+
+        def tensor(values: object) -> object:
+            """Copy one validated planner array to float64 on the GPU."""
+            return torch.as_tensor(values, dtype=torch.float64, device=device)
+
+        response_t = tensor(response)
+        nuisance_t = tensor(nuisance)
+        source_jacobian_t = torch.einsum(
+            "abgi,gik->abk",
+            response_t,
+            tensor(source_basis),
+        )
+        nuisance_jacobian_t = nuisance_t * tensor(nuisance_scales)[None, None, :]
+        jacobian_t = torch.cat((source_jacobian_t, nuisance_jacobian_t), dim=2)
+        expected_t = torch.einsum(
+            "abgi,gi->ab",
+            response_t,
+            tensor(source_strengths),
+        )
+        if nuisance_coefficients.size:
+            expected_t = expected_t + torch.einsum(
+                "abn,n->ab",
+                nuisance_t,
+                tensor(nuisance_coefficients),
+            )
+        expected_t = torch.clamp(
+            expected_t,
+            min=float(minimum_expected_count),
+        )
+        information_t = torch.einsum(
+            "abp,abq,ab->apq",
+            jacobian_t,
+            jacobian_t,
+            1.0 / expected_t,
+        )
+        information_t = 0.5 * information_t.add(information_t.transpose(1, 2))
+        station_cross_t = torch.sum(jacobian_t, dim=1)
+        station_information_t = torch.sum(expected_t, dim=1)
+        information = information_t.detach().cpu().numpy()
+        expected = expected_t.detach().cpu().numpy()
+        station_cross = station_cross_t.detach().cpu().numpy()
+        station_information = station_information_t.detach().cpu().numpy()
+    else:
+        source_jacobian = np.einsum(
+            "abgi,gik->abk",
+            response,
+            source_basis,
             optimize=True,
         )
-    expected = np.maximum(expected, float(minimum_expected_count))
-    information = np.einsum(
-        "abp,abq,ab->apq",
-        jacobian,
-        jacobian,
-        1.0 / expected,
-        optimize=True,
-    )
-    information = 0.5 * (information + np.swapaxes(information, 1, 2))
-    station_cross = np.sum(jacobian, axis=1)
-    station_information = np.sum(expected, axis=1)
+        nuisance_jacobian = nuisance * nuisance_scales[None, None, :]
+        jacobian = np.concatenate((source_jacobian, nuisance_jacobian), axis=2)
+        expected = np.einsum(
+            "abgi,gi->ab",
+            response,
+            source_strengths,
+            optimize=True,
+        )
+        if nuisance_coefficients.size:
+            expected = expected + np.einsum(
+                "abn,n->ab",
+                nuisance,
+                nuisance_coefficients,
+                optimize=True,
+            )
+        expected = np.maximum(expected, float(minimum_expected_count))
+        information = np.einsum(
+            "abp,abq,ab->apq",
+            jacobian,
+            jacobian,
+            1.0 / expected,
+            optimize=True,
+        )
+        information = 0.5 * (information + np.swapaxes(information, 1, 2))
+        station_cross = np.sum(jacobian, axis=1)
+        station_information = np.sum(expected, axis=1)
     return information, station_information, station_cross, station_information
+
+
+def _historical_fisher_precision(
+    source_response: NDArray[np.float64],
+    nuisance_response: NDArray[np.float64],
+    source_basis: NDArray[np.float64],
+    source_strengths: NDArray[np.float64],
+    nuisance_coefficients: NDArray[np.float64],
+    nuisance_scales: NDArray[np.float64],
+    step_ids: Sequence[int],
+    *,
+    minimum_expected_count: float,
+    cache: dict[str, object] | None,
+) -> tuple[NDArray[np.float64], dict[str, object]]:
+    """Reuse historical Fisher terms only while their fitted state is exact."""
+    steps = tuple(int(value) for value in step_ids)
+    parameter_identity = (
+        np.asarray(source_basis, dtype=np.float64).tobytes(),
+        np.asarray(source_strengths, dtype=np.float64).tobytes(),
+        np.asarray(nuisance_coefficients, dtype=np.float64).tobytes(),
+        np.asarray(nuisance_scales, dtype=np.float64).tobytes(),
+        float(minimum_expected_count),
+    )
+    entry = None if cache is None else cache.get("historical_fisher")
+    previous_count = 0
+    if isinstance(entry, dict) and entry.get("identity") == parameter_identity:
+        previous_steps = entry.get("step_ids")
+        if isinstance(previous_steps, tuple) and steps[: len(previous_steps)] == (
+            previous_steps
+        ):
+            previous_count = len(previous_steps)
+            if previous_count == len(steps):
+                return np.asarray(entry["precision"], dtype=np.float64), {
+                    "mode": "prefix_hit",
+                    "reused_measurements": previous_count,
+                    "computed_measurements": 0,
+                }
+    if previous_count:
+        information, _, _, _ = _fisher_information(
+            source_response[previous_count:],
+            nuisance_response[previous_count:],
+            source_basis,
+            source_strengths,
+            nuisance_coefficients,
+            nuisance_scales,
+            minimum_expected_count=minimum_expected_count,
+        )
+        assert isinstance(entry, dict)
+        precision = np.asarray(entry["precision"], dtype=np.float64) + np.sum(
+            information,
+            axis=0,
+        )
+        mode = "prefix_append"
+    else:
+        information, _, _, _ = _fisher_information(
+            source_response,
+            nuisance_response,
+            source_basis,
+            source_strengths,
+            nuisance_coefficients,
+            nuisance_scales,
+            minimum_expected_count=minimum_expected_count,
+        )
+        precision = np.sum(information, axis=0)
+        mode = "full_rebuild"
+    precision = np.asarray(precision, dtype=np.float64)
+    precision.setflags(write=False)
+    if cache is not None:
+        cache["historical_fisher"] = {
+            "identity": parameter_identity,
+            "step_ids": steps,
+            "precision": precision,
+        }
+    return precision, {
+        "mode": mode,
+        "reused_measurements": previous_count,
+        "computed_measurements": len(steps) - previous_count,
+    }
 
 
 def _symmetric_spectral_separation(
@@ -862,6 +1113,443 @@ def _pair_rotation_radians(
     return angle(first_fe, second_fe) + angle(first_pb, second_pb)
 
 
+def _pair_rotation_cost_cache(
+    pair_ids: NDArray[np.int64],
+    orientations: NDArray[np.float64],
+    current_pair_id: int | None,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Precompute exact pair-to-pair and initial rotation costs once."""
+    pair_count = int(pair_ids.size)
+    matrix = np.empty((pair_count, pair_count), dtype=np.float64)
+    initial = np.empty(pair_count, dtype=np.float64)
+    for first_index, first_pair_id in enumerate(pair_ids):
+        initial[first_index] = _pair_rotation_radians(
+            current_pair_id,
+            int(first_pair_id),
+            orientations,
+        )
+        for second_index, second_pair_id in enumerate(pair_ids):
+            matrix[first_index, second_index] = _pair_rotation_radians(
+                int(first_pair_id),
+                int(second_pair_id),
+                orientations,
+            )
+    matrix.setflags(write=False)
+    initial.setflags(write=False)
+    return matrix, initial
+
+
+def _cuda_source_log_precision(
+    precision: object,
+    nuisance_count: int,
+    *,
+    torch_module: object,
+) -> NDArray[np.float64]:
+    """Return batched source log precision from float64 CUDA matrices."""
+    torch = torch_module
+    sign, full_logdet = torch.linalg.slogdet(precision)
+    valid = (sign > 0.0) & torch.isfinite(full_logdet)
+    if not bool(torch.all(valid).item()):
+        raise np.linalg.LinAlgError("Planning precision must be positive definite.")
+    if nuisance_count:
+        nuisance = precision[:, -nuisance_count:, -nuisance_count:]
+        nuisance_sign, nuisance_logdet = torch.linalg.slogdet(nuisance)
+        nuisance_valid = (nuisance_sign > 0.0) & torch.isfinite(nuisance_logdet)
+        if not bool(torch.all(nuisance_valid).item()):
+            raise np.linalg.LinAlgError(
+                "Planning nuisance precision must be positive definite."
+            )
+        full_logdet = full_logdet - nuisance_logdet
+    return full_logdet.detach().cpu().numpy().astype(np.float64, copy=False)
+
+
+def _cuda_beam_search_pose_program(
+    pair_ids: NDArray[np.int64],
+    information: NDArray[np.float64],
+    precision: NDArray[np.float64],
+    effective_nuisance_count: int,
+    bonuses: NDArray[np.float64],
+    rotation_cost_matrix: NDArray[np.float64],
+    initial_rotation_costs: NDArray[np.float64],
+    config: MLEPlanningConfig,
+    *,
+    current_pair_id: int | None,
+    gpu_device: str,
+) -> tuple[tuple[int, ...], tuple[int, ...], float, float]:
+    """Run the exact beam objective with batched float64 CUDA log determinants."""
+    import torch
+
+    device = torch.device(gpu_device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("CUDA beam planning requested but CUDA is unavailable.")
+    dtype = torch.float64
+    information_t = torch.as_tensor(information, dtype=dtype, device=device)
+    state_precisions = torch.as_tensor(
+        precision,
+        dtype=dtype,
+        device=device,
+    ).unsqueeze(0)
+    base_value = _source_log_precision(precision, effective_nuisance_count)
+    states: list[tuple[tuple[int, ...], tuple[int, ...], float, float, int | None]] = [
+        ((), (), base_value, 0.0, current_pair_id)
+    ]
+    for _ in range(int(config.shield_program_length)):
+        parents: list[int] = []
+        pair_indices: list[int] = []
+        metadata: list[tuple[tuple[int, ...], tuple[int, ...], float, int]] = []
+        for state_index, (
+            selected_indices,
+            selected_pairs,
+            _state_value,
+            rotation,
+            _previous,
+        ) in enumerate(states):
+            selected_set = set(selected_indices)
+            for pair_index, raw_pair_id in enumerate(pair_ids):
+                if pair_index in selected_set:
+                    continue
+                pair_id = int(raw_pair_id)
+                parents.append(state_index)
+                pair_indices.append(pair_index)
+                metadata.append(
+                    (
+                        (*selected_indices, pair_index),
+                        (*selected_pairs, pair_id),
+                        rotation
+                        + (
+                            float(initial_rotation_costs[pair_index])
+                            if not selected_indices
+                            else float(
+                                rotation_cost_matrix[
+                                    selected_indices[-1],
+                                    pair_index,
+                                ]
+                            )
+                        ),
+                        pair_id,
+                    )
+                )
+        if not metadata:
+            raise RuntimeError("No unselected shield pair remains.")
+        parent_t = torch.as_tensor(parents, dtype=torch.long, device=device)
+        pair_t = torch.as_tensor(pair_indices, dtype=torch.long, device=device)
+        next_precisions = state_precisions[parent_t] + information_t[pair_t]
+        next_values = _cuda_source_log_precision(
+            next_precisions,
+            effective_nuisance_count,
+            torch_module=torch,
+        )
+        expansions: list[
+            tuple[
+                tuple[float, float, tuple[int, ...]],
+                int,
+                tuple[tuple[int, ...], tuple[int, ...], float, float, int],
+            ]
+        ] = []
+        for expansion_index, (
+            (next_indices, next_pairs, next_rotation, pair_id),
+            next_value,
+        ) in enumerate(zip(metadata, next_values, strict=True)):
+            information_gain = 0.5 * (float(next_value) - base_value)
+            utility_bonus = float(np.mean(bonuses[list(next_indices)]))
+            partial_score = (
+                information_gain
+                + utility_bonus
+                - float(config.rotation_cost_weight) * next_rotation
+            )
+            expansions.append(
+                (
+                    (-partial_score, -information_gain, next_pairs),
+                    expansion_index,
+                    (
+                        next_indices,
+                        next_pairs,
+                        float(next_value),
+                        next_rotation,
+                        pair_id,
+                    ),
+                )
+            )
+        expansions.sort(key=lambda item: item[0])
+        retained = expansions[: int(config.shield_program_beam_width)]
+        retained_indices = torch.as_tensor(
+            [item[1] for item in retained],
+            dtype=torch.long,
+            device=device,
+        )
+        state_precisions = next_precisions[retained_indices]
+        states = [item[2] for item in retained]
+    selected_indices, selected_pairs, current_value, rotation, _ = states[0]
+    return selected_indices, selected_pairs, current_value, rotation
+
+
+def _cuda_beam_search_pose_programs(
+    pair_ids: NDArray[np.int64],
+    information: NDArray[np.float64],
+    precision: NDArray[np.float64],
+    effective_nuisance_count: int,
+    bonuses: NDArray[np.float64],
+    rotation_cost_matrix: NDArray[np.float64],
+    initial_rotation_costs: NDArray[np.float64],
+    config: MLEPlanningConfig,
+    *,
+    gpu_device: str,
+) -> tuple[
+    tuple[tuple[int, ...], tuple[int, ...], float, float],
+    ...,
+]:
+    """Run all candidate-pose beams in shared float64 CUDA batches."""
+    import torch
+
+    device = torch.device(gpu_device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("CUDA beam planning requested but CUDA is unavailable.")
+    candidate_count = int(information.shape[0])
+    information_t = torch.as_tensor(
+        information,
+        dtype=torch.float64,
+        device=device,
+    )
+    base_precision_t = torch.as_tensor(
+        precision,
+        dtype=torch.float64,
+        device=device,
+    )
+    state_precisions = base_precision_t[None, None].expand(
+        candidate_count,
+        1,
+        *precision.shape,
+    )
+    base_value = _source_log_precision(precision, effective_nuisance_count)
+    states: list[list[tuple[tuple[int, ...], tuple[int, ...], float, float]]] = [
+        [((), (), base_value, 0.0)] for _ in range(candidate_count)
+    ]
+    for _ in range(int(config.shield_program_length)):
+        candidate_indices: list[int] = []
+        parent_indices: list[int] = []
+        pair_indices: list[int] = []
+        metadata: list[tuple[int, tuple[int, ...], tuple[int, ...], float]] = []
+        for candidate_index, candidate_states in enumerate(states):
+            for state_index, (
+                selected_indices,
+                selected_pairs,
+                _state_value,
+                rotation,
+            ) in enumerate(candidate_states):
+                selected_set = set(selected_indices)
+                for pair_index, raw_pair_id in enumerate(pair_ids):
+                    if pair_index in selected_set:
+                        continue
+                    next_indices = (*selected_indices, pair_index)
+                    next_pairs = (*selected_pairs, int(raw_pair_id))
+                    next_rotation = rotation + (
+                        float(initial_rotation_costs[pair_index])
+                        if not selected_indices
+                        else float(
+                            rotation_cost_matrix[selected_indices[-1], pair_index]
+                        )
+                    )
+                    candidate_indices.append(candidate_index)
+                    parent_indices.append(state_index)
+                    pair_indices.append(pair_index)
+                    metadata.append(
+                        (
+                            candidate_index,
+                            next_indices,
+                            next_pairs,
+                            next_rotation,
+                        )
+                    )
+        candidate_t = torch.as_tensor(
+            candidate_indices,
+            dtype=torch.long,
+            device=device,
+        )
+        parent_t = torch.as_tensor(parent_indices, dtype=torch.long, device=device)
+        pair_t = torch.as_tensor(pair_indices, dtype=torch.long, device=device)
+        next_precisions = (
+            state_precisions[candidate_t, parent_t] + information_t[candidate_t, pair_t]
+        )
+        next_values = _cuda_source_log_precision(
+            next_precisions,
+            effective_nuisance_count,
+            torch_module=torch,
+        )
+        expansions: list[
+            list[
+                tuple[
+                    tuple[float, float, tuple[int, ...]],
+                    int,
+                    tuple[tuple[int, ...], tuple[int, ...], float, float],
+                ]
+            ]
+        ] = [[] for _ in range(candidate_count)]
+        for expansion_index, (
+            (candidate_index, next_indices, next_pairs, next_rotation),
+            next_value,
+        ) in enumerate(zip(metadata, next_values, strict=True)):
+            information_gain = 0.5 * (float(next_value) - base_value)
+            utility_bonus = float(np.mean(bonuses[candidate_index, list(next_indices)]))
+            partial_score = (
+                information_gain
+                + utility_bonus
+                - float(config.rotation_cost_weight) * next_rotation
+            )
+            expansions[candidate_index].append(
+                (
+                    (-partial_score, -information_gain, next_pairs),
+                    expansion_index,
+                    (
+                        next_indices,
+                        next_pairs,
+                        float(next_value),
+                        next_rotation,
+                    ),
+                )
+            )
+        retained_indices: list[int] = []
+        next_states: list[
+            list[tuple[tuple[int, ...], tuple[int, ...], float, float]]
+        ] = []
+        retained_count = None
+        for candidate_expansions in expansions:
+            candidate_expansions.sort(key=lambda item: item[0])
+            retained = candidate_expansions[: int(config.shield_program_beam_width)]
+            if retained_count is None:
+                retained_count = len(retained)
+            elif len(retained) != retained_count:
+                raise RuntimeError("Candidate beams retained inconsistent widths.")
+            retained_indices.extend(item[1] for item in retained)
+            next_states.append([item[2] for item in retained])
+        retained_t = torch.as_tensor(
+            retained_indices,
+            dtype=torch.long,
+            device=device,
+        )
+        assert retained_count is not None
+        state_precisions = next_precisions[retained_t].reshape(
+            candidate_count,
+            retained_count,
+            *precision.shape,
+        )
+        states = next_states
+    return tuple(
+        (
+            candidate_states[0][0],
+            candidate_states[0][1],
+            candidate_states[0][2],
+            candidate_states[0][3],
+        )
+        for candidate_states in states
+    )
+
+
+def _select_pose_programs_cuda(
+    candidate_indices: NDArray[np.int64],
+    poses: NDArray[np.float64],
+    pair_ids: NDArray[np.int64],
+    pair_information: NDArray[np.float64],
+    expected_counts: NDArray[np.float64],
+    base_precision: NDArray[np.float64],
+    nuisance_count: int,
+    orientations: NDArray[np.float64],
+    config: MLEPlanningConfig,
+    *,
+    travel_costs: NDArray[np.float64],
+    station_rate_cross_information: NDArray[np.float64] | None,
+    station_rate_information: NDArray[np.float64] | None,
+    pair_utility_bonus: NDArray[np.float64],
+    rotation_cost_matrix: NDArray[np.float64],
+    initial_rotation_costs: NDArray[np.float64],
+    gpu_device: str,
+) -> tuple[MLEPlanningAction, ...]:
+    """Select all pose programs through one CUDA beam sequence."""
+    precision = np.asarray(base_precision, dtype=np.float64)
+    information = np.asarray(pair_information, dtype=np.float64)
+    effective_nuisance_count = int(nuisance_count)
+    if station_rate_cross_information is not None:
+        if station_rate_information is None:
+            raise ValueError("Both future station-rate Fisher terms are required.")
+        parameter_count = int(precision.shape[0])
+        extended_precision = np.zeros(
+            (parameter_count + 1, parameter_count + 1),
+            dtype=np.float64,
+        )
+        extended_precision[:-1, :-1] = precision
+        extended_precision[-1, -1] = float(config.future_station_rate_prior_precision)
+        extended_information = np.zeros(
+            (
+                information.shape[0],
+                information.shape[1],
+                parameter_count + 1,
+                parameter_count + 1,
+            ),
+            dtype=np.float64,
+        )
+        extended_information[:, :, :-1, :-1] = information
+        extended_information[:, :, :-1, -1] = station_rate_cross_information
+        extended_information[:, :, -1, :-1] = station_rate_cross_information
+        extended_information[:, :, -1, -1] = station_rate_information
+        precision = extended_precision
+        information = extended_information
+        effective_nuisance_count += 1
+    selections = _cuda_beam_search_pose_programs(
+        pair_ids,
+        information,
+        precision,
+        effective_nuisance_count,
+        pair_utility_bonus,
+        rotation_cost_matrix,
+        initial_rotation_costs,
+        config,
+        gpu_device=gpu_device,
+    )
+    base_value = _source_log_precision(precision, effective_nuisance_count)
+    orientation_count = int(orientations.shape[0])
+    actions: list[MLEPlanningAction] = []
+    for local_index, (
+        selected_indices,
+        selected_pair_ids,
+        current_value,
+        total_rotation,
+    ) in enumerate(selections):
+        information_gain = 0.5 * (current_value - base_value)
+        utility_bonus = float(
+            np.mean(pair_utility_bonus[local_index, list(selected_indices)])
+        )
+        score = (
+            information_gain
+            + utility_bonus
+            - float(config.motion_cost_weight) * float(travel_costs[local_index])
+            - float(config.rotation_cost_weight) * total_rotation
+        )
+        actions.append(
+            MLEPlanningAction(
+                candidate_index=int(candidate_indices[local_index]),
+                detector_pose_xyz=tuple(float(value) for value in poses[local_index]),
+                shield_pair_ids=selected_pair_ids,
+                fe_orientation_indices=tuple(
+                    pair_id // orientation_count for pair_id in selected_pair_ids
+                ),
+                pb_orientation_indices=tuple(
+                    pair_id % orientation_count for pair_id in selected_pair_ids
+                ),
+                information_gain_nats=float(information_gain),
+                travel_cost=float(travel_costs[local_index]),
+                rotation_radians=float(total_rotation),
+                score=float(score),
+                live_time_s_by_view=tuple(
+                    float(config.live_time_s) for _ in selected_indices
+                ),
+                expected_total_counts_by_view=tuple(
+                    float(expected_counts[local_index, pair_index])
+                    for pair_index in selected_indices
+                ),
+            )
+        )
+    return tuple(actions)
+
+
 def _select_pose_program(
     candidate_index: int,
     pose_xyz: NDArray[np.float64],
@@ -878,6 +1566,10 @@ def _select_pose_program(
     station_rate_cross_information: NDArray[np.float64] | None = None,
     station_rate_information: NDArray[np.float64] | None = None,
     pair_utility_bonus: NDArray[np.float64] | None = None,
+    use_gpu: bool = False,
+    gpu_device: str = "cuda",
+    rotation_cost_matrix: NDArray[np.float64] | None = None,
+    initial_rotation_costs: NDArray[np.float64] | None = None,
 ) -> MLEPlanningAction:
     """Jointly optimize a complete station shield program with beam search."""
     if int(config.shield_program_length) > pair_ids.size:
@@ -919,83 +1611,122 @@ def _select_pose_program(
     )
     if bonuses.shape != (pair_ids.size,) or np.any(~np.isfinite(bonuses)):
         raise ValueError("pair_utility_bonus must be one finite value per pair.")
+    if rotation_cost_matrix is None or initial_rotation_costs is None:
+        rotation_cost_matrix, initial_rotation_costs = _pair_rotation_cost_cache(
+            pair_ids,
+            orientations,
+            current_pair_id,
+        )
+    rotation_costs = np.asarray(rotation_cost_matrix, dtype=np.float64)
+    initial_costs = np.asarray(initial_rotation_costs, dtype=np.float64)
+    if rotation_costs.shape != (pair_ids.size, pair_ids.size) or (
+        initial_costs.shape != (pair_ids.size,)
+    ):
+        raise ValueError("Precomputed rotation costs do not align with pair IDs.")
     base_value = _source_log_precision(precision, effective_nuisance_count)
-    states: list[
-        tuple[
-            tuple[int, ...],
-            tuple[int, ...],
-            NDArray[np.float64],
-            float,
-            float,
-            int | None,
-        ]
-    ] = [((), (), precision.copy(), base_value, 0.0, current_pair_id)]
-    for _ in range(int(config.shield_program_length)):
-        expansions: list[
-            tuple[
-                tuple[float, float, tuple[int, ...]],
-                tuple[
-                    tuple[int, ...],
-                    tuple[int, ...],
-                    NDArray[np.float64],
-                    float,
-                    float,
-                    int,
-                ],
-            ]
-        ] = []
-        for (
+    if use_gpu and precision.shape[0] >= 24:
+        (
             selected_indices,
-            selected_pairs,
-            state_precision,
-            _,
-            rotation,
-            previous,
-        ) in states:
-            selected_set = set(selected_indices)
-            for pair_index, raw_pair_id in enumerate(pair_ids):
-                if pair_index in selected_set:
-                    continue
-                pair_id = int(raw_pair_id)
-                next_indices = (*selected_indices, pair_index)
-                next_pairs = (*selected_pairs, pair_id)
-                next_precision = state_precision + information[pair_index]
-                next_value = _source_log_precision(
-                    next_precision,
-                    effective_nuisance_count,
-                )
-                next_rotation = rotation + _pair_rotation_radians(
-                    previous,
-                    pair_id,
-                    orientations,
-                )
-                information_gain = 0.5 * (next_value - base_value)
-                utility_bonus = float(np.mean(bonuses[list(next_indices)]))
-                partial_score = (
-                    information_gain
-                    + utility_bonus
-                    - float(config.rotation_cost_weight) * next_rotation
-                )
-                expansions.append(
-                    (
-                        (-partial_score, -information_gain, next_pairs),
-                        (
-                            next_indices,
-                            next_pairs,
-                            next_precision,
-                            next_value,
-                            next_rotation,
-                            pair_id,
-                        ),
+            selected_pair_ids,
+            current_value,
+            total_rotation,
+        ) = _cuda_beam_search_pose_program(
+            pair_ids,
+            information,
+            precision,
+            effective_nuisance_count,
+            bonuses,
+            rotation_costs,
+            initial_costs,
+            config,
+            current_pair_id=current_pair_id,
+            gpu_device=gpu_device,
+        )
+    else:
+        states: list[
+            tuple[
+                tuple[int, ...],
+                tuple[int, ...],
+                NDArray[np.float64],
+                float,
+                float,
+                int | None,
+            ]
+        ] = [((), (), precision.copy(), base_value, 0.0, current_pair_id)]
+        for _ in range(int(config.shield_program_length)):
+            expansions: list[
+                tuple[
+                    tuple[float, float, tuple[int, ...]],
+                    tuple[
+                        tuple[int, ...],
+                        tuple[int, ...],
+                        NDArray[np.float64],
+                        float,
+                        float,
+                        int,
+                    ],
+                ]
+            ] = []
+            for (
+                state_indices,
+                state_pairs,
+                state_precision,
+                _,
+                rotation,
+                _previous,
+            ) in states:
+                selected_set = set(state_indices)
+                for pair_index, raw_pair_id in enumerate(pair_ids):
+                    if pair_index in selected_set:
+                        continue
+                    pair_id = int(raw_pair_id)
+                    next_indices = (*state_indices, pair_index)
+                    next_pairs = (*state_pairs, pair_id)
+                    next_precision = state_precision + information[pair_index]
+                    next_value = _source_log_precision(
+                        next_precision,
+                        effective_nuisance_count,
                     )
-                )
-        if not expansions:
-            raise RuntimeError("No unselected shield pair remains.")
-        expansions.sort(key=lambda item: item[0])
-        states = [
-            state for _, state in expansions[: int(config.shield_program_beam_width)]
-        ]
-    selected_indices, selected_pair_ids, _, current_value, total_rotation, _ = states[0]
+                    next_rotation = rotation + (
+                        float(initial_costs[pair_index])
+                        if not state_indices
+                        else float(rotation_costs[state_indices[-1], pair_index])
+                    )
+                    information_gain = 0.5 * (next_value - base_value)
+                    utility_bonus = float(np.mean(bonuses[list(next_indices)]))
+                    partial_score = (
+                        information_gain
+                        + utility_bonus
+                        - float(config.rotation_cost_weight) * next_rotation
+                    )
+                    expansions.append(
+                        (
+                            (-partial_score, -information_gain, next_pairs),
+                            (
+                                next_indices,
+                                next_pairs,
+                                next_precision,
+                                next_value,
+                                next_rotation,
+                                pair_id,
+                            ),
+                        )
+                    )
+            if not expansions:
+                raise RuntimeError("No unselected shield pair remains.")
+            expansions.sort(key=lambda item: item[0])
+            states = [
+                state
+                for _, state in expansions[: int(config.shield_program_beam_width)]
+            ]
+        (
+            selected_indices,
+            selected_pair_ids,
+            _,
+            current_value,
+            total_rotation,
+            _,
+        ) = states[0]
     information_gain = 0.5 * (current_value - base_value)
     utility_bonus = float(np.mean(bonuses[list(selected_indices)]))
     score = (
@@ -1041,6 +1772,8 @@ def select_fisher_action(
     station_rate_cross_information: object | None = None,
     station_rate_information: object | None = None,
     pair_utility_bonus: object | None = None,
+    use_gpu: bool = False,
+    gpu_device: str = "cuda",
 ) -> tuple[MLEPlanningAction, tuple[MLEPlanningAction, ...]]:
     """Select a joint pose/program from precomputed expected Fisher matrices."""
     resolved = MLEPlanningConfig() if config is None else config
@@ -1108,29 +1841,60 @@ def select_fisher_action(
     if bonuses.shape != (candidate_count, pair_count) or np.any(~np.isfinite(bonuses)):
         raise ValueError("pair_utility_bonus must align with candidates and pairs.")
     costs = _validated_travel_costs(travel_costs, candidate_count)
-    actions = [
-        _select_pose_program(
-            index,
-            poses[index],
-            pair_array,
-            information[index],
-            totals[index],
-            precision,
-            nuisance_count,
-            orientation_array,
-            resolved,
-            travel_cost=float(costs[index]),
-            current_pair_id=current_pair_id,
-            station_rate_cross_information=(
-                None if station_cross is None else station_cross[index]
-            ),
-            station_rate_information=(
-                None if station_information is None else station_information[index]
-            ),
-            pair_utility_bonus=bonuses[index],
+    rotation_costs, initial_rotation_costs = _pair_rotation_cost_cache(
+        pair_array,
+        orientation_array,
+        current_pair_id,
+    )
+    if use_gpu and parameter_count >= 24 and candidate_count > 1:
+        actions = list(
+            _select_pose_programs_cuda(
+                np.arange(candidate_count, dtype=np.int64),
+                poses,
+                pair_array,
+                information,
+                totals,
+                precision,
+                nuisance_count,
+                orientation_array,
+                resolved,
+                travel_costs=costs,
+                station_rate_cross_information=station_cross,
+                station_rate_information=station_information,
+                pair_utility_bonus=bonuses,
+                rotation_cost_matrix=rotation_costs,
+                initial_rotation_costs=initial_rotation_costs,
+                gpu_device=gpu_device,
+            )
         )
-        for index in range(candidate_count)
-    ]
+    else:
+        actions = [
+            _select_pose_program(
+                index,
+                poses[index],
+                pair_array,
+                information[index],
+                totals[index],
+                precision,
+                nuisance_count,
+                orientation_array,
+                resolved,
+                travel_cost=float(costs[index]),
+                current_pair_id=current_pair_id,
+                station_rate_cross_information=(
+                    None if station_cross is None else station_cross[index]
+                ),
+                station_rate_information=(
+                    None if station_information is None else station_information[index]
+                ),
+                pair_utility_bonus=bonuses[index],
+                use_gpu=use_gpu,
+                gpu_device=gpu_device,
+                rotation_cost_matrix=rotation_costs,
+                initial_rotation_costs=initial_rotation_costs,
+            )
+            for index in range(candidate_count)
+        ]
     ranked = tuple(
         sorted(
             actions,
@@ -1157,6 +1921,7 @@ def plan_next_measurement(
     travel_costs: object | None = None,
     current_pair_id: int | None = None,
     alternative_estimates: Sequence[MLEEstimate] = (),
+    historical_response_cache: dict[str, object] | None = None,
 ) -> MLEPlanningResult:
     """Plan a joint next station and Fe/Pb program from one fitted MLE.
 
@@ -1202,41 +1967,64 @@ def plan_next_measurement(
     ):
         raise ValueError(f"current_pair_id must lie in [0, {pair_limit - 1}].")
 
+    planning_started = perf_counter()
+    response_seconds = 0.0
+    fisher_seconds = 0.0
+    beam_seconds = 0.0
     source_basis, basis_labels = _source_basis(estimate, resolved)
     source_strengths = np.asarray(
         estimate.patch_strength_by_isotope,
         dtype=np.float64,
     ).T
-    historical_source, historical_nuisance, nuisance_names = _spectral_design(
+    response_started = perf_counter()
+    (
+        historical_source,
+        historical_nuisance,
+        nuisance_names,
+        historical_cache_diagnostics,
+    ) = _historical_spectral_design(
         historical_observations,
         estimate,
         kernel,
         mle_config,
+        historical_response_cache,
     )
+    response_seconds += perf_counter() - response_started
     nuisance_coefficients = _nuisance_coefficients(estimate, nuisance_names)
     nuisance_scales = np.maximum(
         nuisance_coefficients,
         float(resolved.nuisance_scale_floor),
     )
-    historical_information, _, _, _ = _fisher_information(
+    fisher_started = perf_counter()
+    historical_precision, historical_fisher_diagnostics = _historical_fisher_precision(
         historical_source,
         historical_nuisance,
         source_basis,
         source_strengths,
         nuisance_coefficients,
         nuisance_scales,
+        historical_observations.step_ids,
         minimum_expected_count=float(resolved.minimum_expected_bin_count),
+        cache=historical_response_cache,
     )
+    fisher_seconds += perf_counter() - fisher_started
     parameter_count = int(source_basis.shape[2] + nuisance_coefficients.size)
-    base_precision = float(resolved.laplace_prior_precision) * np.eye(
-        parameter_count, dtype=np.float64
-    ) + np.sum(historical_information, axis=0)
+    base_precision = (
+        float(resolved.laplace_prior_precision)
+        * np.eye(parameter_count, dtype=np.float64)
+        + historical_precision
+    )
     nuisance_count = int(nuisance_coefficients.size)
     actions: list[MLEPlanningAction] = []
     pose_chunk = int(resolved.candidate_pose_chunk_size)
     orientation_count = int(orientations.shape[0])
     pair_fe = pair_ids // orientation_count
     pair_pb = pair_ids % orientation_count
+    rotation_costs, initial_rotation_costs = _pair_rotation_cost_cache(
+        pair_ids,
+        orientations,
+        current_pair_id,
+    )
     for start in range(0, int(poses.shape[0]), pose_chunk):
         stop = min(start + pose_chunk, int(poses.shape[0]))
         local_poses = poses[start:stop]
@@ -1253,14 +2041,17 @@ def plan_next_measurement(
             ),
             energy_bin_edges_keV=historical_observations.energy_bin_edges_keV,
         )
+        response_started = perf_counter()
         candidate_source, candidate_nuisance, candidate_names = _spectral_design(
             geometry,
             estimate,
             kernel,
             mle_config,
         )
+        response_seconds += perf_counter() - response_started
         if tuple(candidate_names) != tuple(nuisance_names):
             raise RuntimeError("Historical and candidate nuisance bases differ.")
+        fisher_started = perf_counter()
         (
             information,
             expected_counts,
@@ -1275,6 +2066,7 @@ def plan_next_measurement(
             nuisance_scales,
             minimum_expected_count=float(resolved.minimum_expected_bin_count),
         )
+        fisher_seconds += perf_counter() - fisher_started
         ambiguity = _ambiguity_metrics(
             candidate_source,
             information,
@@ -1304,53 +2096,86 @@ def plan_next_measurement(
             name: values.reshape(local_count, pair_ids.size)
             for name, values in ambiguity.items()
         }
-        for local_index in range(local_count):
-            global_index = start + local_index
-            bootstrap_multiplier = (
-                1.0
-                if historical_observations.measurement_count
-                < int(resolved.geometry_bootstrap_measurements)
-                else 0.25
-            )
-            pair_utility_bonus = (
-                float(resolved.floor_ceiling_separation_weight)
-                * ambiguity_by_pose["floor_ceiling"][local_index]
-                + float(resolved.support_hypothesis_separation_weight)
-                * ambiguity_by_pose["support"][local_index]
-                + float(resolved.z_fisher_weight)
-                * ambiguity_by_pose["z_fisher"][local_index]
-                + float(resolved.response_correlation_reduction_weight)
-                * ambiguity_by_pose["correlation"][local_index]
-                + float(resolved.elevation_diversity_weight)
-                * ambiguity_by_pose["elevation"][local_index]
-                + bootstrap_multiplier
-                * float(resolved.geometry_exploration_weight)
-                * ambiguity_by_pose["geometry"][local_index]
-            )
-            action = _select_pose_program(
-                global_index,
-                poses[global_index],
+        bootstrap_multiplier = (
+            1.0
+            if historical_observations.measurement_count
+            < int(resolved.geometry_bootstrap_measurements)
+            else 0.25
+        )
+        pair_utility_bonuses = (
+            float(resolved.floor_ceiling_separation_weight)
+            * ambiguity_by_pose["floor_ceiling"]
+            + float(resolved.support_hypothesis_separation_weight)
+            * ambiguity_by_pose["support"]
+            + float(resolved.z_fisher_weight) * ambiguity_by_pose["z_fisher"]
+            + float(resolved.response_correlation_reduction_weight)
+            * ambiguity_by_pose["correlation"]
+            + float(resolved.elevation_diversity_weight)
+            * ambiguity_by_pose["elevation"]
+            + bootstrap_multiplier
+            * float(resolved.geometry_exploration_weight)
+            * ambiguity_by_pose["geometry"]
+        )
+        beam_started = perf_counter()
+        if mle_config.use_gpu and parameter_count >= 24 and local_count > 1:
+            local_actions = _select_pose_programs_cuda(
+                np.arange(start, stop, dtype=np.int64),
+                local_poses,
                 pair_ids,
-                information[local_index],
-                expected_counts[local_index],
+                information,
+                expected_counts,
                 base_precision,
                 nuisance_count,
                 orientations,
                 resolved,
-                travel_cost=float(costs[global_index]),
-                current_pair_id=current_pair_id,
+                travel_costs=costs[start:stop],
                 station_rate_cross_information=(
-                    station_rate_cross[local_index]
-                    if mle_config.fit_station_rate_nuisance
-                    else None
+                    station_rate_cross if mle_config.fit_station_rate_nuisance else None
                 ),
                 station_rate_information=(
-                    station_rate_information[local_index]
+                    station_rate_information
                     if mle_config.fit_station_rate_nuisance
                     else None
                 ),
-                pair_utility_bonus=pair_utility_bonus,
+                pair_utility_bonus=pair_utility_bonuses,
+                rotation_cost_matrix=rotation_costs,
+                initial_rotation_costs=initial_rotation_costs,
+                gpu_device=str(mle_config.gpu_device),
             )
+        else:
+            local_actions = tuple(
+                _select_pose_program(
+                    start + local_index,
+                    local_poses[local_index],
+                    pair_ids,
+                    information[local_index],
+                    expected_counts[local_index],
+                    base_precision,
+                    nuisance_count,
+                    orientations,
+                    resolved,
+                    travel_cost=float(costs[start + local_index]),
+                    current_pair_id=current_pair_id,
+                    station_rate_cross_information=(
+                        station_rate_cross[local_index]
+                        if mle_config.fit_station_rate_nuisance
+                        else None
+                    ),
+                    station_rate_information=(
+                        station_rate_information[local_index]
+                        if mle_config.fit_station_rate_nuisance
+                        else None
+                    ),
+                    pair_utility_bonus=pair_utility_bonuses[local_index],
+                    use_gpu=bool(mle_config.use_gpu and parameter_count >= 24),
+                    gpu_device=str(mle_config.gpu_device),
+                    rotation_cost_matrix=rotation_costs,
+                    initial_rotation_costs=initial_rotation_costs,
+                )
+                for local_index in range(local_count)
+            )
+        beam_seconds += perf_counter() - beam_started
+        for local_index, action in enumerate(local_actions):
             selected_indices = np.asarray(
                 [
                     int(np.flatnonzero(pair_ids == pair_id)[0])
@@ -1415,6 +2240,21 @@ def plan_next_measurement(
             < int(resolved.geometry_bootstrap_measurements)
         ),
         "config": resolved.to_dict(),
+        "performance": {
+            "fisher_device": "cpu",
+            "beam_device": (
+                str(mle_config.gpu_device)
+                if mle_config.use_gpu and parameter_count >= 24
+                else "cpu"
+            ),
+            "dtype": "float64",
+            "response_seconds": response_seconds,
+            "fisher_seconds": fisher_seconds,
+            "beam_search_seconds": beam_seconds,
+            "elapsed_seconds": perf_counter() - planning_started,
+            "historical_response_cache": historical_cache_diagnostics,
+            "historical_fisher_cache": historical_fisher_diagnostics,
+        },
     }
     return MLEPlanningResult(
         selected_action=selected,
