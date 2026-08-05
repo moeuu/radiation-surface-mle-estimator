@@ -24,6 +24,7 @@ DASHBOARD_INDEX_FILENAME = "index.html"
 DEFAULT_DASHBOARD_PORT = 8878
 
 _HTTP_SERVERS: dict[tuple[str, int], ThreadingHTTPServer] = {}
+_HTTP_SERVER_ROOTS: dict[tuple[str, int], Path] = {}
 _HTTP_THREADS: list[threading.Thread] = []
 
 
@@ -96,6 +97,31 @@ def _default_public_host() -> str:
     return "127.0.0.1"
 
 
+def _available_dashboard_port(host: str, requested_port: int) -> int:
+    """Return the first locally available dashboard port at or above a request."""
+    for candidate in range(int(requested_port), min(int(requested_port) + 100, 65536)):
+        if (host, candidate) not in _HTTP_SERVERS and not _tcp_port_is_open(
+            host, candidate
+        ):
+            return candidate
+    raise OSError(
+        f"No dashboard port is available in {requested_port}.."
+        f"{min(int(requested_port) + 99, 65535)}."
+    )
+
+
+def _dashboard_browser_url(public_host: str, port: int) -> str:
+    """Return one explicit browser URL, including IPv6 brackets and index path."""
+    display_host = str(public_host).strip()
+    if not display_host:
+        raise ValueError("Dashboard public host must be nonempty.")
+    if "://" in display_host or "/" in display_host:
+        raise ValueError("Dashboard public host must be a host name or IP address.")
+    if ":" in display_host and not display_host.startswith("["):
+        display_host = f"[{display_host}]"
+    return f"http://{display_host}:{int(port)}/index.html"
+
+
 def ensure_dashboard_server(
     output_dir: str | Path,
     *,
@@ -115,13 +141,15 @@ def ensure_dashboard_server(
         if public_host is None and host in {"0.0.0.0", "::"}
         else str(public_host or host)
     )
-    url = f"http://{display_host}:{parsed_port}/"
-    key = (host, parsed_port)
-    if key in _HTTP_SERVERS or _tcp_port_is_open(host, parsed_port):
-        return url
+    requested_key = (host, parsed_port)
+    if requested_key in _HTTP_SERVERS and _HTTP_SERVER_ROOTS.get(requested_key) == root:
+        return _dashboard_browser_url(display_host, parsed_port)
+    selected_port = _available_dashboard_port(host, parsed_port)
+    url = _dashboard_browser_url(display_host, selected_port)
+    key = (host, selected_port)
 
-    log_path = root / "dashboard_server.log"
-    pid_path = root / "dashboard_server.pid"
+    log_path = root / f"dashboard_server_{selected_port}.log"
+    pid_path = root / f"dashboard_server_{selected_port}.pid"
     try:
         with log_path.open("ab") as log_handle:
             process = subprocess.Popen(
@@ -129,7 +157,7 @@ def ensure_dashboard_server(
                     sys.executable,
                     "-m",
                     "http.server",
-                    str(parsed_port),
+                    str(selected_port),
                     "--bind",
                     host,
                     "--directory",
@@ -141,7 +169,7 @@ def ensure_dashboard_server(
             )
         pid_path.write_text(f"{process.pid}\n", encoding="utf-8")
         for _ in range(20):
-            if _tcp_port_is_open(host, parsed_port):
+            if _tcp_port_is_open(host, selected_port):
                 return url
             if process.poll() is not None:
                 break
@@ -150,7 +178,7 @@ def ensure_dashboard_server(
         pass
 
     handler = partial(_QuietHandler, directory=root.as_posix())
-    server = ThreadingHTTPServer((host, parsed_port), handler)
+    server = ThreadingHTTPServer((host, selected_port), handler)
     thread = threading.Thread(
         target=server.serve_forever,
         name="online-mle-dashboard",
@@ -158,6 +186,7 @@ def ensure_dashboard_server(
     )
     thread.start()
     _HTTP_SERVERS[key] = server
+    _HTTP_SERVER_ROOTS[key] = root
     _HTTP_THREADS.append(thread)
     return url
 

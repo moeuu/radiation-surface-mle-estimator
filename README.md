@@ -60,8 +60,11 @@ uv run estimate-radiation-mle online-replay \
   --cpu --json
 ```
 
-This command starts the live dashboard server by default and prints its URL before
-the first station fit. The page refreshes from atomically published MLE snapshots;
+This command starts the live dashboard server by default and immediately prints a
+clickable `CUI dashboard URL: http://HOST:PORT/index.html` before the first station
+fit. If the requested port belongs to an older run, the launcher selects the next
+free port instead of displaying stale files. The page refreshes from atomically
+published MLE snapshots;
 it neither reads nor displays simulation truth. Use `--dashboard-port`,
 `--dashboard-host`, and `--dashboard-public-host` for remote delivery. Set
 `MLE_DASHBOARD_PUBLIC_HOST` when the externally reachable host should be discovered

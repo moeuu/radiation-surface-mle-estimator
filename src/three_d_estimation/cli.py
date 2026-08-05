@@ -45,6 +45,12 @@ RAL_PLANNING_CONFIG = ROOT / "configs" / "mle" / "ral_full_planning.json"
 RAL_STOP_CONFIG = ROOT / "configs" / "mle" / "ral_full_stop.json"
 
 
+def _print_cui_dashboard_url(url: str, *, json_output: bool) -> None:
+    """Print one immediately flushable CUI URL without corrupting JSON stdout."""
+    stream = sys.stderr if json_output else sys.stdout
+    print(f"CUI dashboard URL: {url}", file=stream, flush=True)
+
+
 def _add_fit_arguments(parser: argparse.ArgumentParser) -> None:
     """Add arguments shared by count and spectral replay commands."""
     parser.add_argument(
@@ -560,8 +566,7 @@ def _run_online(args: argparse.Namespace) -> int:
 
     def announce_dashboard(url: str) -> None:
         """Print the live URL without corrupting JSON standard output."""
-        stream = sys.stderr if args.json else sys.stdout
-        print(f"dashboard_url: {url}", file=stream, flush=True)
+        _print_cui_dashboard_url(url, json_output=bool(args.json))
 
     online_result = run_online_replay(
         args.run_dir,
@@ -633,8 +638,7 @@ def _run_ral_full_simulation(args: argparse.Namespace) -> int:
 
     def announce_dashboard(url: str) -> None:
         """Relay the MLE dashboard URL as soon as its server starts."""
-        stream = sys.stderr if args.json else sys.stdout
-        print(f"dashboard_url: {url}", file=stream, flush=True)
+        _print_cui_dashboard_url(url, json_output=bool(args.json))
 
     def relay_runtime(line: str) -> None:
         """Relay non-protocol runtime output without corrupting JSON results."""
@@ -702,7 +706,7 @@ def _run_ral_full_simulation(args: argparse.Namespace) -> int:
         if hasattr(result, "stop_reason"):
             print(f"stop_reason: {result.stop_reason}")
         if result.dashboard_url is not None:
-            print(f"dashboard_url: {result.dashboard_url}")
+            _print_cui_dashboard_url(result.dashboard_url, json_output=False)
     return 0
 
 
