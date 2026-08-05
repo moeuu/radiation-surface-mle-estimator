@@ -24,6 +24,11 @@ from .information_planner import MLEPlanningConfig, MLEPlanningResult
 from .online import OnlineMLESession
 from .ral import validate_ral_measurement_log
 
+RAL_PRIVATE_SCENE_PROFILES = (
+    "ral-mix9",
+    "ral-cs4-co3-eu0",
+)
+
 
 @dataclass(frozen=True, slots=True)
 class RALClosedLoopResult:
@@ -36,13 +41,15 @@ class RALClosedLoopResult:
     station_count: int
     stop_reason: str
     dashboard_url: str | None
+    private_scene_profile: str
 
     def to_dict(self) -> dict[str, object]:
         """Return a strict JSON-safe result payload."""
         return {
             "schema_version": 1,
             "status": "complete",
-            "profile": "ral_mix9_surface_mle_closed_loop_v1",
+            "profile": "ral_surface_mle_closed_loop_v1",
+            "private_scene_profile": self.private_scene_profile,
             "control_mode": "mle_closed_loop",
             "measurement_log_path": self.measurement_log_path.as_posix(),
             "mle_output_dir": self.mle_output_dir.as_posix(),
@@ -376,6 +383,7 @@ def run_ral_closed_loop(
     mle_config_path: str | Path,
     planning_config_path: str | Path,
     output_dir: str | Path,
+    private_scene_profile: str = "ral-mix9",
     max_measurements: int = 256,
     minimum_information_gain_nats: float = 1.0e-3,
     low_information_patience: int = 3,
@@ -390,6 +398,10 @@ def run_ral_closed_loop(
     output_hook: Callable[[str], None] = print,
 ) -> RALClosedLoopResult:
     """Run observation, MLE fit, Fisher selection, and runtime action in a loop."""
+    if private_scene_profile not in RAL_PRIVATE_SCENE_PROFILES:
+        raise ValueError(
+            f"private_scene_profile must be one of {RAL_PRIVATE_SCENE_PROFILES}."
+        )
     if isinstance(max_measurements, bool) or int(max_measurements) < 1:
         raise ValueError("max_measurements must be a positive safety bound.")
     if isinstance(low_information_patience, bool) or int(low_information_patience) < 1:
@@ -409,7 +421,7 @@ def run_ral_closed_loop(
     client = AdaptiveRuntimeClient(
         scenario_path,
         runtime_root=runtime_root,
-        private_scene_profile="ral-mix9",
+        private_scene_profile=private_scene_profile,
         output_hook=output_hook,
     )
     online: OnlineMLESession | None = None
@@ -588,10 +600,15 @@ def run_ral_closed_loop(
             station_count=station_count,
             stop_reason=stop_reason,
             dashboard_url=completed.dashboard_url,
+            private_scene_profile=private_scene_profile,
         )
     except BaseException:
         client.abort()
         raise
 
 
-__all__ = ["RALClosedLoopResult", "run_ral_closed_loop"]
+__all__ = [
+    "RALClosedLoopResult",
+    "RAL_PRIVATE_SCENE_PROFILES",
+    "run_ral_closed_loop",
+]

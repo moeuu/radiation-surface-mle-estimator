@@ -306,8 +306,9 @@ class _FakeRuntimeClient:
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         """Initialize a deterministic runtime handshake."""
-        del args, kwargs
+        del args
         type(self).instance = self
+        self.private_scene_profile = kwargs.get("private_scene_profile")
         self.requests: list[dict[str, object]] = []
         self.context = _context_payload()
         self.candidates = {
@@ -464,12 +465,14 @@ def test_closed_loop_sends_bootstrap_then_one_mle_selected_action(
         mle_config_path=mle_path,
         planning_config_path=planning_path,
         output_dir=tmp_path / "output",
+        private_scene_profile="ral-cs4-co3-eu0",
         max_measurements=2,
     )
 
     client = _FakeRuntimeClient.instance
     assert isinstance(result, RALClosedLoopResult)
     assert client is not None
+    assert client.private_scene_profile == "ral-cs4-co3-eu0"
     assert len(client.requests) == 2
     assert client.requests[0]["station_id"] == 0
     assert client.requests[1]["station_id"] == 1

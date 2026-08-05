@@ -10,7 +10,7 @@ The runtime owns external Geant4, detector and shield geometry, obstacle transpo
 spectra, source realization, raw observations, and MeasurementLog v2 publication.
 The private scenario contains only physical-scene and run identity inputs:
 
-- the Cs-137 x4, Co-60 x3, and Eu-154 x2 realized positions and strengths;
+- the selected private profile's realized source positions and strengths;
 - environment and obstacle geometry;
 - the authoritative runtime physics configuration;
 - the final MeasurementLog output location;
@@ -108,6 +108,20 @@ shape reference rather than an executable scenario. Replace `scene.sources` with
 nine complete source objects from the newly authored PF-style surface layout. The
 runtime's private `ral-mix9` profile requires exactly Cs-137 x4, Co-60 x3, and
 Eu-154 x2.
+
+For an explicit absent-isotope test, generate with runtime profile
+`ral-cs4-co3-eu0`. It contains Cs-137 x4 and Co-60 x3 with no Eu-154 truth source,
+while the candidate isotope list still includes Eu-154 so the MLE must infer a zero
+map rather than removing that parameter:
+
+```bash
+uv run --project ../Rotating-shield-simulation-runtime \
+  rotating-shield-sim generate-ral-scenario /private/ral-cs4-co3-eu0.json \
+  --measurement-log-output /runtime-logs/ral-cs4-co3-eu0 \
+  --run-id ral-cs4-co3-eu0 \
+  --runtime-config ../Rotating-shield-simulation-runtime/configs/geant4/variance_reduction_external_no_isaac_32threads.json \
+  --source-profile ral-cs4-co3-eu0
+```
 
 Each source object must contain exactly the eight fields shown above. In particular,
 do not recompute or round `transport_position`, `surface_uv`, the air-facing normal,
@@ -255,6 +269,8 @@ runtime remains alive across observations. Its JSON-lines protocol accepts one s
 action at a time and publishes the immutable MeasurementLog only when the MLE stops.
 The launcher also requests runtime's private `ral-mix9` profile check, so source
 cardinalities are enforced without exposing the realized source list to MLE.
+Use `--private-scene-profile ral-cs4-co3-eu0` for the explicit absent-Eu profile;
+the default remains `ral-mix9`.
 
 For a persistent multi-hour run:
 

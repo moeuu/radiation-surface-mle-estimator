@@ -13,7 +13,11 @@ from pathlib import Path
 import numpy as np
 from runtime.measurement_log import load_measurement_log
 
-from .closed_loop import MLEStopConfig, run_ral_closed_loop
+from .closed_loop import (
+    MLEStopConfig,
+    RAL_PRIVATE_SCENE_PROFILES,
+    run_ral_closed_loop,
+)
 from .config import MLEConfig
 from .conformance import compute_forward_conformance, save_forward_conformance
 from .future_scoring import (
@@ -195,6 +199,15 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "Private runtime scenario authored explicitly for this run, containing "
             "truth/environment/config/output but no acquisition actions. The MLE "
             "does not discover or generate this file."
+        ),
+    )
+    ral_parser.add_argument(
+        "--private-scene-profile",
+        choices=RAL_PRIVATE_SCENE_PROFILES,
+        default="ral-mix9",
+        help=(
+            "Runtime-private source-cardinality contract used only for live "
+            "scenario validation."
         ),
     )
     ral_source.add_argument(
@@ -645,6 +658,7 @@ def _run_ral_full_simulation(args: argparse.Namespace) -> int:
         result = run_ral_closed_loop(
             args.scenario,
             runtime_root=preflight.runtime_root,
+            private_scene_profile=args.private_scene_profile,
             mle_config_path=args.mle_config,
             planning_config_path=args.planning_config,
             output_dir=args.output_dir,

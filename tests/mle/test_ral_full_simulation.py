@@ -130,6 +130,8 @@ def test_ral_full_simulation_cli_supports_scenario_and_existing_log() -> None:
             "ral-full-simulation",
             "--scenario",
             "/private/ral-scenario.json",
+            "--private-scene-profile",
+            "ral-cs4-co3-eu0",
             "--output-dir",
             "/tmp/ral-mle",
         ]
@@ -147,6 +149,7 @@ def test_ral_full_simulation_cli_supports_scenario_and_existing_log() -> None:
 
     assert preflight.preflight_only is True
     assert adaptive.scenario == Path("/private/ral-scenario.json")
+    assert adaptive.private_scene_profile == "ral-cs4-co3-eu0"
     assert not hasattr(adaptive, "plan")
     assert adaptive.max_measurements == 256
     assert adaptive.minimum_information_gain_nats is None
