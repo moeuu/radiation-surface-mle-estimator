@@ -7,7 +7,7 @@ import json
 import os
 from pathlib import Path
 from time import perf_counter
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -1922,6 +1922,7 @@ def plan_next_measurement(
     current_pair_id: int | None = None,
     alternative_estimates: Sequence[MLEEstimate] = (),
     historical_response_cache: dict[str, object] | None = None,
+    progress_hook: Callable[[Mapping[str, object]], None] | None = None,
 ) -> MLEPlanningResult:
     """Plan a joint next station and Fe/Pb program from one fitted MLE.
 
@@ -1944,6 +1945,8 @@ def plan_next_measurement(
         for alternative in alternative_estimates
     ):
         raise TypeError("Every alternative estimate must be an MLEEstimate.")
+    if progress_hook is not None and not callable(progress_hook):
+        raise TypeError("progress_hook must be callable or None.")
     if mle_config.mode != "spectral":
         raise ValueError("Online MLE planning requires spectral mode.")
     if tuple(estimate.isotope_names) != tuple(mle_config.isotope_names) or (
@@ -1968,6 +1971,16 @@ def plan_next_measurement(
         raise ValueError(f"current_pair_id must lie in [0, {pair_limit - 1}].")
 
     planning_started = perf_counter()
+    if progress_hook is not None:
+        progress_hook(
+            {
+                "phase": "historical_setup",
+                "completed_candidates": 0,
+                "total_candidates": int(poses.shape[0]),
+                "elapsed_seconds": 0.0,
+                "eta_seconds": None,
+            }
+        )
     response_seconds = 0.0
     fisher_seconds = 0.0
     beam_seconds = 0.0
@@ -2017,6 +2030,8 @@ def plan_next_measurement(
     nuisance_count = int(nuisance_coefficients.size)
     actions: list[MLEPlanningAction] = []
     pose_chunk = int(resolved.candidate_pose_chunk_size)
+    candidate_count = int(poses.shape[0])
+    candidate_started = perf_counter()
     orientation_count = int(orientations.shape[0])
     pair_fe = pair_ids // orientation_count
     pair_pb = pair_ids % orientation_count
@@ -2025,8 +2040,28 @@ def plan_next_measurement(
         orientations,
         current_pair_id,
     )
-    for start in range(0, int(poses.shape[0]), pose_chunk):
-        stop = min(start + pose_chunk, int(poses.shape[0]))
+    if progress_hook is not None:
+        progress_hook(
+            {
+                "phase": "candidate_search",
+                "completed_candidates": 0,
+                "total_candidates": candidate_count,
+                "elapsed_seconds": 0.0,
+                "eta_seconds": None,
+            }
+        )
+    for start in range(0, candidate_count, pose_chunk):
+        stop = min(start + pose_chunk, candidate_count)
+        if progress_hook is not None:
+            progress_hook(
+                {
+                    "phase": "candidate_chunk",
+                    "completed_candidates": int(start),
+                    "total_candidates": candidate_count,
+                    "elapsed_seconds": perf_counter() - candidate_started,
+                    "eta_seconds": None,
+                }
+            )
         local_poses = poses[start:stop]
         local_count = int(local_poses.shape[0])
         expanded = np.repeat(local_poses, pair_ids.size, axis=0)
@@ -2206,6 +2241,25 @@ def plan_next_measurement(
                     elevation_diversity=elevation,
                     geometry_exploration=geometry,
                 )
+            )
+        if progress_hook is not None:
+            candidate_elapsed = perf_counter() - candidate_started
+            completed = int(stop)
+            progress_hook(
+                {
+                    "phase": "candidate_search",
+                    "completed_candidates": completed,
+                    "total_candidates": candidate_count,
+                    "elapsed_seconds": candidate_elapsed,
+                    "eta_seconds": (
+                        candidate_elapsed
+                        * float(candidate_count - completed)
+                        / float(completed)
+                    ),
+                    "response_seconds": response_seconds,
+                    "fisher_seconds": fisher_seconds,
+                    "beam_search_seconds": beam_seconds,
+                }
             )
     ranked = tuple(
         sorted(

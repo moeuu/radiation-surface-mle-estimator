@@ -425,6 +425,24 @@ def run_ral_closed_loop(
         output_hook=output_hook,
     )
     online: OnlineMLESession | None = None
+
+    def relay_progress(progress: Mapping[str, object]) -> None:
+        """Emit one compact long-running phase progress line with an ETA."""
+        completed = int(
+            progress.get("completed", progress.get("completed_candidates", 0))
+        )
+        total = int(progress.get("total", progress.get("total_candidates", 0)))
+        elapsed = float(progress.get("elapsed_seconds", 0.0))
+        eta_value = progress.get("eta_seconds")
+        eta = "estimating" if eta_value is None else f"{float(eta_value):.1f}s"
+        percent = 0.0 if total < 1 else 100.0 * completed / total
+        output_hook(
+            "Progress: "
+            f"phase={progress.get('phase', 'unknown')} "
+            f"completed={completed}/{total} ({percent:.1f}%) "
+            f"elapsed={elapsed:.1f}s eta={eta}"
+        )
+
     try:
         ready = client.read_event()
         _strict_fields(
@@ -469,6 +487,7 @@ def run_ral_closed_loop(
             dashboard_port=dashboard_port,
             dashboard_public_host=dashboard_public_host,
             dashboard_cui_overlay=dashboard_cui_overlay,
+            progress_hook=relay_progress,
         )
         if online.dashboard_url is not None and dashboard_url_hook is not None:
             dashboard_url_hook(online.dashboard_url)
@@ -519,6 +538,7 @@ def run_ral_closed_loop(
                 allowed_pair_ids=candidates["allowed_pair_ids"],
                 travel_costs=candidates["travel_costs"],
                 current_pair_id=candidates["current_pair_id"],
+                progress_hook=relay_progress,
             )
             refinement_count = int(
                 getattr(planning_config, "local_refinement_top_k", 0)
@@ -550,6 +570,7 @@ def run_ral_closed_loop(
                     travel_costs=candidates["travel_costs"],
                     current_pair_id=candidates["current_pair_id"],
                     overwrite=True,
+                    progress_hook=relay_progress,
                 )
             plan_history.append(plan)
             selected = plan.selected_action

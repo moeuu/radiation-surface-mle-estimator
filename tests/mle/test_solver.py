@@ -145,6 +145,38 @@ def test_surface_map_zero_signal_stays_zero() -> None:
     assert result.deviance == pytest.approx(0.0, abs=1.0e-10)
 
 
+def test_solver_reports_iteration_progress_and_eta() -> None:
+    """Long solver runs should expose checked iterations without changing results."""
+    events: list[dict[str, object]] = []
+
+    fit_surface_map_poisson(
+        np.asarray([10.0, 5.0], dtype=float),
+        np.eye(2, dtype=float),
+        np.ones(2, dtype=float),
+        config=SurfaceMapConfig(
+            max_iterations=6,
+            check_interval=2,
+            tolerance=0.0,
+            objective_tolerance=0.0,
+        ),
+        progress_hook=lambda event: events.append(dict(event)),
+        progress_phase="test_solver",
+    )
+
+    assert events[0] == {
+        "phase": "test_solver",
+        "completed": 0,
+        "total": 6,
+        "elapsed_seconds": 0.0,
+        "eta_seconds": None,
+    }
+    checked = [int(event["completed"]) for event in events[1:]]
+    assert checked
+    assert checked == sorted(checked)
+    assert all(event["phase"] == "test_solver" for event in events)
+    assert all(float(event["eta_seconds"]) >= 0.0 for event in events[1:])
+
+
 def test_surface_map_area_semantics_separate_density_and_strength() -> None:
     """Equal integrated sources on unequal patches should have inverse-area density."""
     result = fit_surface_map_poisson(

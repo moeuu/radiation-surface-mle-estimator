@@ -234,6 +234,7 @@ class OnlineMLESession:
         dashboard_port: int = DEFAULT_DASHBOARD_PORT,
         dashboard_public_host: str | None = None,
         dashboard_cui_overlay: Mapping[str, object] | None = None,
+        progress_hook: Callable[[Mapping[str, object]], None] | None = None,
     ) -> None:
         """Initialize one station-causal session and its output directory."""
         if not isinstance(context, RunContext):
@@ -264,6 +265,7 @@ class OnlineMLESession:
         active_backend = backend or SurfaceMLEBackend(
             config,
             run_root=resolved_run_root,
+            progress_hook=progress_hook,
         )
         self.context = context
         self.config = config
@@ -619,6 +621,7 @@ class OnlineMLESession:
         travel_costs: object | None = None,
         current_pair_id: int | None = None,
         overwrite: bool = False,
+        progress_hook: Callable[[Mapping[str, object]], None] | None = None,
     ) -> MLEPlanningResult:
         """Plan and publish the next runtime action after a completed station."""
         self._ensure_active()
@@ -635,6 +638,7 @@ class OnlineMLESession:
             allowed_pair_ids=allowed_pair_ids,
             travel_costs=travel_costs,
             current_pair_id=current_pair_id,
+            progress_hook=progress_hook,
         )
         if not isinstance(planned, MLEPlanningResult):
             raise TypeError("Online backend planning must return MLEPlanningResult.")

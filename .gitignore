@@ -8,5 +8,6 @@ build/
 dist/
 results/
 .ruff_cache/
+.cache/
 .vscode/
 images/

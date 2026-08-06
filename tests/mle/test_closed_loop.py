@@ -402,7 +402,18 @@ class _FakeOnlineSession:
 
     def plan_next_action(self, *args: object, **kwargs: object) -> MLEPlanningResult:
         """Select one next observation after the first fit."""
-        del args, kwargs
+        del args
+        progress_hook = kwargs.get("progress_hook")
+        if callable(progress_hook):
+            progress_hook(
+                {
+                    "phase": "candidate_search",
+                    "completed_candidates": 1,
+                    "total_candidates": 2,
+                    "elapsed_seconds": 3.0,
+                    "eta_seconds": 3.0,
+                }
+            )
         action = MLEPlanningAction(
             candidate_index=0,
             detector_pose_xyz=(0.5, 0.5, 1.0),
@@ -485,6 +496,7 @@ def test_closed_loop_sends_bootstrap_then_one_mle_selected_action(
     monkeypatch.setattr(
         closed_loop, "validate_ral_measurement_log", lambda path: fake_log
     )
+    output_lines: list[str] = []
 
     result = run_ral_closed_loop(
         tmp_path / "private-scenario.json",
@@ -494,6 +506,7 @@ def test_closed_loop_sends_bootstrap_then_one_mle_selected_action(
         output_dir=tmp_path / "output",
         private_scene_profile="ral-cs4-co3-eu0",
         max_measurements=2,
+        output_hook=output_lines.append,
     )
 
     client = _FakeRuntimeClient.instance
@@ -510,6 +523,12 @@ def test_closed_loop_sends_bootstrap_then_one_mle_selected_action(
     assert all("actions" not in request for request in client.requests)
     assert result.record_count == 2
     assert result.stop_reason == "maximum_measurement_safety_bound"
+    assert any(
+        "Progress: phase=candidate_search completed=1/2 (50.0%)"
+        in line
+        and "elapsed=3.0s eta=3.0s" in line
+        for line in output_lines
+    )
 
 
 def test_closed_loop_groups_same_pose_shield_views_into_one_station(

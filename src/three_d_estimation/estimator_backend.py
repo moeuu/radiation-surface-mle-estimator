@@ -349,15 +349,19 @@ class SurfaceMLEBackend:
         *,
         estimator_factory: EstimatorFactory = SurfaceMLEEstimator,
         run_root: str | Path | None = None,
+        progress_hook: Callable[[Mapping[str, object]], None] | None = None,
     ) -> None:
         """Store configuration, runtime asset root, and estimator factory."""
         if not isinstance(config, MLEConfig):
             raise TypeError("config must be MLEConfig.")
         if not callable(estimator_factory):
             raise TypeError("estimator_factory must be callable.")
+        if progress_hook is not None and not callable(progress_hook):
+            raise TypeError("progress_hook must be callable or None.")
         self.config = config
         self._estimator_factory = estimator_factory
         self._run_root = None if run_root is None else Path(run_root).resolve()
+        self._progress_hook = progress_hook
         self._context: RunContext | None = None
         self._environment: EnvironmentConfig | None = None
         self._obstacle_grid: ObstacleGrid | None = None
@@ -419,7 +423,7 @@ class SurfaceMLEBackend:
             obstacle_grid=obstacle_grid,
             use_gpu=bool(self.config.use_gpu),
         )
-        estimator = self._estimator_factory(self.config)
+        estimator = self._new_estimator(self.config)
         if not callable(getattr(estimator, "fit", None)):
             raise TypeError("estimator_factory must return an object with fit().")
 
@@ -428,6 +432,12 @@ class SurfaceMLEBackend:
         self._obstacle_grid = obstacle_grid
         self._kernel = kernel
         self._estimator = estimator
+
+    def _new_estimator(self, config: MLEConfig) -> SurfaceMLEEstimator:
+        """Create an estimator while preserving custom one-argument factories."""
+        if self._estimator_factory is SurfaceMLEEstimator:
+            return SurfaceMLEEstimator(config, progress_hook=self._progress_hook)
+        return self._estimator_factory(config)
 
     def _ensure_active(self) -> None:
         """Raise when the backend is uninitialized or already finalized."""
@@ -485,7 +495,7 @@ class SurfaceMLEBackend:
             != int(self.config.coarse_to_fine_levels)
         ):
             if self._online_estimator is None:
-                self._online_estimator = self._estimator_factory(
+                self._online_estimator = self._new_estimator(
                     replace(
                         self.config,
                         uncertainty_enable=False,
@@ -579,6 +589,7 @@ class SurfaceMLEBackend:
         allowed_pair_ids: Sequence[int] | None = None,
         travel_costs: object | None = None,
         current_pair_id: int | None = None,
+        progress_hook: Callable[[Mapping[str, object]], None] | None = None,
     ) -> MLEPlanningResult:
         """Rank runtime-supplied poses and Fe/Pb programs from the latest fit."""
         self._ensure_active()
@@ -614,6 +625,7 @@ class SurfaceMLEBackend:
             current_pair_id=resolved_current_pair,
             alternative_estimates=tuple(self._fit_estimates[-4:-1]),
             historical_response_cache=self._planning_response_cache,
+            progress_hook=progress_hook,
         )
 
     def finalize(self) -> EstimatorResult:

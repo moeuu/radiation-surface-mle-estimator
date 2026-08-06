@@ -5,7 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from time import perf_counter
-from typing import Sequence
+from typing import Callable, Mapping, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -273,8 +273,21 @@ def _fit_problem(
     initial_densities: NDArray[np.float64] | None = None,
     initial_nuisance: NDArray[np.float64] | None = None,
     persistent_response_cache: dict[str, object] | None = None,
+    progress_hook: Callable[[Mapping[str, object]], None] | None = None,
+    progress_label: str = "base",
 ) -> _FitState:
     """Build the configured forward model and solve one patch resolution."""
+    response_started = perf_counter()
+    if progress_hook is not None:
+        progress_hook(
+            {
+                "phase": f"mle_response:{progress_label}",
+                "completed": 0,
+                "total": 1,
+                "elapsed_seconds": 0.0,
+                "eta_seconds": None,
+            }
+        )
     if config.mode == "count":
         if batch.isotope_counts is None:
             raise ValueError(
@@ -374,6 +387,29 @@ def _fit_problem(
             "calibration_path": config.discrepancy_calibration_path,
         }
 
+    if progress_hook is not None:
+        response_elapsed = perf_counter() - response_started
+        progress_hook(
+            {
+                "phase": f"mle_response:{progress_label}",
+                "completed": 1,
+                "total": 1,
+                "elapsed_seconds": response_elapsed,
+                "eta_seconds": 0.0,
+            }
+        )
+    solver_started = perf_counter()
+    if progress_hook is not None:
+        progress_hook(
+            {
+                "phase": f"mle_solver:{progress_label}",
+                "completed": 0,
+                "total": 1,
+                "elapsed_seconds": 0.0,
+                "eta_seconds": None,
+            }
+        )
+
     if config.mode == "count" and config.count_likelihood != "poisson":
         if batch.isotope_covariances is None:
             raise ValueError(
@@ -434,6 +470,8 @@ def _fit_problem(
             gpu_dtype=str(config.gpu_dtype),
             response_device_cache_fraction=float(config.response_device_cache_fraction),
             persistent_response_cache=persistent_response_cache,
+            progress_hook=progress_hook,
+            progress_phase=f"mle_solver_iterations:{progress_label}",
         )
     else:
         fitted = fit_surface_map_poisson(
@@ -451,6 +489,19 @@ def _fit_problem(
                 nuisance_l2_weights=nuisance_l2_weights,
                 overdispersion_alpha_by_bin=overdispersion_alpha,
             ),
+            progress_hook=progress_hook,
+            progress_phase=f"mle_solver_iterations:{progress_label}",
+        )
+    if progress_hook is not None:
+        solver_elapsed = perf_counter() - solver_started
+        progress_hook(
+            {
+                "phase": f"mle_solver:{progress_label}",
+                "completed": 1,
+                "total": 1,
+                "elapsed_seconds": solver_elapsed,
+                "eta_seconds": 0.0,
+            }
         )
     return _FitState(
         patches=patches,
@@ -506,6 +557,7 @@ def _debias_state(
     observed: NDArray[np.float64],
     config: MLEConfig,
     persistent_response_cache: dict[str, object] | None = None,
+    progress_hook: Callable[[Mapping[str, object]], None] | None = None,
 ) -> _FitState:
     """Refit selected support without L1, TV, or group shrinkage bias."""
     if state.likelihood_diagnostics.get("family") in {
@@ -544,6 +596,8 @@ def _debias_state(
             gpu_dtype=str(config.gpu_dtype),
             response_device_cache_fraction=float(config.response_device_cache_fraction),
             persistent_response_cache=persistent_response_cache,
+            progress_hook=progress_hook,
+            progress_phase="mle_solver_iterations:debias",
         )
         return replace(state, response=masked_response, result=result)
     if state.response.ndim == 4:
@@ -566,6 +620,8 @@ def _debias_state(
             nuisance_l2_weights=state.nuisance_l2_weights,
             overdispersion_alpha_by_bin=state.overdispersion_alpha_by_bin,
         ),
+        progress_hook=progress_hook,
+        progress_phase="mle_solver_iterations:debias",
     )
     return replace(state, response=masked_response, result=result)
 
@@ -879,13 +935,37 @@ class SurfaceMLEEstimator:
         config: MLEConfig,
         *,
         persistent_response_cache: dict[str, object] | None = None,
+        progress_hook: Callable[[Mapping[str, object]], None] | None = None,
     ) -> None:
         """Store configuration and an optional exact device response cache."""
         if not isinstance(config, MLEConfig):
             raise TypeError("config must be an MLEConfig.")
+        if progress_hook is not None and not callable(progress_hook):
+            raise TypeError("progress_hook must be callable or None.")
         self.config = config
+        self._progress_hook = progress_hook
         self._persistent_response_cache = (
             {} if persistent_response_cache is None else persistent_response_cache
+        )
+
+    def _report_bootstrap_progress(
+        self,
+        completed: int,
+        total: int,
+        started: float,
+    ) -> None:
+        """Report completed exact bootstrap replicates and their running ETA."""
+        if self._progress_hook is None:
+            return
+        elapsed = perf_counter() - float(started)
+        self._progress_hook(
+            {
+                "phase": "mle_bootstrap",
+                "completed": int(completed),
+                "total": int(total),
+                "elapsed_seconds": elapsed,
+                "eta_seconds": elapsed * (int(total) - int(completed)) / completed,
+            }
         )
 
     def fit(
@@ -916,7 +996,10 @@ class SurfaceMLEEstimator:
                 l1_weight=float(selection.selected.l1_weight),
                 tv_weight=float(selection.selected.tv_weight),
             )
-            selected_estimate = SurfaceMLEEstimator(selected_config).fit(
+            selected_estimate = SurfaceMLEEstimator(
+                selected_config,
+                progress_hook=self._progress_hook,
+            ).fit(
                 batch,
                 environment,
                 kernel,
@@ -972,8 +1055,10 @@ class SurfaceMLEEstimator:
             initial_densities=initial_densities,
             initial_nuisance=initial_nuisance,
             persistent_response_cache=self._persistent_response_cache,
+            progress_hook=self._progress_hook,
+            progress_label="base",
         )
-        for _level in range(int(self.config.coarse_to_fine_levels)):
+        for level in range(int(self.config.coarse_to_fine_levels)):
             selected = _refinement_patch_ids(state, self.config.refinement_fraction)
             if not selected:
                 break
@@ -997,6 +1082,8 @@ class SurfaceMLEEstimator:
                 initial_densities=warm,
                 initial_nuisance=state.result.nuisance_coefficients,
                 persistent_response_cache=self._persistent_response_cache,
+                progress_hook=self._progress_hook,
+                progress_label=f"refinement_{level + 1}",
             )
 
         observed = (
@@ -1012,6 +1099,7 @@ class SurfaceMLEEstimator:
                 observed,
                 self.config,
                 self._persistent_response_cache,
+                self._progress_hook,
             )
         predicted = _full_prediction(state)
         held_out_deviance = (
@@ -1212,6 +1300,16 @@ class SurfaceMLEEstimator:
         bootstrap_seconds = 0.0
         if replicate_count:
             bootstrap_started = perf_counter()
+            if self._progress_hook is not None:
+                self._progress_hook(
+                    {
+                        "phase": "mle_bootstrap",
+                        "completed": 0,
+                        "total": replicate_count,
+                        "elapsed_seconds": 0.0,
+                        "eta_seconds": None,
+                    }
+                )
             rng = np.random.default_rng(int(self.config.bootstrap_seed))
             bootstrap_config = replace(
                 self.config,
@@ -1233,15 +1331,23 @@ class SurfaceMLEEstimator:
                     bootstrap_config,
                     persistent_response_cache=self._persistent_response_cache,
                 )
-                bootstrap_estimates.extend(
-                    bootstrap_estimator.fit(
-                        replicate_batch,
-                        environment,
-                        kernel,
-                        obstacle_grid=obstacle_grid,
+                for replicate_index, replicate_batch in enumerate(
+                    replicate_batches,
+                    start=1,
+                ):
+                    bootstrap_estimates.append(
+                        bootstrap_estimator.fit(
+                            replicate_batch,
+                            environment,
+                            kernel,
+                            obstacle_grid=obstacle_grid,
+                        )
                     )
-                    for replicate_batch in replicate_batches
-                )
+                    self._report_bootstrap_progress(
+                        replicate_index,
+                        replicate_count,
+                        bootstrap_started,
+                    )
             else:
                 cached_entries = self._persistent_response_cache.get("entries")
                 response_entries = (
@@ -1279,9 +1385,16 @@ class SurfaceMLEEstimator:
                     return result
 
                 with ThreadPoolExecutor(max_workers=batch_size) as executor:
-                    bootstrap_estimates.extend(
-                        executor.map(fit_replicate, replicate_batches)
-                    )
+                    for replicate_index, result in enumerate(
+                        executor.map(fit_replicate, replicate_batches),
+                        start=1,
+                    ):
+                        bootstrap_estimates.append(result)
+                        self._report_bootstrap_progress(
+                            replicate_index,
+                            replicate_count,
+                            bootstrap_started,
+                        )
             bootstrap_seconds = perf_counter() - bootstrap_started
         bootstrap, augmented_clusters = bootstrap_uncertainty_summary(
             estimate,

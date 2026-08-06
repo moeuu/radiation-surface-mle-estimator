@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from time import perf_counter
+from typing import Callable, Mapping
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -615,6 +616,8 @@ def fit_surface_map_poisson(
     initial_densities_cps_1m_m2: ArrayLike | None = None,
     initial_nuisance_coefficients: ArrayLike | None = None,
     config: SurfaceMapConfig | None = None,
+    progress_hook: Callable[[Mapping[str, object]], None] | None = None,
+    progress_phase: str = "mle_solver_iterations",
 ) -> SurfaceMapResult:
     """
     Fit a non-negative all-history Poisson surface intensity map.
@@ -629,6 +632,8 @@ def fit_surface_map_poisson(
     ``observed_shape + (patches, isotopes)`` and are flattened in one batch.
     """
     solver_config = SurfaceMapConfig() if config is None else config
+    if progress_hook is not None and not callable(progress_hook):
+        raise TypeError("progress_hook must be callable or None.")
     if solver_config.likelihood_family != "poisson":
         raise ValueError(
             "Calibrated overdispersion requires the matrix-free solver path."
@@ -697,6 +702,17 @@ def fit_surface_map_poisson(
     converged = False
     iterations = 0
     objective_history: list[float] = []
+    solve_started = perf_counter()
+    if progress_hook is not None:
+        progress_hook(
+            {
+                "phase": str(progress_phase),
+                "completed": 0,
+                "total": int(solver_config.max_iterations),
+                "elapsed_seconds": 0.0,
+                "eta_seconds": None,
+            }
+        )
 
     for iteration in range(1, int(solver_config.max_iterations) + 1):
         signal_bar = problem.response_by_density @ densities_bar.reshape(-1)
@@ -782,6 +798,21 @@ def fit_surface_map_poisson(
         previous_check_density = densities.copy()
         previous_check_nuisance = nuisance.copy()
         previous_objective = float(objective_terms.total)
+        if progress_hook is not None:
+            elapsed = perf_counter() - solve_started
+            progress_hook(
+                {
+                    "phase": str(progress_phase),
+                    "completed": int(iteration),
+                    "total": int(solver_config.max_iterations),
+                    "elapsed_seconds": elapsed,
+                    "eta_seconds": elapsed
+                    * (int(solver_config.max_iterations) - int(iteration))
+                    / int(iteration),
+                    "relative_change": relative_change,
+                    "relative_objective_change": relative_objective_change,
+                }
+            )
         if relative_change <= float(
             solver_config.tolerance
         ) and relative_objective_change <= float(solver_config.objective_tolerance):
@@ -1205,6 +1236,8 @@ def fit_surface_map_poisson_operator(
     gpu_dtype: str = "float64",
     response_device_cache_fraction: float = 0.6,
     persistent_response_cache: dict[str, object] | None = None,
+    progress_hook: Callable[[Mapping[str, object]], None] | None = None,
+    progress_phase: str = "mle_solver_iterations",
 ) -> SurfaceMapResult:
     """Fit Poisson surface density using streamed response products.
 
@@ -1221,6 +1254,8 @@ def fit_surface_map_poisson_operator(
     import torch
 
     solver_config = SurfaceMapConfig() if config is None else config
+    if progress_hook is not None and not callable(progress_hook):
+        raise TypeError("progress_hook must be callable or None.")
     observed_array = np.asarray(observed_counts, dtype=np.float64)
     if observed_array.shape != response_operator.observation_shape:
         raise ValueError("observed_counts must match response_operator shape.")
@@ -1309,6 +1344,16 @@ def fit_surface_map_poisson_operator(
         raise RuntimeError("CUDA matrix-free solve requested but CUDA is unavailable.")
     dtype = torch.float32 if gpu_dtype == "float32" else torch.float64
     solve_started = perf_counter()
+    if progress_hook is not None:
+        progress_hook(
+            {
+                "phase": str(progress_phase),
+                "completed": 0,
+                "total": int(solver_config.max_iterations),
+                "elapsed_seconds": 0.0,
+                "eta_seconds": None,
+            }
+        )
 
     def tensor(values: ArrayLike, *, integer: bool = False) -> object:
         """Copy one bounded array to the selected solver device."""
@@ -1590,6 +1635,21 @@ def fit_surface_map_poisson_operator(
             previous_density = densities.clone()
             previous_nuisance = nuisance.clone()
             previous_objective = terms[0]
+            if progress_hook is not None:
+                elapsed = perf_counter() - solve_started
+                progress_hook(
+                    {
+                        "phase": str(progress_phase),
+                        "completed": int(iteration),
+                        "total": int(solver_config.max_iterations),
+                        "elapsed_seconds": elapsed,
+                        "eta_seconds": elapsed
+                        * (int(solver_config.max_iterations) - int(iteration))
+                        / int(iteration),
+                        "relative_change": relative_change,
+                        "relative_objective_change": relative_objective_change,
+                    }
+                )
             if relative_change <= float(
                 solver_config.tolerance
             ) and relative_objective_change <= float(solver_config.objective_tolerance):
@@ -1669,6 +1729,21 @@ def fit_surface_map_poisson_operator(
         previous_density = densities.clone()
         previous_nuisance = nuisance.clone()
         previous_objective = terms[0]
+        if progress_hook is not None:
+            elapsed = perf_counter() - solve_started
+            progress_hook(
+                {
+                    "phase": str(progress_phase),
+                    "completed": int(iteration),
+                    "total": int(solver_config.max_iterations),
+                    "elapsed_seconds": elapsed,
+                    "eta_seconds": elapsed
+                    * (int(solver_config.max_iterations) - int(iteration))
+                    / int(iteration),
+                    "relative_change": relative_change,
+                    "relative_objective_change": relative_objective_change,
+                }
+            )
         if relative_change <= float(
             solver_config.tolerance
         ) and relative_objective_change <= float(solver_config.objective_tolerance):
