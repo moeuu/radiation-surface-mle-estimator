@@ -1063,6 +1063,12 @@ def _prepare_dense_torch_response(
             )
             return gathered, diagnostics, row_sums, column_sums
 
+    # Candidate planning can leave large, unreferenced blocks in PyTorch's
+    # CUDA caching allocator.  The driver reports those reserved blocks as
+    # unavailable, even though PyTorch can release them.  Flush only unused
+    # allocator blocks before deciding whether the exact response fits;
+    # live tensors, including the persistent response prefix, are preserved.
+    torch.cuda.empty_cache()
     free_bytes, _ = torch.cuda.mem_get_info(device)
     budget_bytes = int(float(cache_fraction) * int(free_bytes))
     diagnostics["free_device_bytes_at_prepare"] = int(free_bytes)

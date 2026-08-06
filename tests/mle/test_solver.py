@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from three_d_estimation.solver import (
+    _prepare_dense_torch_response,
     SurfaceMapConfig,
     evaluate_surface_map_objective,
     fit_surface_map_poisson,
@@ -78,6 +79,73 @@ def test_response_sums_share_one_operator_traversal() -> None:
     matrix = response.reshape(6, 2)
     np.testing.assert_array_equal(row_sums, np.sum(matrix, axis=1))
     np.testing.assert_array_equal(column_sums, np.sum(matrix, axis=0))
+
+
+def test_cuda_cache_budget_releases_unused_allocator_blocks_first() -> None:
+    """CUDA fit checks must measure free memory after allocator cleanup."""
+
+    class _Scalar:
+        """Expose the float64 element size used by the cache estimator."""
+
+        @staticmethod
+        def element_size() -> int:
+            """Return the test scalar size in bytes."""
+            return 8
+
+    class _Cuda:
+        """Record allocator cleanup and free-memory query ordering."""
+
+        def __init__(self) -> None:
+            """Initialize an empty call log."""
+            self.calls: list[str] = []
+
+        def empty_cache(self) -> None:
+            """Record release of unused allocator blocks."""
+            self.calls.append("empty_cache")
+
+        def mem_get_info(self, device: object) -> tuple[int, int]:
+            """Return a deliberately insufficient post-cleanup budget."""
+            del device
+            self.calls.append("mem_get_info")
+            return 100, 1_000
+
+    class _Torch:
+        """Provide the minimal torch surface needed before cache fallback."""
+
+        def __init__(self) -> None:
+            """Install the fake CUDA allocator."""
+            self.cuda = _Cuda()
+
+        @staticmethod
+        def empty(shape: object, *, dtype: object) -> _Scalar:
+            """Return one scalar carrying an eight-byte element size."""
+            del shape, dtype
+            return _Scalar()
+
+    class _Device:
+        """Represent one CUDA device for the cache-preparation test."""
+
+        type = "cuda"
+
+    response = np.ones((10, 10, 1), dtype=np.float64)
+    operator = _dense_density_operator(
+        response,
+        np.ones(10, dtype=np.float64),
+        isotope_count=1,
+    )
+    torch = _Torch()
+
+    matrix, diagnostics, _, _ = _prepare_dense_torch_response(
+        operator,
+        device=_Device(),
+        dtype=object(),
+        cache_fraction=0.5,
+        torch_module=torch,
+    )
+
+    assert matrix is None
+    assert diagnostics["fallback_reason"] == "response_exceeds_device_cache_budget"
+    assert torch.cuda.calls == ["empty_cache", "mem_get_info"]
 
 
 def test_surface_map_recovers_piecewise_smooth_density() -> None:
