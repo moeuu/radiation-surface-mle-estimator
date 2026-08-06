@@ -405,6 +405,16 @@ class _FakeOnlineSession:
         del args
         progress_hook = kwargs.get("progress_hook")
         if callable(progress_hook):
+            for completed, elapsed in ((0, 0.0), (20, 1.0), (40, 5.1), (100, 6.0)):
+                progress_hook(
+                    {
+                        "phase": "mle_solver_iterations:test",
+                        "completed": completed,
+                        "total": 100,
+                        "elapsed_seconds": elapsed,
+                        "eta_seconds": 0.0,
+                    }
+                )
             progress_hook(
                 {
                     "phase": "candidate_search",
@@ -529,6 +539,16 @@ def test_closed_loop_sends_bootstrap_then_one_mle_selected_action(
         and "elapsed=3.0s eta=3.0s" in line
         for line in output_lines
     )
+    solver_lines = [
+        line
+        for line in output_lines
+        if "phase=mle_solver_iterations:test" in line
+    ]
+    assert [line.split("completed=", 1)[1].split(" ", 1)[0] for line in solver_lines] == [
+        "0/100",
+        "40/100",
+        "100/100",
+    ]
 
 
 def test_closed_loop_groups_same_pose_shield_views_into_one_station(

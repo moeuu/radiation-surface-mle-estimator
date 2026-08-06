@@ -425,6 +425,7 @@ def run_ral_closed_loop(
         output_hook=output_hook,
     )
     online: OnlineMLESession | None = None
+    progress_last_elapsed: dict[str, float] = {}
 
     def relay_progress(progress: Mapping[str, object]) -> None:
         """Emit one compact long-running phase progress line with an ETA."""
@@ -433,12 +434,18 @@ def run_ral_closed_loop(
         )
         total = int(progress.get("total", progress.get("total_candidates", 0)))
         elapsed = float(progress.get("elapsed_seconds", 0.0))
+        phase = str(progress.get("phase", "unknown"))
+        if phase.startswith("mle_solver_iterations:"):
+            last_elapsed = progress_last_elapsed.get(phase, 0.0)
+            if completed not in {0, total} and elapsed - last_elapsed < 5.0:
+                return
+            progress_last_elapsed[phase] = elapsed
         eta_value = progress.get("eta_seconds")
         eta = "estimating" if eta_value is None else f"{float(eta_value):.1f}s"
         percent = 0.0 if total < 1 else 100.0 * completed / total
         output_hook(
             "Progress: "
-            f"phase={progress.get('phase', 'unknown')} "
+            f"phase={phase} "
             f"completed={completed}/{total} ({percent:.1f}%) "
             f"elapsed={elapsed:.1f}s eta={eta}"
         )
