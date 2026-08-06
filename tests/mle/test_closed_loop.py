@@ -310,6 +310,7 @@ class _FakeRuntimeClient:
         type(self).instance = self
         self.private_scene_profile = kwargs.get("private_scene_profile")
         self.requests: list[dict[str, object]] = []
+        self.cui_overlay_requests: list[bool] = []
         self.context = _context_payload()
         self.candidates = {
             "candidate_poses_xyz": [[0.5, 0.5, 1.0]],
@@ -346,6 +347,28 @@ class _FakeRuntimeClient:
             "candidates": self.candidates,
         }
 
+    def request_cui_overlay(self, *, include_truth: bool) -> dict[str, object]:
+        """Return display-only private truth outside estimator events."""
+        self.cui_overlay_requests.append(include_truth)
+        return {
+            "type": "cui_overlay",
+            "schema_version": 1,
+            "truth": {
+                "schema_version": 1,
+                "semantics": "evaluation_cui_overlay_only_not_estimator_input",
+                "true_sources": {
+                    "Co-60": [[1.0, 1.0, 0.0]],
+                    "Cs-137": [],
+                    "Eu-154": [],
+                },
+                "true_strengths": {
+                    "Co-60": [1000.0],
+                    "Cs-137": [],
+                    "Eu-154": [],
+                },
+            },
+        }
+
     def finalize(self) -> dict[str, object]:
         """Return the final immutable log location."""
         return {
@@ -361,9 +384,13 @@ class _FakeRuntimeClient:
 class _FakeOnlineSession:
     """Expose the online MLE operations used by the controller."""
 
+    last_dashboard_cui_overlay: object = None
+
     def __init__(self, *args: object, **kwargs: object) -> None:
         """Initialize record capture and a dashboard sentinel."""
-        del args, kwargs
+        del args
+        self.dashboard_cui_overlay = kwargs.get("dashboard_cui_overlay")
+        type(self).last_dashboard_cui_overlay = self.dashboard_cui_overlay
         self.records: list[object] = []
         self.dashboard_url = "http://127.0.0.1:8878/"
         self.bound_path: Path | None = None
@@ -473,6 +500,10 @@ def test_closed_loop_sends_bootstrap_then_one_mle_selected_action(
     assert isinstance(result, RALClosedLoopResult)
     assert client is not None
     assert client.private_scene_profile == "ral-cs4-co3-eu0"
+    assert client.cui_overlay_requests == [True]
+    overlay = _FakeOnlineSession.last_dashboard_cui_overlay
+    assert isinstance(overlay, dict)
+    assert len(overlay["truth"]["true_sources"]["Co-60"]) == 1
     assert len(client.requests) == 2
     assert client.requests[0]["station_id"] == 0
     assert client.requests[1]["station_id"] == 1

@@ -355,6 +355,33 @@ def test_obstacle_uses_the_matching_line_mu_row() -> None:
     assert second_ratio < 1.0e-6
 
 
+def test_obstacle_line_slice_preserves_matching_compton_row() -> None:
+    """Line kernels must select aligned total and Compton obstacle tables."""
+    obstacle_grid = ObstacleGrid(
+        origin=(0.0, 0.0),
+        cell_size=1.0,
+        grid_shape=(1, 1),
+        blocked_cells=(),
+        transport_boxes_m=((0.4, -0.1, -0.1, 0.6, 0.1, 0.1),),
+        transport_mu_by_isotope={"Co-60": (0.4,)},
+        transport_line_mu_by_isotope={"Co-60": ((0.2,), (0.4,))},
+        transport_line_compton_mu_by_isotope={
+            "Co-60": ((0.05,), (0.1,))
+        },
+    )
+
+    selected = spectral_builder._obstacle_grid_for_line(
+        obstacle_grid,
+        "Co-60",
+        1,
+        require_line_resolved=True,
+    )
+
+    assert selected is not None
+    assert selected.transport_line_mu_values("Co-60") == ((0.4,),)
+    assert selected.transport_line_compton_mu_values("Co-60") == ((0.1,),)
+
+
 def test_incomplete_obstacle_line_table_is_rejected() -> None:
     """A partial line table cannot silently fall back to aggregate attenuation."""
     edges = np.arange(1000.0, 1452.0, 2.0)

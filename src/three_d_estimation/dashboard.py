@@ -234,8 +234,12 @@ def _hotspot_payload(estimate: MLEEstimate) -> list[dict[str, object]]:
 def _dashboard_payload(
     estimate: MLEEstimate | None,
     state: Mapping[str, object],
+    *,
+    environment: Mapping[str, object] | None = None,
+    cui_overlay: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Build the browser's estimator-only live data contract."""
+    """Build the browser data contract with a display-only CUI overlay."""
+    truth = None if cui_overlay is None else cui_overlay.get("truth")
     payload: dict[str, object] = {
         "schema_version": 1,
         "status": str(state.get("status", "starting")),
@@ -252,6 +256,10 @@ def _dashboard_payload(
         "density_by_isotope": {},
         "detector_positions_xyz": [],
         "hotspots": [],
+        "cui": {
+            "environment": dict(environment or {}),
+            "truth": truth,
+        },
     }
     if estimate is None:
         return payload
@@ -291,14 +299,22 @@ def _dashboard_payload(
 
 
 class OnlineMLEDashboard:
-    """Publish a self-refreshing estimator-only browser workspace."""
+    """Publish a self-refreshing estimator and private-CUI browser workspace."""
 
-    def __init__(self, output_dir: str | Path) -> None:
+    def __init__(
+        self,
+        output_dir: str | Path,
+        *,
+        environment: Mapping[str, object] | None = None,
+        cui_overlay: Mapping[str, object] | None = None,
+    ) -> None:
         """Create static dashboard assets in an online result directory."""
         self.output_dir = Path(output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.index_path = self.output_dir / DASHBOARD_INDEX_FILENAME
         self.data_path = self.output_dir / DASHBOARD_DATA_FILENAME
+        self.environment = dict(environment or {})
+        self.cui_overlay = None if cui_overlay is None else dict(cui_overlay)
         _write_bytes_atomic(self.index_path, _DASHBOARD_HTML.encode("utf-8"))
 
     def publish(
@@ -307,7 +323,12 @@ class OnlineMLEDashboard:
         state: Mapping[str, object],
     ) -> None:
         """Atomically publish the latest browser data snapshot."""
-        payload = _dashboard_payload(estimate, state)
+        payload = _dashboard_payload(
+            estimate,
+            state,
+            environment=self.environment,
+            cui_overlay=self.cui_overlay,
+        )
         encoded = (
             json.dumps(
                 payload,
@@ -355,15 +376,18 @@ _DASHBOARD_HTML = r"""<!doctype html>
     .pulse.finalized { animation: none; box-shadow: none; }
     @keyframes pulse { 70% { box-shadow: 0 0 0 8px rgba(64,224,208,0); } }
     .workspace { height: calc(100svh - 70px); display: grid; grid-template-columns: minmax(0, 1fr) 350px; }
-    .stage { position: relative; min-width: 0; overflow: hidden; background: radial-gradient(circle at 50% 48%, #151b1f 0, var(--bg) 64%); }
-    #surface { width: 100%; height: 100%; display: block; }
-    .stage-head { position: absolute; inset: 24px 26px auto 26px; display: flex; align-items: flex-start; justify-content: space-between; pointer-events: none; }
+    .stage { min-width: 0; overflow: hidden; display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); }
+    .view { position: relative; min-width: 0; overflow: hidden; background: radial-gradient(circle at 50% 48%, #151b1f 0, var(--bg) 64%); }
+    canvas { width: 100%; height: 100%; display: block; }
+    .panel-label { position: absolute; left: 20px; top: 18px; padding: 7px 9px; background: rgba(9,11,13,.78); border: 1px solid var(--line); color: var(--muted); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; pointer-events: none; }
+    .truth-note { position: absolute; left: 20px; bottom: 18px; color: #ffbf69; font-size: 10px; letter-spacing: .04em; }
+    .stage-head { position: absolute; inset: 62px 20px auto 20px; display: flex; align-items: flex-start; justify-content: space-between; pointer-events: none; }
     .stage-title h1 { margin: 0; font-size: clamp(23px, 3vw, 42px); font-weight: 560; letter-spacing: -.045em; }
     .stage-title p { margin: 7px 0 0; color: var(--muted); max-width: 470px; }
     .tabs { display: flex; gap: 5px; pointer-events: auto; }
     .tabs button { border: 0; color: var(--muted); background: transparent; padding: 7px 10px; cursor: pointer; border-bottom: 1px solid transparent; }
     .tabs button.active { color: var(--text); border-color: var(--accent); }
-    .legend { position: absolute; left: 28px; bottom: 25px; color: var(--muted); font-size: 11px; letter-spacing: .02em; }
+    .legend { position: absolute; left: 20px; bottom: 18px; color: var(--muted); font-size: 11px; letter-spacing: .02em; }
     .legend i { display: inline-block; width: 108px; height: 3px; margin: 0 8px; vertical-align: middle; background: linear-gradient(90deg, #263137, var(--accent)); }
     .inspector { overflow: auto; border-left: 1px solid var(--line); background: var(--surface); padding: 25px 24px 32px; }
     .section { padding: 0 0 24px; margin: 0 0 24px; border-bottom: 1px solid var(--line); }
@@ -389,7 +413,7 @@ _DASHBOARD_HTML = r"""<!doctype html>
     @media (max-width: 860px) {
       .topbar { padding: 0 18px; }
       .workspace { height: auto; grid-template-columns: 1fr; }
-      .stage { height: 62svh; min-height: 430px; }
+      .stage { height: 100svh; min-height: 760px; grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
       .inspector { border-left: 0; border-top: 1px solid var(--line); }
       .stage-head { inset: 18px 18px auto; flex-direction: column; gap: 15px; }
     }
@@ -403,12 +427,20 @@ _DASHBOARD_HTML = r"""<!doctype html>
   </header>
   <main class="workspace">
     <section class="stage">
-      <canvas id="surface"></canvas>
-      <div class="stage-head">
-        <div class="stage-title"><h1>Surface intensity</h1><p>Station-complete, all-history maximum likelihood estimate. Detector path is shown in white.</p></div>
-        <nav id="tabs" class="tabs" aria-label="Isotope"></nav>
+      <div class="view">
+        <canvas id="environment"></canvas>
+        <div class="panel-label">Environment + source truth</div>
+        <div class="truth-note">PRIVATE CUI OVERLAY · NEVER USED BY MLE</div>
       </div>
-      <div class="legend">0 <i></i> peak density</div>
+      <div class="view">
+        <canvas id="surface"></canvas>
+        <div class="panel-label">MLE estimate</div>
+        <div class="stage-head">
+          <div class="stage-title"><h1>Surface intensity</h1><p>Station-complete, all-history maximum likelihood estimate. Detector path is shown in white.</p></div>
+          <nav id="tabs" class="tabs" aria-label="Isotope"></nav>
+        </div>
+        <div class="legend">0 <i></i> peak density</div>
+      </div>
     </section>
     <aside class="inspector">
       <section class="section"><p class="eyebrow">Run</p><div id="runId" class="run-id">—</div></section>
@@ -422,6 +454,8 @@ _DASHBOARD_HTML = r"""<!doctype html>
     const state = { data: null, isotope: null, updatedAt: 0 };
     const canvas = document.getElementById('surface');
     const ctx = canvas.getContext('2d');
+    const environmentCanvas = document.getElementById('environment');
+    const environmentCtx = environmentCanvas.getContext('2d');
     const esc = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     const fmt = value => Number.isFinite(Number(value)) ? Number(value).toLocaleString(undefined, {maximumFractionDigits: 3}) : '—';
     function project(point, bounds, width, height) {
@@ -431,7 +465,26 @@ _DASHBOARD_HTML = r"""<!doctype html>
       const sz = (z-minZ)/Math.max(maxZ-minZ, 1e-9);
       return [width*.5 + (sx-sy)*width*.43, height*.66 + (sx+sy)*height*.20 - sz*height*.42];
     }
+    function sizeCanvas(target, targetCtx) {
+      const ratio=Math.min(window.devicePixelRatio||1,2); const rect=target.getBoundingClientRect();
+      target.width=Math.max(1,Math.floor(rect.width*ratio));target.height=Math.max(1,Math.floor(rect.height*ratio));
+      targetCtx.setTransform(ratio,0,0,ratio,0,0);targetCtx.clearRect(0,0,rect.width,rect.height);return rect;
+    }
+    function drawEnvironment() {
+      const rect=sizeCanvas(environmentCanvas,environmentCtx), data=state.data||{}, cui=data.cui||{}, env=cui.environment||{}, truth=cui.truth||{};
+      const width=Math.max(Number(env.size_x)||1,1),height=Math.max(Number(env.size_y)||1,1),margin=42;
+      const scale=Math.min((rect.width-margin*2)/width,(rect.height-margin*2)/height),ox=(rect.width-width*scale)/2,oy=(rect.height-height*scale)/2;
+      const map=p=>[ox+Number(p[0])*scale,oy+(height-Number(p[1]))*scale];
+      environmentCtx.fillStyle='#0b0e10';environmentCtx.fillRect(ox,oy,width*scale,height*scale);environmentCtx.strokeStyle='rgba(255,255,255,.28)';environmentCtx.strokeRect(ox,oy,width*scale,height*scale);
+      const grid=env.obstacle_grid||{},cell=Number(grid.cell_size)||1,origin=grid.origin||[0,0];environmentCtx.fillStyle='rgba(148,163,174,.36)';
+      for(const item of (grid.blocked_cells||[])){const x=Number(origin[0])+Number(item[0])*cell,y=Number(origin[1])+Number(item[1])*cell;const p=map([x,y+cell]);environmentCtx.fillRect(p[0],p[1],cell*scale,cell*scale);}
+      const path=data.detector_positions_xyz||[];if(path.length){environmentCtx.beginPath();path.forEach((p,i)=>{const q=map(p);i?environmentCtx.lineTo(...q):environmentCtx.moveTo(...q)});environmentCtx.strokeStyle='rgba(255,255,255,.75)';environmentCtx.lineWidth=1.4;environmentCtx.stroke();}
+      const colors={'Cs-137':'#ffb454','Co-60':'#67b7ff','Eu-154':'#77e59b'};const sources=truth.true_sources||{},strengths=truth.true_strengths||{};let legendY=70;
+      for(const isotope of (data.isotopes||Object.keys(sources))){const positions=sources[isotope]||[],values=strengths[isotope]||[];environmentCtx.fillStyle=colors[isotope]||'#f06cff';environmentCtx.font='11px system-ui';environmentCtx.textAlign='left';environmentCtx.fillText(`${isotope}: ${positions.length}`,18,legendY);legendY+=16;positions.forEach((p,i)=>{const q=map(p);environmentCtx.beginPath();environmentCtx.arc(q[0],q[1],7,0,Math.PI*2);environmentCtx.fill();environmentCtx.strokeStyle='#090b0d';environmentCtx.lineWidth=2;environmentCtx.stroke();environmentCtx.fillStyle='#fff';environmentCtx.fillText(`${isotope} · ${fmt(values[i])} cps`,q[0]+10,q[1]-9);environmentCtx.fillStyle=colors[isotope]||'#f06cff';});}
+      if(!truth.true_sources){environmentCtx.fillStyle='#7f8a92';environmentCtx.textAlign='center';environmentCtx.fillText('Private CUI overlay unavailable',rect.width/2,rect.height/2);}
+    }
     function draw() {
+      drawEnvironment();
       const ratio = Math.min(window.devicePixelRatio || 1, 2);
       const rect = canvas.getBoundingClientRect();
       canvas.width = Math.max(1, Math.floor(rect.width*ratio)); canvas.height = Math.max(1, Math.floor(rect.height*ratio));

@@ -233,6 +233,7 @@ class OnlineMLESession:
         dashboard_host: str = "0.0.0.0",
         dashboard_port: int = DEFAULT_DASHBOARD_PORT,
         dashboard_public_host: str | None = None,
+        dashboard_cui_overlay: Mapping[str, object] | None = None,
     ) -> None:
         """Initialize one station-causal session and its output directory."""
         if not isinstance(context, RunContext):
@@ -291,7 +292,13 @@ class OnlineMLESession:
         self._latest_planning_state: dict[str, object] | None = None
         self._planning_paths: list[Path] = []
         self.dashboard = (
-            OnlineMLEDashboard(self.output_dir) if enable_dashboard else None
+            OnlineMLEDashboard(
+                self.output_dir,
+                environment=context.environment,
+                cui_overlay=dashboard_cui_overlay,
+            )
+            if enable_dashboard
+            else None
         )
         self.dashboard_url = (
             ensure_dashboard_server(

@@ -488,11 +488,23 @@ def _obstacle_grid_for_line(
             "Obstacle line attenuation table for "
             f"{isotope} has {len(rows)} rows but line index {line_index} was requested."
         )
+    compton_rows = grid.transport_line_compton_mu_values(isotope)
+    if compton_rows is not None and not 0 <= int(line_index) < len(compton_rows):
+        raise ValueError(
+            "Obstacle line Compton table for "
+            f"{isotope} has {len(compton_rows)} rows but line index "
+            f"{line_index} was requested."
+        )
     mu_by_isotope = dict(grid.transport_mu_by_isotope)
     return grid.with_transport_model(
         boxes_m=grid.transport_boxes_m,
         mu_by_isotope=mu_by_isotope,
         line_mu_by_isotope={str(isotope): (rows[int(line_index)],)},
+        line_compton_mu_by_isotope=(
+            None
+            if compton_rows is None
+            else {str(isotope): (compton_rows[int(line_index)],)}
+        ),
     )
 
 

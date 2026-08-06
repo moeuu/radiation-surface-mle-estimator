@@ -450,6 +450,11 @@ def run_ral_closed_loop(
             raise ValueError(
                 "RAL MLE isotopes must match the adaptive runtime scenario."
             )
+        dashboard_cui_overlay = (
+            client.request_cui_overlay(include_truth=True)
+            if enable_dashboard
+            else None
+        )
         online = OnlineMLESession(
             context=context,
             config=mle_config,
@@ -463,6 +468,7 @@ def run_ral_closed_loop(
             dashboard_host=dashboard_host,
             dashboard_port=dashboard_port,
             dashboard_public_host=dashboard_public_host,
+            dashboard_cui_overlay=dashboard_cui_overlay,
         )
         if online.dashboard_url is not None and dashboard_url_hook is not None:
             dashboard_url_hook(online.dashboard_url)

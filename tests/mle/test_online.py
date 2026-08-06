@@ -198,6 +198,16 @@ def test_online_session_publishes_each_causal_station_and_final_report(
         output_dir=output_dir,
         backend=_FakeOnlineBackend(),
         measurement_log_sha256="d" * 64,
+        dashboard_cui_overlay={
+            "type": "cui_overlay",
+            "schema_version": 1,
+            "truth": {
+                "schema_version": 1,
+                "semantics": "evaluation_cui_overlay_only_not_estimator_input",
+                "true_sources": {"Cs-137": [[0.5, 0.5, 0.0]]},
+                "true_strengths": {"Cs-137": [1200.0]},
+            },
+        },
     )
 
     assert session.receive_persisted(_record(0, 0, station_complete=False)) is None
@@ -236,6 +246,11 @@ def test_online_session_publishes_each_causal_station_and_final_report(
     assert dashboard["density_by_isotope"]["Cs-137"] == [3.0]
     assert dashboard["detector_positions_xyz"] == []
     assert dashboard["planning"]["selected_action"]["shield_pair_ids"] == [3]
+    assert dashboard["cui"]["truth"]["true_sources"]["Cs-137"] == [
+        [0.5, 0.5, 0.0]
+    ]
+    assert "truth" not in state
+    assert "cui" not in state
     planning_path = output_dir / "planning" / "after_step_00000002.json"
     assert planning_path.is_file()
     planning = json.loads(planning_path.read_text(encoding="utf-8"))
