@@ -14,7 +14,12 @@ import threading
 import time
 from typing import Mapping
 
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
+from numpy.typing import NDArray
 
 from .types import MLEEstimate
 
@@ -22,6 +27,10 @@ from .types import MLEEstimate
 DASHBOARD_DATA_FILENAME = "dashboard_data.json"
 DASHBOARD_INDEX_FILENAME = "index.html"
 DEFAULT_DASHBOARD_PORT = 8878
+OVERVIEW_IMAGE_FILENAME = "latest_experiment_overview.png"
+ROBOT_IMAGE_FILENAME = "latest_robot_2d.png"
+MLE_IMAGE_FILENAME = "latest_mle_3d.png"
+SPECTRUM_IMAGE_FILENAME = "latest_spectrum.png"
 
 _HTTP_SERVERS: dict[tuple[str, int], ThreadingHTTPServer] = {}
 _HTTP_SERVER_ROOTS: dict[tuple[str, int], Path] = {}
@@ -231,6 +240,371 @@ def _hotspot_payload(estimate: MLEEstimate) -> list[dict[str, object]]:
     return hotspots
 
 
+_ISOTOPE_COLORS = {
+    "Cs-137": "#d62728",
+    "Co-60": "#1f77b4",
+    "Eu-154": "#2ca02c",
+}
+
+
+def _environment_bounds(
+    environment: Mapping[str, object],
+    estimate: MLEEstimate | None,
+) -> tuple[float, float, float]:
+    """Return positive xyz plotting bounds from runtime-owned scene metadata."""
+    x_max = _finite_float(environment.get("size_x"), fallback=0.0)
+    y_max = _finite_float(environment.get("size_y"), fallback=0.0)
+    z_max = _finite_float(environment.get("size_z"), fallback=0.0)
+    if estimate is not None:
+        points = np.asarray(
+            [patch.centroid_xyz for patch in estimate.patches],
+            dtype=np.float64,
+        )
+        x_max = max(x_max, float(np.max(points[:, 0], initial=1.0)))
+        y_max = max(y_max, float(np.max(points[:, 1], initial=1.0)))
+        z_max = max(z_max, float(np.max(points[:, 2], initial=1.0)))
+    return max(x_max, 1.0), max(y_max, 1.0), max(z_max, 1.0)
+
+
+def _draw_obstacles(
+    axis: object,
+    environment: Mapping[str, object],
+) -> None:
+    """Draw the runtime-owned obstacle grid on one top-down Matplotlib axis."""
+    from matplotlib.patches import Rectangle
+
+    raw_grid = environment.get("obstacle_grid", {})
+    grid = raw_grid if isinstance(raw_grid, Mapping) else {}
+    cell_size = max(_finite_float(grid.get("cell_size"), fallback=1.0), 1.0e-9)
+    raw_origin = grid.get("origin", (0.0, 0.0))
+    origin = np.asarray(raw_origin, dtype=np.float64).reshape(-1)
+    if origin.size < 2:
+        origin = np.zeros(2, dtype=np.float64)
+    for raw_cell in grid.get("blocked_cells", []):
+        cell = np.asarray(raw_cell, dtype=np.float64).reshape(-1)
+        if cell.size < 2 or np.any(~np.isfinite(cell[:2])):
+            continue
+        axis.add_patch(
+            Rectangle(
+                (
+                    float(origin[0] + cell[0] * cell_size),
+                    float(origin[1] + cell[1] * cell_size),
+                ),
+                cell_size,
+                cell_size,
+                facecolor="#404040",
+                edgecolor="#404040",
+                zorder=0,
+            )
+        )
+
+
+def _truth_arrays(
+    cui_overlay: Mapping[str, object] | None,
+    isotope: str,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return evaluation-only truth positions and strengths for one isotope."""
+    truth = None if cui_overlay is None else cui_overlay.get("truth")
+    if not isinstance(truth, Mapping):
+        return np.zeros((0, 3), dtype=np.float64), np.zeros(0, dtype=np.float64)
+    sources = truth.get("true_sources", {})
+    strengths = truth.get("true_strengths", {})
+    raw_positions = sources.get(isotope, []) if isinstance(sources, Mapping) else []
+    raw_strengths = strengths.get(isotope, []) if isinstance(strengths, Mapping) else []
+    positions = np.asarray(raw_positions, dtype=np.float64)
+    if positions.size == 0:
+        positions = np.zeros((0, 3), dtype=np.float64)
+    elif positions.ndim != 2 or positions.shape[1] != 3:
+        positions = np.zeros((0, 3), dtype=np.float64)
+    values = np.asarray(raw_strengths, dtype=np.float64).reshape(-1)
+    if values.size != positions.shape[0]:
+        values = np.zeros(positions.shape[0], dtype=np.float64)
+    return positions, values
+
+
+def _hotspot_arrays(
+    estimate: MLEEstimate | None,
+    isotope: str,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return MLE hotspot centroids and integrated strengths for one isotope."""
+    if estimate is None:
+        return np.zeros((0, 3), dtype=np.float64), np.zeros(0, dtype=np.float64)
+    rows = [
+        row
+        for row in _hotspot_payload(estimate)
+        if str(row.get("isotope")) == isotope
+    ]
+    if not rows:
+        return np.zeros((0, 3), dtype=np.float64), np.zeros(0, dtype=np.float64)
+    return (
+        np.asarray([row["centroid_xyz"] for row in rows], dtype=np.float64),
+        np.asarray(
+            [row["integrated_strength_cps_1m"] for row in rows],
+            dtype=np.float64,
+        ),
+    )
+
+
+def _draw_path(axis: object, payload: Mapping[str, object], *, three_d: bool) -> None:
+    """Draw the traversed detector path using the PF CUI visual vocabulary."""
+    positions = np.asarray(payload.get("detector_positions_xyz", []), dtype=np.float64)
+    if positions.ndim != 2 or positions.shape[1] != 3 or not positions.size:
+        return
+    if three_d:
+        axis.plot(
+            positions[:, 0],
+            positions[:, 1],
+            positions[:, 2],
+            color="#20dfe3",
+            linewidth=1.8,
+            zorder=4,
+        )
+        axis.scatter(
+            positions[:, 0],
+            positions[:, 1],
+            positions[:, 2],
+            s=28,
+            facecolors="white",
+            edgecolors="#00cfd5",
+            zorder=5,
+        )
+    else:
+        axis.plot(
+            positions[:, 0],
+            positions[:, 1],
+            color="#20dfe3",
+            linewidth=1.8,
+            zorder=4,
+        )
+        axis.scatter(
+            positions[:, 0],
+            positions[:, 1],
+            s=34,
+            facecolors="white",
+            edgecolors="#00cfd5",
+            zorder=5,
+        )
+
+
+def _save_figure_atomic(figure: object, path: Path) -> None:
+    """Atomically publish one Matplotlib PNG without partial browser reads."""
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    if temporary.exists():
+        raise FileExistsError(f"Dashboard image staging file exists: {temporary}")
+    try:
+        figure.savefig(temporary, format="png", dpi=150, bbox_inches="tight")
+        os.replace(temporary, path)
+    finally:
+        plt.close(figure)
+        if temporary.exists():
+            temporary.unlink()
+
+
+def _render_dashboard_images(
+    estimate: MLEEstimate | None,
+    payload: Mapping[str, object],
+    environment: Mapping[str, object],
+    cui_overlay: Mapping[str, object] | None,
+    output_dir: Path,
+) -> None:
+    """Render the PF-style scientific PNG set for the browser CUI."""
+    isotopes = tuple(str(value) for value in payload.get("isotopes", []))
+    x_max, y_max, z_max = _environment_bounds(environment, estimate)
+    progress = (
+        f"records={int(payload.get('record_count', 0))} "
+        f"station={payload.get('latest_station_id', '—')} "
+        f"step={payload.get('latest_step_id', '—')}"
+    )
+
+    overview, axes = plt.subplots(1, 2, figsize=(12.0, 6.0))
+    top_axis, elevation_axis = axes
+    _draw_obstacles(top_axis, environment)
+    _draw_path(top_axis, payload, three_d=False)
+    for isotope in isotopes:
+        color = _ISOTOPE_COLORS.get(isotope, "#9467bd")
+        truth_positions, _ = _truth_arrays(cui_overlay, isotope)
+        hotspots, _ = _hotspot_arrays(estimate, isotope)
+        if truth_positions.size:
+            top_axis.scatter(
+                truth_positions[:, 0], truth_positions[:, 1], marker="*", s=85,
+                color=color, label=f"true {isotope}", zorder=7,
+            )
+            elevation_axis.scatter(
+                truth_positions[:, 0], truth_positions[:, 2], marker="*", s=85,
+                color=color, label=f"true {isotope}", zorder=7,
+            )
+        if hotspots.size:
+            top_axis.scatter(
+                hotspots[:, 0], hotspots[:, 1], marker="x", s=145,
+                linewidths=2.2, color=color, label=f"MLE {isotope}", zorder=8,
+            )
+            elevation_axis.scatter(
+                hotspots[:, 0], hotspots[:, 2], marker="x", s=145,
+                linewidths=2.2, color=color, label=f"MLE {isotope}", zorder=8,
+            )
+    top_axis.set(xlim=(0.0, x_max), ylim=(0.0, y_max), xlabel="x [m]", ylabel="y [m]")
+    elevation_axis.set(
+        xlim=(0.0, x_max), ylim=(0.0, z_max), xlabel="x [m]", ylabel="z [m]"
+    )
+    top_axis.set_title("Top-down map: obstacles, path, truth, and MLE")
+    elevation_axis.set_title("Elevation projection: height ambiguity")
+    for axis in axes:
+        axis.grid(alpha=0.25)
+        axis.set_aspect("equal", adjustable="box")
+    handles, labels = top_axis.get_legend_handles_labels()
+    if handles:
+        overview.legend(handles, labels, loc="lower center", ncol=3, fontsize=8)
+    overview.suptitle(
+        f"RA-L experiment overview — Surface MLE\n{progress}",
+        fontweight="bold",
+    )
+    overview.tight_layout(rect=(0.0, 0.08, 1.0, 0.91))
+    _save_figure_atomic(overview, output_dir / OVERVIEW_IMAGE_FILENAME)
+
+    robot, robot_axis = plt.subplots(figsize=(8.4, 7.2))
+    _draw_obstacles(robot_axis, environment)
+    _draw_path(robot_axis, payload, three_d=False)
+    for isotope in isotopes:
+        color = _ISOTOPE_COLORS.get(isotope, "#9467bd")
+        truth_positions, _ = _truth_arrays(cui_overlay, isotope)
+        hotspots, _ = _hotspot_arrays(estimate, isotope)
+        if truth_positions.size:
+            robot_axis.scatter(
+                truth_positions[:, 0], truth_positions[:, 1], marker="*", s=95,
+                color=color, label=f"true {isotope}", zorder=7,
+            )
+        if hotspots.size:
+            robot_axis.scatter(
+                hotspots[:, 0], hotspots[:, 1], marker="x", s=170,
+                linewidths=2.4, color=color, label=f"MLE {isotope}", zorder=8,
+            )
+    robot_axis.set(
+        xlim=(0.0, x_max), ylim=(0.0, y_max), xlabel="x [m]", ylabel="y [m]"
+    )
+    robot_axis.set_aspect("equal", adjustable="box")
+    robot_axis.grid(alpha=0.25)
+    robot_axis.set_title(f"Robot 2D position — {progress}")
+    handles, labels = robot_axis.get_legend_handles_labels()
+    if handles:
+        robot_axis.legend(handles, labels, loc="upper left", bbox_to_anchor=(1.01, 1.0))
+    robot.tight_layout()
+    _save_figure_atomic(robot, output_dir / ROBOT_IMAGE_FILENAME)
+
+    mle_figure = plt.figure(figsize=(14.0, 6.2))
+    density_axis = mle_figure.add_subplot(1, 2, 1, projection="3d")
+    hotspot_axis = mle_figure.add_subplot(1, 2, 2, projection="3d")
+    if estimate is not None:
+        patch_points = np.asarray(
+            [patch.centroid_xyz for patch in estimate.patches], dtype=np.float64
+        )
+        for isotope_index, isotope in enumerate(isotopes):
+            if isotope_index >= estimate.density_by_isotope.shape[0]:
+                continue
+            density = np.asarray(estimate.density_by_isotope[isotope_index], dtype=float)
+            peak = max(float(np.max(density, initial=0.0)), 1.0e-12)
+            active = density > peak * 1.0e-4
+            if np.any(active):
+                density_axis.scatter(
+                    patch_points[active, 0], patch_points[active, 1], patch_points[active, 2],
+                    s=4.0 + 34.0 * np.sqrt(density[active] / peak), alpha=0.38,
+                    color=_ISOTOPE_COLORS.get(isotope, "#9467bd"), label=isotope,
+                )
+            hotspots, strengths = _hotspot_arrays(estimate, isotope)
+            if hotspots.size:
+                sizes = 90.0 + 120.0 * strengths / max(float(np.max(strengths)), 1.0e-12)
+                hotspot_axis.scatter(
+                    hotspots[:, 0], hotspots[:, 1], hotspots[:, 2], marker="x",
+                    s=sizes, linewidths=2.5,
+                    color=_ISOTOPE_COLORS.get(isotope, "#9467bd"), label=f"MLE {isotope}",
+                )
+    _draw_path(hotspot_axis, payload, three_d=True)
+    for isotope in isotopes:
+        truth_positions, _ = _truth_arrays(cui_overlay, isotope)
+        if truth_positions.size:
+            hotspot_axis.scatter(
+                truth_positions[:, 0], truth_positions[:, 1], truth_positions[:, 2],
+                marker="*", s=100, color=_ISOTOPE_COLORS.get(isotope, "#9467bd"),
+                label=f"true {isotope}",
+            )
+    for axis, title in (
+        (density_axis, "Surface-patch intensity"),
+        (hotspot_axis, "MLE hotspot centroids"),
+    ):
+        axis.set(xlim=(0.0, x_max), ylim=(0.0, y_max), zlim=(0.0, z_max))
+        axis.set_xlabel("x [m]")
+        axis.set_ylabel("y [m]")
+        axis.set_zlabel("z [m]")
+        axis.set_title(title)
+        axis.view_init(elev=27.0, azim=-58.0)
+        handles, labels = axis.get_legend_handles_labels()
+        if handles:
+            axis.legend(handles, labels, fontsize=8)
+    mle_figure.suptitle(f"Surface MLE 3D — {progress}")
+    mle_figure.tight_layout()
+    _save_figure_atomic(mle_figure, output_dir / MLE_IMAGE_FILENAME)
+
+    spectrum, spectrum_axis = plt.subplots(figsize=(11.0, 4.8))
+    observed = np.asarray(
+        payload.get("latest_observed_spectrum_counts", []),
+        dtype=np.float64,
+    ).reshape(-1)
+    energy_edges = np.asarray(
+        payload.get("energy_bin_edges_keV", []),
+        dtype=np.float64,
+    ).reshape(-1)
+    energy_axis = (
+        0.5 * (energy_edges[:-1] + energy_edges[1:])
+        if energy_edges.size == observed.size + 1
+        else np.arange(observed.size, dtype=np.float64)
+    )
+    if observed.size:
+        spectrum_axis.step(
+            energy_axis,
+            observed,
+            where="mid",
+            color="#202020",
+            linewidth=0.8,
+            alpha=0.75,
+            label="observed",
+        )
+    predicted_available = False
+    if estimate is not None and estimate.predicted_spectra is not None:
+        predicted = np.asarray(estimate.predicted_spectra, dtype=np.float64)
+        if predicted.ndim == 2 and predicted.shape[0]:
+            prediction = predicted[-1]
+            prediction_axis = (
+                energy_axis
+                if energy_axis.size == prediction.size
+                else np.arange(prediction.size, dtype=np.float64)
+            )
+            spectrum_axis.plot(
+                prediction_axis,
+                prediction,
+                color="#1f77b4",
+                linewidth=1.0,
+                label="MLE prediction",
+            )
+            predicted_available = True
+    if observed.size or predicted_available:
+        spectrum_axis.set_yscale("symlog", linthresh=1.0)
+        spectrum_axis.set_ylabel("counts per measurement")
+        spectrum_axis.set_xlabel(
+            "energy [keV]"
+            if energy_edges.size == observed.size + 1
+            else "spectrum bin"
+        )
+        spectrum_axis.legend()
+    else:
+        spectrum_axis.text(
+            0.5, 0.5, "Predicted spectrum appears after the first completed fit",
+            ha="center", va="center", transform=spectrum_axis.transAxes,
+        )
+    spectrum_axis.grid(alpha=0.25)
+    spectrum_axis.set_title(f"Latest observed and predicted spectrum — {progress}")
+    spectrum.tight_layout()
+    _save_figure_atomic(spectrum, output_dir / SPECTRUM_IMAGE_FILENAME)
+
+
 def _dashboard_payload(
     estimate: MLEEstimate | None,
     state: Mapping[str, object],
@@ -256,6 +630,10 @@ def _dashboard_payload(
         "density_by_isotope": {},
         "detector_positions_xyz": [],
         "hotspots": [],
+        "latest_observed_spectrum_counts": list(
+            state.get("latest_observed_spectrum_counts", [])
+        ),
+        "energy_bin_edges_keV": list(state.get("energy_bin_edges_keV", [])),
         "cui": {
             "environment": dict(environment or {}),
             "truth": truth,
@@ -329,6 +707,13 @@ class OnlineMLEDashboard:
             environment=self.environment,
             cui_overlay=self.cui_overlay,
         )
+        _render_dashboard_images(
+            estimate,
+            payload,
+            self.environment,
+            self.cui_overlay,
+            self.output_dir,
+        )
         encoded = (
             json.dumps(
                 payload,
@@ -348,179 +733,45 @@ _DASHBOARD_HTML = r"""<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <link rel="icon" href="data:,">
-  <title>Radiation Surface MLE — Live</title>
+  <title>Rotating Shield MLE CUI View</title>
   <style>
-    :root {
-      color-scheme: dark;
-      --bg: #090b0d;
-      --surface: #0e1114;
-      --line: #252a2f;
-      --muted: #8b959e;
-      --text: #f2f5f7;
-      --accent: #40e0d0;
-      --danger: #ff756d;
-    }
     * { box-sizing: border-box; }
-    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--text); }
-    body { font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
-    button { font: inherit; }
-    .topbar {
-      height: 70px; display: flex; align-items: center; justify-content: space-between;
-      padding: 0 28px; border-bottom: 1px solid var(--line); background: rgba(9,11,13,.94);
-    }
-    .brand { display: flex; align-items: baseline; gap: 13px; letter-spacing: -.02em; }
-    .brand strong { font-size: 18px; font-weight: 650; }
-    .brand span { color: var(--muted); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; }
-    .run-state { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
-    .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 0 rgba(64,224,208,.45); animation: pulse 2s infinite; }
-    .pulse.finalized { animation: none; box-shadow: none; }
-    @keyframes pulse { 70% { box-shadow: 0 0 0 8px rgba(64,224,208,0); } }
-    .workspace { height: calc(100svh - 70px); display: grid; grid-template-columns: minmax(0, 1fr) 350px; }
-    .stage { min-width: 0; overflow: hidden; display: grid; grid-template-columns: 1fr 1fr; gap: 1px; background: var(--line); }
-    .view { position: relative; min-width: 0; overflow: hidden; background: radial-gradient(circle at 50% 48%, #151b1f 0, var(--bg) 64%); }
-    canvas { width: 100%; height: 100%; display: block; }
-    .panel-label { position: absolute; left: 20px; top: 18px; padding: 7px 9px; background: rgba(9,11,13,.78); border: 1px solid var(--line); color: var(--muted); font-size: 10px; letter-spacing: .12em; text-transform: uppercase; pointer-events: none; }
-    .truth-note { position: absolute; left: 20px; bottom: 18px; color: #ffbf69; font-size: 10px; letter-spacing: .04em; }
-    .stage-head { position: absolute; inset: 62px 20px auto 20px; display: flex; align-items: flex-start; justify-content: space-between; pointer-events: none; }
-    .stage-title h1 { margin: 0; font-size: clamp(23px, 3vw, 42px); font-weight: 560; letter-spacing: -.045em; }
-    .stage-title p { margin: 7px 0 0; color: var(--muted); max-width: 470px; }
-    .tabs { display: flex; gap: 5px; pointer-events: auto; }
-    .tabs button { border: 0; color: var(--muted); background: transparent; padding: 7px 10px; cursor: pointer; border-bottom: 1px solid transparent; }
-    .tabs button.active { color: var(--text); border-color: var(--accent); }
-    .legend { position: absolute; left: 20px; bottom: 18px; color: var(--muted); font-size: 11px; letter-spacing: .02em; }
-    .legend i { display: inline-block; width: 108px; height: 3px; margin: 0 8px; vertical-align: middle; background: linear-gradient(90deg, #263137, var(--accent)); }
-    .inspector { overflow: auto; border-left: 1px solid var(--line); background: var(--surface); padding: 25px 24px 32px; }
-    .section { padding: 0 0 24px; margin: 0 0 24px; border-bottom: 1px solid var(--line); }
-    .section:last-child { border-bottom: 0; }
-    .eyebrow { color: var(--muted); font-size: 10px; letter-spacing: .14em; text-transform: uppercase; margin: 0 0 12px; }
-    .run-id { font-size: 15px; overflow-wrap: anywhere; }
-    .metric { display: grid; grid-template-columns: 1fr auto; align-items: baseline; padding: 8px 0; }
-    .metric span { color: var(--muted); }
-    .metric strong { font-variant-numeric: tabular-nums; font-weight: 520; }
-    .timeline { list-style: none; margin: 0; padding: 0; }
-    .timeline li { position: relative; display: grid; grid-template-columns: 18px 1fr auto; gap: 8px; align-items: center; min-height: 35px; color: var(--muted); }
-    .timeline li::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); }
-    .timeline li:not(:last-child)::after { content: ""; position: absolute; left: 2px; top: 21px; bottom: -12px; width: 1px; background: var(--line); }
-    .timeline b { color: var(--text); font-weight: 500; }
-    .hotspot { padding: 10px 0; border-top: 1px solid var(--line); }
-    .hotspot:first-of-type { border-top: 0; }
-    .hotspot-top { display: flex; justify-content: space-between; gap: 12px; }
-    .hotspot small { color: var(--muted); }
-    .hotspot strong { font-weight: 520; font-variant-numeric: tabular-nums; }
-    .empty { color: var(--muted); padding: 6px 0; }
-    .fade { animation: settle .25s ease both; }
-    @keyframes settle { from { opacity: .55; transform: translateY(2px); } }
-    @media (max-width: 860px) {
-      .topbar { padding: 0 18px; }
-      .workspace { height: auto; grid-template-columns: 1fr; }
-      .stage { height: 100svh; min-height: 760px; grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
-      .inspector { border-left: 0; border-top: 1px solid var(--line); }
-      .stage-head { inset: 18px 18px auto; flex-direction: column; gap: 15px; }
-    }
-    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; } }
+    body { margin: 0; background: #111; color: #eee; font-family: sans-serif; }
+    header { padding: 10px 16px; background: #1d1d1d; border-bottom: 1px solid #333; display: flex; justify-content: space-between; gap: 16px; }
+    header span:last-child { color: #aaa; }
+    main { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 10px; }
+    section { background: #181818; border: 1px solid #333; padding: 8px; }
+    h2 { margin: 0 0 8px; font-size: 16px; font-weight: 600; }
+    img { width: 100%; height: calc(50vh - 70px); object-fit: contain; background: #fff; }
+    .wide { grid-column: 1 / span 2; }
+    .overview img { height: min(78vh, 980px); }
+    @media (max-width: 860px) { main { grid-template-columns: 1fr; } .wide { grid-column: auto; } img, .overview img { height: auto; } }
   </style>
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand"><strong>Radiation Surface MLE</strong><span>online estimator</span></div>
-    <div class="run-state"><i id="pulse" class="pulse"></i><span id="status">STARTING</span><span>·</span><span id="freshness">waiting for data</span></div>
-  </header>
-  <main class="workspace">
-    <section class="stage">
-      <div class="view">
-        <canvas id="environment"></canvas>
-        <div class="panel-label">Environment + source truth</div>
-        <div class="truth-note">PRIVATE CUI OVERLAY · NEVER USED BY MLE</div>
-      </div>
-      <div class="view">
-        <canvas id="surface"></canvas>
-        <div class="panel-label">MLE estimate</div>
-        <div class="stage-head">
-          <div class="stage-title"><h1>Surface intensity</h1><p>Station-complete, all-history maximum likelihood estimate. Detector path is shown in white.</p></div>
-          <nav id="tabs" class="tabs" aria-label="Isotope"></nav>
-        </div>
-        <div class="legend">0 <i></i> peak density</div>
-      </div>
-    </section>
-    <aside class="inspector">
-      <section class="section"><p class="eyebrow">Run</p><div id="runId" class="run-id">—</div></section>
-      <section class="section"><p class="eyebrow">Current fit</p><div id="metrics"></div></section>
-      <section class="section"><p class="eyebrow">Recommended next action</p><div id="nextAction"></div></section>
-      <section class="section"><p class="eyebrow">Station history</p><ol id="timeline" class="timeline"></ol></section>
-      <section class="section"><p class="eyebrow">Hotspots</p><div id="hotspots"></div></section>
-    </aside>
+  <header><span>Rotating Shield MLE CUI View — auto refresh every 2 s — truth: evaluation overlay only</span><span id="status">loading</span></header>
+  <main>
+    <section class="wide overview"><h2>RA-L experiment overview</h2><img id="overview" src="latest_experiment_overview.png" alt="MLE experiment overview"></section>
+    <section><h2>Robot position 2D</h2><img id="robot" src="latest_robot_2d.png" alt="Robot path and MLE estimates"></section>
+    <section><h2>Surface MLE 3D</h2><img id="mle" src="latest_mle_3d.png" alt="Three-dimensional MLE surface estimate"></section>
+    <section class="wide"><h2>Latest observed and predicted full spectrum</h2><img id="spectrum" src="latest_spectrum.png" alt="Latest observed and predicted spectrum"></section>
   </main>
   <script>
-    const state = { data: null, isotope: null, updatedAt: 0 };
-    const canvas = document.getElementById('surface');
-    const ctx = canvas.getContext('2d');
-    const environmentCanvas = document.getElementById('environment');
-    const environmentCtx = environmentCanvas.getContext('2d');
-    const esc = value => String(value ?? '—').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-    const fmt = value => Number.isFinite(Number(value)) ? Number(value).toLocaleString(undefined, {maximumFractionDigits: 3}) : '—';
-    function project(point, bounds, width, height) {
-      const [x,y,z] = point; const [minX,maxX,minY,maxY,minZ,maxZ] = bounds;
-      const sx = (x-minX)/Math.max(maxX-minX, 1e-9)-.5;
-      const sy = (y-minY)/Math.max(maxY-minY, 1e-9)-.5;
-      const sz = (z-minZ)/Math.max(maxZ-minZ, 1e-9);
-      return [width*.5 + (sx-sy)*width*.43, height*.66 + (sx+sy)*height*.20 - sz*height*.42];
-    }
-    function sizeCanvas(target, targetCtx) {
-      const ratio=Math.min(window.devicePixelRatio||1,2); const rect=target.getBoundingClientRect();
-      target.width=Math.max(1,Math.floor(rect.width*ratio));target.height=Math.max(1,Math.floor(rect.height*ratio));
-      targetCtx.setTransform(ratio,0,0,ratio,0,0);targetCtx.clearRect(0,0,rect.width,rect.height);return rect;
-    }
-    function drawEnvironment() {
-      const rect=sizeCanvas(environmentCanvas,environmentCtx), data=state.data||{}, cui=data.cui||{}, env=cui.environment||{}, truth=cui.truth||{};
-      const width=Math.max(Number(env.size_x)||1,1),height=Math.max(Number(env.size_y)||1,1),margin=42;
-      const scale=Math.min((rect.width-margin*2)/width,(rect.height-margin*2)/height),ox=(rect.width-width*scale)/2,oy=(rect.height-height*scale)/2;
-      const map=p=>[ox+Number(p[0])*scale,oy+(height-Number(p[1]))*scale];
-      environmentCtx.fillStyle='#0b0e10';environmentCtx.fillRect(ox,oy,width*scale,height*scale);environmentCtx.strokeStyle='rgba(255,255,255,.28)';environmentCtx.strokeRect(ox,oy,width*scale,height*scale);
-      const grid=env.obstacle_grid||{},cell=Number(grid.cell_size)||1,origin=grid.origin||[0,0];environmentCtx.fillStyle='rgba(148,163,174,.36)';
-      for(const item of (grid.blocked_cells||[])){const x=Number(origin[0])+Number(item[0])*cell,y=Number(origin[1])+Number(item[1])*cell;const p=map([x,y+cell]);environmentCtx.fillRect(p[0],p[1],cell*scale,cell*scale);}
-      const path=data.detector_positions_xyz||[];if(path.length){environmentCtx.beginPath();path.forEach((p,i)=>{const q=map(p);i?environmentCtx.lineTo(...q):environmentCtx.moveTo(...q)});environmentCtx.strokeStyle='rgba(255,255,255,.75)';environmentCtx.lineWidth=1.4;environmentCtx.stroke();}
-      const colors={'Cs-137':'#ffb454','Co-60':'#67b7ff','Eu-154':'#77e59b'};const sources=truth.true_sources||{},strengths=truth.true_strengths||{};let legendY=70;
-      for(const isotope of (data.isotopes||Object.keys(sources))){const positions=sources[isotope]||[],values=strengths[isotope]||[];environmentCtx.fillStyle=colors[isotope]||'#f06cff';environmentCtx.font='11px system-ui';environmentCtx.textAlign='left';environmentCtx.fillText(`${isotope}: ${positions.length}`,18,legendY);legendY+=16;positions.forEach((p,i)=>{const q=map(p);environmentCtx.beginPath();environmentCtx.arc(q[0],q[1],7,0,Math.PI*2);environmentCtx.fill();environmentCtx.strokeStyle='#090b0d';environmentCtx.lineWidth=2;environmentCtx.stroke();environmentCtx.fillStyle='#fff';environmentCtx.fillText(`${isotope} · ${fmt(values[i])} cps`,q[0]+10,q[1]-9);environmentCtx.fillStyle=colors[isotope]||'#f06cff';});}
-      if(!truth.true_sources){environmentCtx.fillStyle='#7f8a92';environmentCtx.textAlign='center';environmentCtx.fillText('Private CUI overlay unavailable',rect.width/2,rect.height/2);}
-    }
-    function draw() {
-      drawEnvironment();
-      const ratio = Math.min(window.devicePixelRatio || 1, 2);
-      const rect = canvas.getBoundingClientRect();
-      canvas.width = Math.max(1, Math.floor(rect.width*ratio)); canvas.height = Math.max(1, Math.floor(rect.height*ratio));
-      ctx.setTransform(ratio,0,0,ratio,0,0); ctx.clearRect(0,0,rect.width,rect.height);
-      const data = state.data; if (!data || !data.patches.length) {
-        ctx.fillStyle='#7f8a92'; ctx.font='13px system-ui'; ctx.textAlign='center'; ctx.fillText('Waiting for first station-complete MLE fit', rect.width/2, rect.height/2); return;
+    async function refresh() {
+      const t = Date.now();
+      document.getElementById("overview").src = "latest_experiment_overview.png?t=" + t;
+      document.getElementById("robot").src = "latest_robot_2d.png?t=" + t;
+      document.getElementById("mle").src = "latest_mle_3d.png?t=" + t;
+      document.getElementById("spectrum").src = "latest_spectrum.png?t=" + t;
+      try {
+        const response = await fetch("dashboard_data.json?t=" + t, {cache: "no-store"});
+        const data = await response.json();
+        document.getElementById("status").textContent = `${String(data.status || "starting").toUpperCase()} · records ${data.record_count ?? 0} · station ${data.latest_station_id ?? "—"}`;
+      } catch (_) {
+        document.getElementById("status").textContent = "RECONNECTING";
       }
-      const plan=data.planning&&data.planning.selected_action; const plannedPose=plan&&plan.detector_pose_xyz;
-      const points = data.patches.map(p => p.centroid_xyz).concat(data.detector_positions_xyz || []).concat(plannedPose?[plannedPose]:[]);
-      const axis = i => points.map(p => Number(p[i]));
-      const pad=.05; let bounds=[Math.min(...axis(0)),Math.max(...axis(0)),Math.min(...axis(1)),Math.max(...axis(1)),Math.min(...axis(2)),Math.max(...axis(2))];
-      if (bounds[0]===bounds[1]) { bounds[0]-=1; bounds[1]+=1; } if (bounds[2]===bounds[3]) { bounds[2]-=1; bounds[3]+=1; } if (bounds[4]===bounds[5]) bounds[5]+=1;
-      bounds=[bounds[0]-pad,bounds[1]+pad,bounds[2]-pad,bounds[3]+pad,bounds[4],bounds[5]+pad];
-      const density = data.density_by_isotope[state.isotope] || []; const peak=Math.max(...density,1e-12);
-      const rows=data.patches.map((p,i)=>({p,i,depth:p.centroid_xyz[0]+p.centroid_xyz[1]})).sort((a,b)=>a.depth-b.depth);
-      ctx.strokeStyle='rgba(255,255,255,.08)'; ctx.lineWidth=1;
-      for (const z of [0,.5,1]) { const a=project([bounds[0],bounds[2],bounds[4]+z*(bounds[5]-bounds[4])],bounds,rect.width,rect.height); const b=project([bounds[1],bounds[3],bounds[4]+z*(bounds[5]-bounds[4])],bounds,rect.width,rect.height); ctx.beginPath();ctx.moveTo(...a);ctx.lineTo(...b);ctx.stroke(); }
-      for (const row of rows) { const value=Number(density[row.i]||0); const normalized=Math.sqrt(Math.max(0,value/peak)); const [x,y]=project(row.p.centroid_xyz,bounds,rect.width,rect.height); const radius=1.8+normalized*7.5; ctx.beginPath();ctx.arc(x,y,radius,0,Math.PI*2);ctx.fillStyle=`rgba(64,224,208,${.12+normalized*.82})`;ctx.fill(); }
-      const path=data.detector_positions_xyz||[]; if(path.length){ctx.beginPath();path.forEach((p,i)=>{const q=project(p,bounds,rect.width,rect.height);i?ctx.lineTo(...q):ctx.moveTo(...q)});ctx.strokeStyle='rgba(255,255,255,.68)';ctx.lineWidth=1.4;ctx.stroke();for(const p of path){const q=project(p,bounds,rect.width,rect.height);ctx.beginPath();ctx.arc(...q,2.4,0,Math.PI*2);ctx.fillStyle='#fff';ctx.fill();}}
-      if(plannedPose){const [x,y]=project(plannedPose,bounds,rect.width,rect.height);ctx.save();ctx.translate(x,y);ctx.rotate(Math.PI/4);ctx.fillStyle='#40e0d0';ctx.fillRect(-5,-5,10,10);ctx.restore();}
     }
-    function render(data) {
-      state.data=data; if(!state.isotope || !data.isotopes.includes(state.isotope)) state.isotope=data.isotopes[0]||null;
-      document.getElementById('status').textContent=String(data.status||'starting').toUpperCase(); document.getElementById('pulse').classList.toggle('finalized',data.status==='finalized');
-      document.getElementById('runId').textContent=data.run_id||'—';
-      const s=data.summary||{}; const rows=[['Records',data.record_count],['Latest station',data.latest_station_id],['Surface patches',s.patch_count],['Objective',fmt(s.objective)],['Poisson deviance',fmt(s.poisson_deviance)],['Iterations',s.iterations],['Converged',s.converged===true?'yes':s.converged===false?'no':'—']];
-      document.getElementById('metrics').innerHTML=rows.map(([k,v])=>`<div class="metric"><span>${esc(k)}</span><strong>${esc(v)}</strong></div>`).join('');
-      const plan=data.planning&&data.planning.selected_action;document.getElementById('nextAction').innerHTML=plan?`<div class="metric"><span>Pose xyz</span><strong>${plan.detector_pose_xyz.map(fmt).join(' / ')}</strong></div><div class="metric"><span>Fe/Pb pair IDs</span><strong>${plan.shield_pair_ids.map(esc).join(' → ')}</strong></div><div class="metric"><span>Live time</span><strong>${plan.live_time_s_by_view.map(fmt).join(' / ')} s</strong></div><div class="metric"><span>Information gain</span><strong>${fmt(plan.information_gain_nats)} nat</strong></div><div class="metric"><span>Expected counts</span><strong>${plan.expected_total_counts_by_view.map(fmt).join(' / ')}</strong></div>`:'<div class="empty">Waiting for runtime candidates</div>';
-      const tabs=document.getElementById('tabs');tabs.innerHTML=data.isotopes.map(iso=>`<button class="${iso===state.isotope?'active':''}" data-iso="${esc(iso)}">${esc(iso)}</button>`).join('');tabs.querySelectorAll('button').forEach(b=>b.onclick=()=>{state.isotope=b.dataset.iso;render(data)});
-      const timeline=(data.station_reports||[]).slice(-8);document.getElementById('timeline').innerHTML=timeline.length?timeline.map(item=>`<li><b>Station ${esc(item.station_id)}</b><span>step ${esc(item.data_cutoff_step)}</span></li>`).join(''):'<li class="empty">No completed station yet</li>';
-      const hotspots=(data.hotspots||[]).filter(h=>!state.isotope||h.isotope===state.isotope);document.getElementById('hotspots').innerHTML=hotspots.length?hotspots.slice(0,8).map(h=>`<div class="hotspot fade"><div class="hotspot-top"><span>${esc(h.isotope)} · ${esc((h.surface_kinds||[]).join(', '))}</span><strong>${fmt(h.integrated_strength_cps_1m)} cps</strong></div><small>xyz ${h.centroid_xyz.map(fmt).join(' / ')}</small></div>`).join(''):'<div class="empty">No active hotspot cluster</div>';
-      state.updatedAt=Date.now(); document.getElementById('freshness').textContent='updated now'; draw();
-    }
-    async function refresh(){try{const response=await fetch(`dashboard_data.json?t=${Date.now()}`,{cache:'no-store'});if(!response.ok)throw new Error(response.status);render(await response.json())}catch(error){document.getElementById('freshness').textContent='reconnecting';}}
-    setInterval(()=>{if(state.updatedAt){const seconds=Math.floor((Date.now()-state.updatedAt)/1000);document.getElementById('freshness').textContent=seconds<3?'updated now':`updated ${seconds}s ago`; }},1000);
-    window.addEventListener('resize',draw); refresh(); setInterval(refresh,2000);
+    refresh(); setInterval(refresh, 2000);
   </script>
 </body>
 </html>

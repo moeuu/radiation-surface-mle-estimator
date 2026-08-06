@@ -423,6 +423,8 @@ class SurfaceMLEBackend:
             obstacle_grid=obstacle_grid,
             use_gpu=bool(self.config.use_gpu),
         )
+        kernel.gpu_device = str(self.config.gpu_device)
+        kernel.gpu_dtype = str(self.config.gpu_dtype)
         estimator = self._new_estimator(self.config)
         if not callable(getattr(estimator, "fit", None)):
             raise TypeError("estimator_factory must return an object with fit().")
@@ -590,6 +592,7 @@ class SurfaceMLEBackend:
         travel_costs: object | None = None,
         current_pair_id: int | None = None,
         progress_hook: Callable[[Mapping[str, object]], None] | None = None,
+        screening_only: bool = False,
     ) -> MLEPlanningResult:
         """Rank runtime-supplied poses and Fe/Pb programs from the latest fit."""
         self._ensure_active()
@@ -626,6 +629,7 @@ class SurfaceMLEBackend:
             alternative_estimates=tuple(self._fit_estimates[-4:-1]),
             historical_response_cache=self._planning_response_cache,
             progress_hook=progress_hook,
+            screening_only=screening_only,
         )
 
     def finalize(self) -> EstimatorResult:

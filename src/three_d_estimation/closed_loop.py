@@ -546,6 +546,11 @@ def run_ral_closed_loop(
                 travel_costs=candidates["travel_costs"],
                 current_pair_id=candidates["current_pair_id"],
                 progress_hook=relay_progress,
+                screening_only=(
+                    bool(getattr(planning_config, "two_stage_screening", False))
+                    and int(getattr(planning_config, "local_refinement_top_k", 0))
+                    > 0
+                ),
             )
             refinement_count = int(
                 getattr(planning_config, "local_refinement_top_k", 0)

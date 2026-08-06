@@ -445,7 +445,19 @@ class OnlineMLESession:
             payload,
         )
         if self.dashboard is not None:
-            self.dashboard.publish(self._latest_published_estimate, payload)
+            dashboard_payload = dict(payload)
+            records = self.records
+            if records:
+                dashboard_payload["latest_observed_spectrum_counts"] = (
+                    records[-1].spectrum_counts.tolist()
+                )
+                dashboard_payload["energy_bin_edges_keV"] = (
+                    records[-1].energy_bin_edges_keV.tolist()
+                )
+            self.dashboard.publish(
+                self._latest_published_estimate,
+                dashboard_payload,
+            )
 
     def receive_persisted(
         self,
@@ -622,6 +634,7 @@ class OnlineMLESession:
         current_pair_id: int | None = None,
         overwrite: bool = False,
         progress_hook: Callable[[Mapping[str, object]], None] | None = None,
+        screening_only: bool = False,
     ) -> MLEPlanningResult:
         """Plan and publish the next runtime action after a completed station."""
         self._ensure_active()
@@ -639,6 +652,7 @@ class OnlineMLESession:
             travel_costs=travel_costs,
             current_pair_id=current_pair_id,
             progress_hook=progress_hook,
+            screening_only=screening_only,
         )
         if not isinstance(planned, MLEPlanningResult):
             raise TypeError("Online backend planning must return MLEPlanningResult.")
@@ -668,6 +682,7 @@ class OnlineMLESession:
             "data_cutoff_step": int(latest.step_id),
             "path": path.relative_to(self.output_dir).as_posix(),
             "selected_action": annotated.selected_action.to_dict(),
+            "preliminary_screening": bool(screening_only),
         }
         self._persist_state(status="running")
         return annotated

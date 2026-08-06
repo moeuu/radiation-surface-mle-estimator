@@ -20,7 +20,7 @@ from .spectral_response_builder import build_spectral_response
 from .types import MLEEstimate, ObservationBatch, SurfacePatch
 
 
-PLANNING_METHOD = "laplace_poisson_fisher_d_s_station_block_optimal_v2"
+PLANNING_METHOD = "two_stage_grouped_poisson_fisher_d_s_station_block_v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,6 +50,16 @@ class MLEPlanningConfig:
     geometry_exploration_weight: float = 0.5
     geometry_bootstrap_measurements: int = 6
     local_refinement_top_k: int = 8
+    two_stage_screening: bool = True
+    screening_energy_bin_count: int = 64
+    screening_pair_limit: int = 16
+    screening_pose_chunk_size: int = 64
+    screening_source_parameter_limit: int = 24
+    screening_points_per_mode: int = 2
+    exact_candidate_min: int = 4
+    exact_candidate_max: int = 8
+    exact_score_margin_fraction: float = 0.05
+    exact_diversity_weight: float = 0.15
 
     def __post_init__(self) -> None:
         """Validate all values that affect the planning objective."""
@@ -62,6 +72,15 @@ class MLEPlanningConfig:
             "shield_program_beam_width": self.shield_program_beam_width,
             "geometry_bootstrap_measurements": self.geometry_bootstrap_measurements,
             "local_refinement_top_k": self.local_refinement_top_k,
+            "screening_energy_bin_count": self.screening_energy_bin_count,
+            "screening_pair_limit": self.screening_pair_limit,
+            "screening_pose_chunk_size": self.screening_pose_chunk_size,
+            "screening_source_parameter_limit": (
+                self.screening_source_parameter_limit
+            ),
+            "screening_points_per_mode": self.screening_points_per_mode,
+            "exact_candidate_min": self.exact_candidate_min,
+            "exact_candidate_max": self.exact_candidate_max,
         }
         for name, value in integer_fields.items():
             if isinstance(value, (bool, np.bool_)) or not isinstance(
@@ -77,6 +96,22 @@ class MLEPlanningConfig:
             raise ValueError(
                 "max_active_source_parameters cannot exceed "
                 "max_total_source_parameters."
+            )
+        if int(self.exact_candidate_min) > int(self.exact_candidate_max):
+            raise ValueError("exact_candidate_min cannot exceed exact_candidate_max.")
+        if not isinstance(self.two_stage_screening, (bool, np.bool_)):
+            raise TypeError("two_stage_screening must be boolean.")
+        if self.two_stage_screening and int(self.ranked_action_limit) < int(
+            self.exact_candidate_max
+        ):
+            raise ValueError(
+                "ranked_action_limit must cover exact_candidate_max."
+            )
+        if self.two_stage_screening and int(self.screening_pair_limit) < int(
+            self.shield_program_length
+        ):
+            raise ValueError(
+                "screening_pair_limit must cover shield_program_length."
             )
         positive_fields = {
             "live_time_s": self.live_time_s,
@@ -108,6 +143,8 @@ class MLEPlanningConfig:
             ),
             "elevation_diversity_weight": self.elevation_diversity_weight,
             "geometry_exploration_weight": self.geometry_exploration_weight,
+            "exact_score_margin_fraction": self.exact_score_margin_fraction,
+            "exact_diversity_weight": self.exact_diversity_weight,
         }
         for name, value in nonnegative_fields.items():
             parsed = float(value)
@@ -115,6 +152,8 @@ class MLEPlanningConfig:
                 raise ValueError(f"{name} must be finite and nonnegative.")
         if float(self.active_strength_fraction) > 1.0:
             raise ValueError("active_strength_fraction must not exceed one.")
+        if float(self.exact_diversity_weight) > 1.0:
+            raise ValueError("exact_diversity_weight must not exceed one.")
 
     def to_dict(self) -> dict[str, object]:
         """Return a JSON-safe planner configuration."""
@@ -297,6 +336,15 @@ class _PatchView:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _ScreeningPatchView:
+    """Expose compact representative points as unit-area pseudo patches."""
+
+    quadrature_points_xyz: NDArray[np.float64]
+    quadrature_weights: NDArray[np.float64]
+    areas_m2: NDArray[np.float64]
+
+
 def _validated_candidate_poses(
     candidate_poses_xyz: object,
 ) -> NDArray[np.float64]:
@@ -346,6 +394,386 @@ def _validated_pair_ids(
     if np.unique(pairs).size != pairs.size:
         raise ValueError("allowed_pair_ids must not contain duplicates.")
     return np.ascontiguousarray(pairs)
+
+
+def _screening_source_basis(
+    estimate: MLEEstimate,
+    config: MLEPlanningConfig,
+) -> tuple[NDArray[np.float64], tuple[dict[str, object], ...]]:
+    """Build a compact isotope-by-surface basis for approximate screening."""
+    patch_count = len(estimate.patches)
+    isotope_count = len(estimate.isotope_names)
+    strengths = np.asarray(estimate.patch_strength_by_isotope, dtype=np.float64).T
+    groups: dict[tuple[int, str], list[int]] = {}
+    for isotope_index in range(isotope_count):
+        for patch_index, patch in enumerate(estimate.patches):
+            groups.setdefault((isotope_index, patch.surface_kind), []).append(
+                patch_index
+            )
+    ordered = sorted(
+        groups.items(),
+        key=lambda item: (item[0][0], item[0][1]),
+    )
+    limit = int(config.screening_source_parameter_limit)
+    if len(ordered) > limit:
+        collapsed: dict[tuple[int, str], list[int]] = {}
+        for (isotope_index, _surface), indices in ordered:
+            collapsed.setdefault((isotope_index, "all_surfaces"), []).extend(indices)
+        ordered = sorted(collapsed.items(), key=lambda item: item[0][0])
+    if len(ordered) > limit:
+        raise ValueError(
+            "screening_source_parameter_limit must cover every isotope mode."
+        )
+    basis = np.zeros(
+        (patch_count, isotope_count, len(ordered)),
+        dtype=np.float64,
+    )
+    labels: list[dict[str, object]] = []
+    floor = float(config.source_strength_scale_floor_cps_1m)
+    for column, ((isotope_index, surface_kind), indices) in enumerate(ordered):
+        fitted = strengths[indices, isotope_index]
+        total = float(np.sum(fitted))
+        if total > 0.0:
+            weights = fitted / total
+        else:
+            areas = np.asarray(
+                [estimate.patches[index].area_m2 for index in indices],
+                dtype=np.float64,
+            )
+            weights = areas / float(np.sum(areas))
+        scale = max(total, floor)
+        basis[indices, isotope_index, column] = scale * weights
+        labels.append(
+            {
+                "kind": "screening_surface_mode",
+                "isotope": estimate.isotope_names[isotope_index],
+                "surface_kind": surface_kind,
+                "patch_ids": [estimate.patches[index].patch_id for index in indices],
+                "scale_cps_1m": scale,
+            }
+        )
+    if not ordered or np.any(np.sum(basis, axis=(0, 1)) <= 0.0):
+        raise RuntimeError("Every screening source mode must be nonzero.")
+    return basis, tuple(labels)
+
+
+def _screening_pseudo_model(
+    estimate: MLEEstimate,
+    config: MLEPlanningConfig,
+) -> tuple[
+    _ScreeningPatchView,
+    NDArray[np.float64],
+    NDArray[np.float64],
+    NDArray[np.float64],
+    tuple[dict[str, object], ...],
+]:
+    """Compress each screening mode to a few weighted representative points."""
+    full_basis, labels = _screening_source_basis(estimate, config)
+    full_strengths = np.asarray(
+        estimate.patch_strength_by_isotope,
+        dtype=np.float64,
+    ).T
+    patch_points = np.asarray(
+        [patch.centroid_xyz for patch in estimate.patches],
+        dtype=np.float64,
+    )
+    patch_ids = np.asarray(
+        [patch.patch_id for patch in estimate.patches],
+        dtype=np.int64,
+    )
+    pseudo_points: list[NDArray[np.float64]] = []
+    pseudo_strength_rows: list[NDArray[np.float64]] = []
+    pseudo_basis_rows: list[NDArray[np.float64]] = []
+    point_limit = int(config.screening_points_per_mode)
+    isotope_count = len(estimate.isotope_names)
+    parameter_count = full_basis.shape[2]
+    for parameter_index in range(parameter_count):
+        coordinates = np.argwhere(full_basis[:, :, parameter_index] > 0.0)
+        if not coordinates.size:
+            raise RuntimeError("Screening mode unexpectedly has no coordinates.")
+        isotope_index = int(coordinates[0, 1])
+        indices = coordinates[:, 0].astype(np.int64)
+        weights = full_basis[indices, isotope_index, parameter_index]
+        local_points = patch_points[indices]
+        representative_count = min(point_limit, int(indices.size))
+        first_candidates = np.flatnonzero(weights == float(np.max(weights)))
+        first = int(first_candidates[np.argmin(patch_ids[indices[first_candidates]])])
+        representatives = [first]
+        minimum_distance = np.linalg.norm(local_points - local_points[first], axis=1)
+        while len(representatives) < representative_count:
+            scores = minimum_distance * np.sqrt(np.maximum(weights, 0.0))
+            scores[np.asarray(representatives, dtype=np.int64)] = -np.inf
+            next_index = int(np.argmax(scores))
+            representatives.append(next_index)
+            minimum_distance = np.minimum(
+                minimum_distance,
+                np.linalg.norm(local_points - local_points[next_index], axis=1),
+            )
+        representative_points = local_points[
+            np.asarray(representatives, dtype=np.int64)
+        ]
+        distances = np.linalg.norm(
+            local_points[:, None, :] - representative_points[None, :, :],
+            axis=2,
+        )
+        assignments = np.argmin(distances, axis=1)
+        for cluster_index in range(representative_count):
+            members = assignments == cluster_index
+            if not np.any(members):
+                continue
+            cluster_weights = weights[members]
+            weight_sum = float(np.sum(cluster_weights))
+            centroid = np.average(
+                local_points[members],
+                axis=0,
+                weights=cluster_weights,
+            )
+            strength_row = np.zeros(isotope_count, dtype=np.float64)
+            strength_row[isotope_index] = float(
+                np.sum(full_strengths[indices[members], isotope_index])
+            )
+            basis_row = np.zeros(
+                (isotope_count, parameter_count),
+                dtype=np.float64,
+            )
+            basis_row[isotope_index, parameter_index] = weight_sum
+            pseudo_points.append(np.asarray(centroid, dtype=np.float64))
+            pseudo_strength_rows.append(strength_row)
+            pseudo_basis_rows.append(basis_row)
+    points = np.asarray(pseudo_points, dtype=np.float64)
+    patch_view = _ScreeningPatchView(
+        quadrature_points_xyz=points[:, None, :],
+        quadrature_weights=np.ones((points.shape[0], 1), dtype=np.float64),
+        areas_m2=np.ones(points.shape[0], dtype=np.float64),
+    )
+    pseudo_strengths = np.asarray(pseudo_strength_rows, dtype=np.float64)
+    pseudo_basis = np.asarray(pseudo_basis_rows, dtype=np.float64)
+    if not np.allclose(
+        np.sum(pseudo_basis, axis=(0, 1)),
+        np.sum(full_basis, axis=(0, 1)),
+        rtol=1.0e-12,
+        atol=1.0e-12,
+    ):
+        raise RuntimeError("Pseudo screening model did not preserve mode scales.")
+    return patch_view, pseudo_strengths, pseudo_basis, full_basis, labels
+
+
+def _representative_pair_ids(
+    pair_ids: NDArray[np.int64],
+    orientations: NDArray[np.float64],
+    limit: int,
+    current_pair_id: int | None,
+) -> NDArray[np.int64]:
+    """Select a deterministic farthest-first covering set of shield pairs."""
+    pairs = np.asarray(pair_ids, dtype=np.int64)
+    if pairs.size <= int(limit):
+        return np.ascontiguousarray(pairs)
+    rotation_costs, _ = _pair_rotation_cost_cache(
+        pairs,
+        orientations,
+        current_pair_id,
+    )
+    matches = (
+        np.flatnonzero(pairs == int(current_pair_id))
+        if current_pair_id is not None
+        else np.zeros(0, dtype=np.int64)
+    )
+    first = int(matches[0]) if matches.size else int(np.argmin(pairs))
+    selected = np.zeros(int(limit), dtype=np.int64)
+    selected[0] = first
+    available = np.ones(pairs.size, dtype=bool)
+    available[first] = False
+    minimum_distance = rotation_costs[first].copy()
+    for offset in range(1, int(limit)):
+        scores = np.where(available, minimum_distance, -np.inf)
+        maximum = float(np.max(scores))
+        tied = np.flatnonzero(scores == maximum)
+        next_index = int(tied[np.argmin(pairs[tied])])
+        selected[offset] = next_index
+        available[next_index] = False
+        minimum_distance = np.minimum(
+            minimum_distance,
+            rotation_costs[next_index],
+        )
+    return np.ascontiguousarray(pairs[selected])
+
+
+def _source_marginal_precision(
+    precision: NDArray[np.float64],
+    nuisance_count: int,
+) -> NDArray[np.float64]:
+    """Return the source Schur complement of one joint precision matrix."""
+    matrix = np.asarray(precision, dtype=np.float64)
+    source_count = int(matrix.shape[0]) - int(nuisance_count)
+    source = matrix[:source_count, :source_count]
+    if int(nuisance_count) == 0:
+        return source.copy()
+    cross = matrix[:source_count, source_count:]
+    nuisance = matrix[source_count:, source_count:]
+    try:
+        solved = np.linalg.solve(nuisance, cross.T)
+    except np.linalg.LinAlgError:
+        solved = np.linalg.pinv(nuisance, rcond=1.0e-12) @ cross.T
+    marginal = source - cross @ solved
+    return 0.5 * (marginal + marginal.T)
+
+
+def _screening_background_rate(
+    observations: ObservationBatch,
+    edges: NDArray[np.float64],
+    predicted_source_counts: NDArray[np.float64] | None = None,
+) -> NDArray[np.float64]:
+    """Aggregate the non-source historical rate into coarse Poisson groups."""
+    full_centers = 0.5 * (
+        observations.energy_bin_edges_keV[:-1]
+        + observations.energy_bin_edges_keV[1:]
+    )
+    indices = np.searchsorted(edges, full_centers, side="right") - 1
+    indices = np.clip(indices, 0, edges.size - 2)
+    observed = np.asarray(observations.spectrum_counts, dtype=np.float64)
+    if predicted_source_counts is None:
+        residual = observed
+    else:
+        predicted = np.asarray(predicted_source_counts, dtype=np.float64)
+        if predicted.shape != observed.shape or np.any(~np.isfinite(predicted)):
+            raise ValueError("Predicted screening source counts must align with history.")
+        residual = np.maximum(observed - predicted, 0.0)
+    total_counts = np.sum(residual, axis=0, dtype=np.float64)
+    grouped = np.bincount(
+        indices,
+        weights=total_counts,
+        minlength=edges.size - 1,
+    ).astype(np.float64)
+    total_live_time = max(float(np.sum(observations.live_times_s)), 1.0e-12)
+    return grouped / total_live_time
+
+
+def _screening_fisher_information(
+    source_response: NDArray[np.float64],
+    source_basis: NDArray[np.float64],
+    source_strengths: NDArray[np.float64],
+    background_counts: NDArray[np.float64],
+    *,
+    minimum_expected_count: float,
+    use_gpu: bool = False,
+    gpu_device: str = "cuda",
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Return source-only grouped-Poisson Fisher matrices for screening."""
+    response = np.asarray(source_response, dtype=np.float64)
+    background = np.ascontiguousarray(background_counts, dtype=np.float64)
+    if response.ndim != 4 or background.shape != response.shape[:2]:
+        raise ValueError("Screening response and background counts must align.")
+    if use_gpu:
+        import torch
+
+        device = torch.device(gpu_device)
+        if device.type == "cuda" and not torch.cuda.is_available():
+            raise RuntimeError("CUDA screening requested but CUDA is unavailable.")
+        response_t = torch.as_tensor(response, dtype=torch.float64, device=device)
+        basis_t = torch.as_tensor(source_basis, dtype=torch.float64, device=device)
+        strength_t = torch.as_tensor(
+            source_strengths,
+            dtype=torch.float64,
+            device=device,
+        )
+        background_t = torch.as_tensor(
+            background,
+            dtype=torch.float64,
+            device=device,
+        )
+        jacobian_t = torch.einsum("abgi,gik->abk", response_t, basis_t)
+        expected_t = torch.einsum("abgi,gi->ab", response_t, strength_t)
+        expected_t = torch.clamp(
+            expected_t + background_t,
+            min=float(minimum_expected_count),
+        )
+        information_t = torch.einsum(
+            "abp,abq,ab->apq",
+            jacobian_t,
+            jacobian_t,
+            1.0 / expected_t,
+        )
+        information = information_t.detach().cpu().numpy()
+        expected = expected_t.detach().cpu().numpy()
+    else:
+        jacobian = np.einsum(
+            "abgi,gik->abk",
+            response,
+            source_basis,
+            optimize=True,
+        )
+        expected = np.einsum(
+            "abgi,gi->ab",
+            response,
+            source_strengths,
+            optimize=True,
+        )
+        expected = np.maximum(
+            expected + background,
+            float(minimum_expected_count),
+        )
+        information = np.einsum(
+            "abp,abq,ab->apq",
+            jacobian,
+            jacobian,
+            1.0 / expected,
+            optimize=True,
+        )
+    information = 0.5 * (information + np.swapaxes(information, 1, 2))
+    return information, np.sum(expected, axis=1)
+
+
+def _diverse_exact_candidate_indices(
+    ranked: Sequence[MLEPlanningAction],
+    poses: NDArray[np.float64],
+    config: MLEPlanningConfig,
+) -> NDArray[np.int64]:
+    """Choose an adaptive exact shortlist with score and spatial diversity."""
+    if not ranked:
+        raise ValueError("ranked screening actions must be nonempty.")
+    maximum = min(int(config.exact_candidate_max), len(ranked))
+    minimum = min(int(config.exact_candidate_min), maximum)
+    best_score = float(ranked[0].score)
+    margin = max(abs(best_score), 1.0) * float(config.exact_score_margin_fraction)
+    within_margin = sum(float(action.score) >= best_score - margin for action in ranked)
+    target = min(maximum, max(minimum, within_margin))
+    pool = tuple(ranked[: min(len(ranked), max(4 * target, target))])
+    selected: list[int] = []
+    forced = min(2, target, len(pool))
+    selected.extend(int(pool[index].candidate_index) for index in range(forced))
+    coordinates = np.asarray(
+        [poses[int(action.candidate_index)] for action in pool],
+        dtype=np.float64,
+    )
+    span = np.maximum(np.ptp(coordinates, axis=0), 1.0e-9)
+    normalized = coordinates / span[None, :]
+    score_values = np.asarray([action.score for action in pool], dtype=np.float64)
+    score_span = max(float(np.ptp(score_values)), 1.0e-12)
+    score_quality = (score_values - float(np.min(score_values))) / score_span
+    weight = float(config.exact_diversity_weight)
+    while len(selected) < target:
+        selected_positions = np.asarray(
+            [poses[index] / span for index in selected],
+            dtype=np.float64,
+        )
+        distances = np.linalg.norm(
+            normalized[:, None, :] - selected_positions[None, :, :],
+            axis=2,
+        )
+        diversity = np.min(distances, axis=1)
+        diversity /= max(float(np.max(diversity)), 1.0e-12)
+        combined = (1.0 - weight) * score_quality + weight * diversity
+        for selected_index in selected:
+            combined[
+                next(
+                    offset
+                    for offset, action in enumerate(pool)
+                    if int(action.candidate_index) == selected_index
+                )
+            ] = -np.inf
+        next_offset = int(np.argmax(combined))
+        selected.append(int(pool[next_offset].candidate_index))
+    return np.asarray(selected, dtype=np.int64)
 
 
 def _source_basis(
@@ -567,6 +995,34 @@ def _spectral_design(
         details.nuisance_response,
         details.nuisance_names,
     )
+
+
+def _screening_spectral_design(
+    observations: object,
+    patches: object,
+    isotopes: Sequence[str],
+    kernel: ContinuousKernel,
+    mle_config: MLEConfig,
+) -> NDArray[np.float64]:
+    """Build coarse source response without exact-stage nuisance expansion."""
+    details = build_spectral_response(
+        observations,
+        patches,
+        isotopes,
+        kernel,
+        chunk_size=int(mle_config.response_chunk_size),
+        continuum_to_peak=float(mle_config.continuum_to_peak),
+        backscatter_fraction=float(mle_config.backscatter_fraction),
+        require_line_resolved=True,
+        include_background_nuisance=False,
+        include_scatter_nuisance=False,
+        discrepancy_calibration=None,
+        include_shield_leakage_nuisance=False,
+        include_station_rate_nuisance=False,
+        include_low_rank_residual_nuisance=False,
+        include_gain_resolution_drift=False,
+    )
+    return details.response_per_integrated_strength
 
 
 def _historical_spectral_design(
@@ -1846,7 +2302,7 @@ def select_fisher_action(
         orientation_array,
         current_pair_id,
     )
-    if use_gpu and parameter_count >= 24 and candidate_count > 1:
+    if use_gpu and candidate_count > 1:
         actions = list(
             _select_pose_programs_cuda(
                 np.arange(candidate_count, dtype=np.int64),
@@ -1909,7 +2365,287 @@ def select_fisher_action(
     return ranked[0], ranked[: int(resolved.ranked_action_limit)]
 
 
-def plan_next_measurement(
+def _screen_candidate_measurements(
+    estimate: MLEEstimate,
+    historical_observations: ObservationBatch,
+    kernel: ContinuousKernel,
+    mle_config: MLEConfig,
+    poses: NDArray[np.float64],
+    pair_ids: NDArray[np.int64],
+    costs: NDArray[np.float64],
+    current_pair_id: int | None,
+    config: MLEPlanningConfig,
+    historical_response_cache: dict[str, object] | None,
+    progress_hook: Callable[[Mapping[str, object]], None] | None,
+) -> MLEPlanningResult:
+    """Screen many poses with grouped spectra and a compact source basis."""
+    started = perf_counter()
+    orientations = np.asarray(kernel.orientations, dtype=np.float64)
+    representative_pairs = _representative_pair_ids(
+        pair_ids,
+        orientations,
+        int(config.screening_pair_limit),
+        current_pair_id,
+    )
+    (
+        screening_patches,
+        source_strengths,
+        basis,
+        historical_basis,
+        basis_labels,
+    ) = _screening_pseudo_model(estimate, config)
+    historical_strengths = np.asarray(
+        estimate.patch_strength_by_isotope,
+        dtype=np.float64,
+    ).T
+    historical_source, historical_nuisance, nuisance_names, _ = (
+        _historical_spectral_design(
+            historical_observations,
+            estimate,
+            kernel,
+            mle_config,
+            historical_response_cache,
+        )
+    )
+    nuisance_coefficients = _nuisance_coefficients(estimate, nuisance_names)
+    nuisance_scales = np.maximum(
+        nuisance_coefficients,
+        float(config.nuisance_scale_floor),
+    )
+    historical_precision, _ = _historical_fisher_precision(
+        historical_source,
+        historical_nuisance,
+        historical_basis,
+        historical_strengths,
+        nuisance_coefficients,
+        nuisance_scales,
+        historical_observations.step_ids,
+        minimum_expected_count=float(config.minimum_expected_bin_count),
+        cache=historical_response_cache,
+    )
+    nuisance_count = int(nuisance_coefficients.size)
+    joint_precision = (
+        float(config.laplace_prior_precision)
+        * np.eye(historical_precision.shape[0], dtype=np.float64)
+        + historical_precision
+    )
+    base_precision = _source_marginal_precision(joint_precision, nuisance_count)
+    bin_count = int(config.screening_energy_bin_count)
+    full_edges = historical_observations.energy_bin_edges_keV
+    screening_edges = np.linspace(
+        float(full_edges[0]),
+        float(full_edges[-1]),
+        bin_count + 1,
+        dtype=np.float64,
+    )
+    background_rate = _screening_background_rate(
+        historical_observations,
+        screening_edges,
+        np.einsum(
+            "mbpi,pi->mb",
+            historical_source,
+            historical_strengths,
+            optimize=True,
+        ),
+    )
+    cache_identity = (
+        id(estimate),
+        tuple(int(value) for value in historical_observations.step_ids),
+        tuple(int(value) for value in representative_pairs),
+        int(bin_count),
+        int(config.screening_source_parameter_limit),
+        int(config.screening_points_per_mode),
+        int(config.shield_program_length),
+        current_pair_id,
+    )
+    cache_entry = (
+        None
+        if historical_response_cache is None
+        else historical_response_cache.get("candidate_screening")
+    )
+    if not isinstance(cache_entry, dict) or cache_entry.get("identity") != cache_identity:
+        cache_entry = {"identity": cache_identity, "actions_by_pose": {}}
+        if historical_response_cache is not None:
+            historical_response_cache["candidate_screening"] = cache_entry
+    actions_by_pose = cache_entry["actions_by_pose"]
+    if not isinstance(actions_by_pose, dict):
+        raise TypeError("candidate screening cache is invalid.")
+    missing = np.asarray(
+        [
+            index
+            for index, pose in enumerate(poses)
+            if np.asarray(pose, dtype=np.float64).tobytes() not in actions_by_pose
+        ],
+        dtype=np.int64,
+    )
+    screening_config = replace(
+        config,
+        shield_program_beam_width=1,
+        ranked_action_limit=max(int(config.ranked_action_limit), int(poses.shape[0])),
+    )
+    response_seconds = 0.0
+    fisher_seconds = 0.0
+    beam_seconds = 0.0
+    completed_missing = 0
+    if progress_hook is not None:
+        progress_hook(
+            {
+                "phase": "candidate_screening",
+                "completed_candidates": int(poses.shape[0] - missing.size),
+                "total_candidates": int(poses.shape[0]),
+                "elapsed_seconds": 0.0,
+                "eta_seconds": None,
+                "reused_candidates": int(poses.shape[0] - missing.size),
+            }
+        )
+    chunk_size = int(config.screening_pose_chunk_size)
+    orientation_count = int(orientations.shape[0])
+    pair_fe = representative_pairs // orientation_count
+    pair_pb = representative_pairs % orientation_count
+    for missing_start in range(0, missing.size, chunk_size):
+        selected_indices = missing[missing_start : missing_start + chunk_size]
+        local_poses = poses[selected_indices]
+        local_count = int(local_poses.shape[0])
+        expanded = np.repeat(local_poses, representative_pairs.size, axis=0)
+        geometry = _PlanningGeometry(
+            detector_positions_xyz=expanded,
+            fe_indices=np.tile(pair_fe, local_count),
+            pb_indices=np.tile(pair_pb, local_count),
+            live_times_s=np.full(
+                expanded.shape[0],
+                float(config.live_time_s),
+                dtype=np.float64,
+            ),
+            energy_bin_edges_keV=screening_edges,
+        )
+        response_started = perf_counter()
+        response = _screening_spectral_design(
+            geometry,
+            screening_patches,
+            estimate.isotope_names,
+            kernel,
+            mle_config,
+        )
+        response_seconds += perf_counter() - response_started
+        background = np.broadcast_to(
+            float(config.live_time_s) * background_rate[None, :],
+            response.shape[:2],
+        )
+        fisher_started = perf_counter()
+        information, totals = _screening_fisher_information(
+            response,
+            basis,
+            source_strengths,
+            background,
+            minimum_expected_count=float(config.minimum_expected_bin_count),
+            use_gpu=bool(mle_config.use_gpu),
+            gpu_device=str(mle_config.gpu_device),
+        )
+        fisher_seconds += perf_counter() - fisher_started
+        information = information.reshape(
+            local_count,
+            representative_pairs.size,
+            base_precision.shape[0],
+            base_precision.shape[1],
+        )
+        totals = totals.reshape(local_count, representative_pairs.size)
+        beam_started = perf_counter()
+        _, local_ranked = select_fisher_action(
+            local_poses,
+            representative_pairs,
+            information,
+            totals,
+            base_precision,
+            orientations,
+            nuisance_count=0,
+            config=screening_config,
+            travel_costs=costs[selected_indices],
+            current_pair_id=current_pair_id,
+            use_gpu=bool(mle_config.use_gpu),
+            gpu_device=str(mle_config.gpu_device),
+        )
+        beam_seconds += perf_counter() - beam_started
+        by_local_index = {action.candidate_index: action for action in local_ranked}
+        for local_index, global_index in enumerate(selected_indices):
+            action = by_local_index[local_index]
+            actions_by_pose[
+                np.asarray(poses[global_index], dtype=np.float64).tobytes()
+            ] = replace(
+                action,
+                candidate_index=int(global_index),
+                detector_pose_xyz=tuple(float(value) for value in poses[global_index]),
+            )
+        completed_missing += local_count
+        if progress_hook is not None:
+            elapsed = perf_counter() - started
+            completed = int(poses.shape[0] - missing.size + completed_missing)
+            progress_hook(
+                {
+                    "phase": "candidate_screening",
+                    "completed_candidates": completed,
+                    "total_candidates": int(poses.shape[0]),
+                    "elapsed_seconds": elapsed,
+                    "eta_seconds": (
+                        elapsed * (int(poses.shape[0]) - completed) / completed
+                        if completed
+                        else None
+                    ),
+                    "reused_candidates": int(poses.shape[0] - missing.size),
+                }
+            )
+    actions: list[MLEPlanningAction] = []
+    for index, pose in enumerate(poses):
+        cached = actions_by_pose[np.asarray(pose, dtype=np.float64).tobytes()]
+        travel_delta = float(costs[index]) - float(cached.travel_cost)
+        actions.append(
+            replace(
+                cached,
+                candidate_index=index,
+                detector_pose_xyz=tuple(float(value) for value in pose),
+                travel_cost=float(costs[index]),
+                score=float(cached.score)
+                - float(config.motion_cost_weight) * travel_delta,
+            )
+        )
+    ranked = tuple(
+        sorted(
+            actions,
+            key=lambda action: (
+                -action.score,
+                -action.information_gain_nats,
+                action.candidate_index,
+                action.shield_pair_ids,
+            ),
+        )
+    )
+    diagnostics = {
+        "criterion": "grouped-Poisson source Fisher screening",
+        "approximate": True,
+        "stage": "screening",
+        "candidate_count": int(poses.shape[0]),
+        "screening_energy_bin_count": bin_count,
+        "screening_pair_ids": representative_pairs.astype(int).tolist(),
+        "screening_source_basis": list(basis_labels),
+        "reused_candidates": int(poses.shape[0] - missing.size),
+        "computed_candidates": int(missing.size),
+        "performance": {
+            "response_seconds": response_seconds,
+            "fisher_seconds": fisher_seconds,
+            "beam_search_seconds": beam_seconds,
+            "elapsed_seconds": perf_counter() - started,
+            "dtype": "float64",
+            "device": str(mle_config.gpu_device) if mle_config.use_gpu else "cpu",
+        },
+        "config": config.to_dict(),
+    }
+    return MLEPlanningResult(
+        selected_action=ranked[0],
+        ranked_actions=ranked[: int(config.ranked_action_limit)],
+        diagnostics=diagnostics,
+    )
+
+
+def _plan_next_measurement_exact(
     estimate: MLEEstimate,
     historical_observations: ObservationBatch,
     kernel: ContinuousKernel,
@@ -1924,7 +2660,7 @@ def plan_next_measurement(
     historical_response_cache: dict[str, object] | None = None,
     progress_hook: Callable[[Mapping[str, object]], None] | None = None,
 ) -> MLEPlanningResult:
-    """Plan a joint next station and Fe/Pb program from one fitted MLE.
+    """Exactly plan a joint next station and Fe/Pb program from one fitted MLE.
 
     Candidate generation, obstacle traversability, and exact travel costs stay
     with the shared runtime. This function ranks only the truth-free candidates
@@ -2313,6 +3049,130 @@ def plan_next_measurement(
     return MLEPlanningResult(
         selected_action=selected,
         ranked_actions=ranked[: int(resolved.ranked_action_limit)],
+        diagnostics=diagnostics,
+    )
+
+
+def plan_next_measurement(
+    estimate: MLEEstimate,
+    historical_observations: ObservationBatch,
+    kernel: ContinuousKernel,
+    mle_config: MLEConfig,
+    candidate_poses_xyz: object,
+    *,
+    planning_config: MLEPlanningConfig | None = None,
+    allowed_pair_ids: Sequence[int] | None = None,
+    travel_costs: object | None = None,
+    current_pair_id: int | None = None,
+    alternative_estimates: Sequence[MLEEstimate] = (),
+    historical_response_cache: dict[str, object] | None = None,
+    progress_hook: Callable[[Mapping[str, object]], None] | None = None,
+    screening_only: bool = False,
+) -> MLEPlanningResult:
+    """Screen many poses and exactly re-evaluate only an adaptive shortlist."""
+    if not isinstance(estimate, MLEEstimate):
+        raise TypeError("estimate must be an MLEEstimate.")
+    if not isinstance(historical_observations, ObservationBatch):
+        raise TypeError("historical_observations must be an ObservationBatch.")
+    if not isinstance(kernel, ContinuousKernel):
+        raise TypeError("kernel must be the shared runtime ContinuousKernel.")
+    if not isinstance(mle_config, MLEConfig):
+        raise TypeError("mle_config must be an MLEConfig.")
+    resolved = MLEPlanningConfig() if planning_config is None else planning_config
+    if not isinstance(screening_only, (bool, np.bool_)):
+        raise TypeError("screening_only must be boolean.")
+    poses = _validated_candidate_poses(candidate_poses_xyz)
+    costs = _validated_travel_costs(travel_costs, int(poses.shape[0]))
+    orientations = np.asarray(kernel.orientations, dtype=np.float64)
+    if orientations.ndim != 2 or orientations.shape[1:] != (3,):
+        raise ValueError("Shared kernel orientations must have shape (R, 3).")
+    pairs = _validated_pair_ids(allowed_pair_ids, int(orientations.shape[0]))
+    if not resolved.two_stage_screening and not screening_only:
+        return _plan_next_measurement_exact(
+            estimate,
+            historical_observations,
+            kernel,
+            mle_config,
+            poses,
+            planning_config=resolved,
+            allowed_pair_ids=pairs,
+            travel_costs=costs,
+            current_pair_id=current_pair_id,
+            alternative_estimates=alternative_estimates,
+            historical_response_cache=historical_response_cache,
+            progress_hook=progress_hook,
+        )
+    screening = _screen_candidate_measurements(
+        estimate,
+        historical_observations,
+        kernel,
+        mle_config,
+        poses,
+        pairs,
+        costs,
+        current_pair_id,
+        resolved,
+        historical_response_cache,
+        progress_hook,
+    )
+    if screening_only:
+        return screening
+    if int(poses.shape[0]) <= int(resolved.exact_candidate_min):
+        exact_indices = np.arange(poses.shape[0], dtype=np.int64)
+    else:
+        exact_indices = _diverse_exact_candidate_indices(
+            screening.ranked_actions,
+            poses,
+            resolved,
+        )
+    exact = _plan_next_measurement_exact(
+        estimate,
+        historical_observations,
+        kernel,
+        mle_config,
+        poses[exact_indices],
+        planning_config=resolved,
+        allowed_pair_ids=pairs,
+        travel_costs=costs[exact_indices],
+        current_pair_id=current_pair_id,
+        alternative_estimates=alternative_estimates,
+        historical_response_cache=historical_response_cache,
+        progress_hook=progress_hook,
+    )
+
+    def restore_index(action: MLEPlanningAction) -> MLEPlanningAction:
+        """Restore one exact-shortlist index to the runtime candidate index."""
+        return replace(
+            action,
+            candidate_index=int(exact_indices[int(action.candidate_index)]),
+        )
+
+    restored_ranked = tuple(restore_index(action) for action in exact.ranked_actions)
+    restored_selected = restore_index(exact.selected_action)
+    diagnostics = {
+        **exact.diagnostics,
+        "criterion": "two-stage grouped screening then exact D_s-optimal Fisher",
+        "approximate_candidate_screening": True,
+        "screening": screening.diagnostics,
+        "total_candidate_count": int(poses.shape[0]),
+        "exact_candidate_indices": exact_indices.astype(int).tolist(),
+        "exact_candidate_count": int(exact_indices.size),
+        "screening_selected_candidate_index": int(
+            screening.selected_action.candidate_index
+        ),
+        "screening_selected_score": float(screening.selected_action.score),
+        "exact_selected_screening_rank": next(
+            (
+                index
+                for index, action in enumerate(screening.ranked_actions)
+                if action.candidate_index == restored_selected.candidate_index
+            ),
+            None,
+        ),
+    }
+    return MLEPlanningResult(
+        selected_action=restored_selected,
+        ranked_actions=restored_ranked,
         diagnostics=diagnostics,
     )
 

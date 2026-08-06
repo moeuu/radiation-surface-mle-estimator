@@ -243,6 +243,8 @@ def test_online_session_publishes_each_causal_station_and_final_report(
     assert (output_dir / "index.html").is_file()
     assert dashboard["status"] == "finalized"
     assert dashboard["record_count"] == 3
+    assert dashboard["latest_observed_spectrum_counts"] == [3, 2]
+    assert dashboard["energy_bin_edges_keV"] == [0.0, 400.0, 800.0]
     assert dashboard["density_by_isotope"]["Cs-137"] == [3.0]
     assert dashboard["detector_positions_xyz"] == []
     assert dashboard["planning"]["selected_action"]["shield_pair_ids"] == [3]

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from three_d_estimation import dashboard
@@ -49,3 +51,37 @@ def test_cui_url_is_visible_without_corrupting_json_stdout(
     structured = capsys.readouterr()
     assert structured.out == ""
     assert structured.err == f"CUI dashboard URL: {url}\n"
+
+
+def test_dashboard_publishes_pf_style_scientific_images(tmp_path: Path) -> None:
+    """The browser work surface must be the same PNG-first form as the PF CUI."""
+    publisher = dashboard.OnlineMLEDashboard(
+        tmp_path,
+        environment={"size_x": 10.0, "size_y": 20.0, "size_z": 10.0},
+    )
+    publisher.publish(
+        None,
+        {
+            "status": "starting",
+            "run_id": "test-run",
+            "mode": "spectral",
+            "isotopes": ["Co-60", "Cs-137", "Eu-154"],
+            "record_count": 0,
+            "latest_step_id": None,
+            "latest_station_id": None,
+        },
+    )
+
+    expected = (
+        dashboard.OVERVIEW_IMAGE_FILENAME,
+        dashboard.ROBOT_IMAGE_FILENAME,
+        dashboard.MLE_IMAGE_FILENAME,
+        dashboard.SPECTRUM_IMAGE_FILENAME,
+    )
+    html = (tmp_path / dashboard.DASHBOARD_INDEX_FILENAME).read_text(
+        encoding="utf-8"
+    )
+    for filename in expected:
+        payload = (tmp_path / filename).read_bytes()
+        assert payload.startswith(b"\x89PNG\r\n\x1a\n")
+        assert filename in html

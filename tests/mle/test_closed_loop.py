@@ -310,6 +310,7 @@ class _FakeRuntimeClient:
         type(self).instance = self
         self.private_scene_profile = kwargs.get("private_scene_profile")
         self.requests: list[dict[str, object]] = []
+        self.refinement_requests: list[dict[str, object]] = []
         self.cui_overlay_requests: list[bool] = []
         self.context = _context_payload()
         self.candidates = {
@@ -335,6 +336,9 @@ class _FakeRuntimeClient:
 
     def request(self, request: dict[str, object]) -> dict[str, object]:
         """Return a record for exactly the supplied action."""
+        if request.get("type") == "refine":
+            self.refinement_requests.append(dict(request))
+            return {"type": "candidates", "candidates": self.candidates}
         self.requests.append(dict(request))
         step_id = len(self.requests) - 1
         return {
@@ -385,13 +389,16 @@ class _FakeOnlineSession:
     """Expose the online MLE operations used by the controller."""
 
     last_dashboard_cui_overlay: object = None
+    last_instance: _FakeOnlineSession | None = None
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         """Initialize record capture and a dashboard sentinel."""
         del args
         self.dashboard_cui_overlay = kwargs.get("dashboard_cui_overlay")
         type(self).last_dashboard_cui_overlay = self.dashboard_cui_overlay
+        type(self).last_instance = self
         self.records: list[object] = []
+        self.planning_calls: list[dict[str, object]] = []
         self.dashboard_url = "http://127.0.0.1:8878/"
         self.bound_path: Path | None = None
 
@@ -403,6 +410,7 @@ class _FakeOnlineSession:
     def plan_next_action(self, *args: object, **kwargs: object) -> MLEPlanningResult:
         """Select one next observation after the first fit."""
         del args
+        self.planning_calls.append(dict(kwargs))
         progress_hook = kwargs.get("progress_hook")
         if callable(progress_hook):
             for completed, elapsed in ((0, 0.0), (20, 1.0), (40, 5.1), (100, 6.0)):
@@ -549,6 +557,68 @@ def test_closed_loop_sends_bootstrap_then_one_mle_selected_action(
         "40/100",
         "100/100",
     ]
+
+
+def test_two_stage_closed_loop_screens_before_runtime_refinement(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    """Runtime refinement must sit between screening and exact planning calls."""
+    from three_d_estimation import closed_loop
+
+    mle_path = tmp_path / "mle.json"
+    planning_path = tmp_path / "planning.json"
+    mle_path.write_text("{}\n", encoding="utf-8")
+    planning_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(closed_loop, "AdaptiveRuntimeClient", _FakeRuntimeClient)
+    monkeypatch.setattr(closed_loop, "OnlineMLESession", _FakeOnlineSession)
+    monkeypatch.setattr(
+        closed_loop.MLEConfig,
+        "load",
+        lambda path: SimpleNamespace(
+            isotope_names=("Co-60", "Cs-137", "Eu-154")
+        ),
+    )
+    monkeypatch.setattr(
+        closed_loop.MLEPlanningConfig,
+        "load",
+        lambda path: SimpleNamespace(
+            shield_program_length=1,
+            live_time_s=30.0,
+            local_refinement_top_k=1,
+            two_stage_screening=True,
+        ),
+    )
+    fake_log = SimpleNamespace(
+        path=Path("/tmp/adaptive-log"),
+        run_id="adaptive-test",
+        records=(SimpleNamespace(station_id=0), SimpleNamespace(station_id=1)),
+    )
+    monkeypatch.setattr(
+        closed_loop,
+        "validate_ral_measurement_log",
+        lambda path: fake_log,
+    )
+
+    run_ral_closed_loop(
+        tmp_path / "private-scenario.json",
+        runtime_root=tmp_path,
+        mle_config_path=mle_path,
+        planning_config_path=planning_path,
+        output_dir=tmp_path / "output",
+        max_measurements=2,
+    )
+
+    client = _FakeRuntimeClient.instance
+    assert client is not None
+    assert client.refinement_requests == [
+        {"type": "refine", "candidate_indices": [0]}
+    ]
+    session = _FakeOnlineSession.last_instance
+    assert session is not None
+    session_calls = session.planning_calls
+    assert session_calls[0]["screening_only"] is True
+    assert "screening_only" not in session_calls[1]
 
 
 def test_closed_loop_groups_same_pose_shield_views_into_one_station(

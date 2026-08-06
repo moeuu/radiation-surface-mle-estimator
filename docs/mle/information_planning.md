@@ -33,6 +33,29 @@ generic refinement request. The runtime—not this package—generates and
 collision-checks the local 3-D neighbors, after which the MLE reranks the refined
 set. PF, MLE, and future estimators therefore share one physical workspace.
 
+## Two-stage candidate search
+
+The production planner separates candidate coverage from exact spectral ranking:
+
+1. Every runtime pose is screened with a 64-group spectrum, a deterministic
+   farthest-first subset of 16 Fe/Pb pairs, and a compact isotope-by-surface
+   Fisher basis. Each source mode is represented by up to two spatial points.
+   Zero fitted modes, including a zero Eu-154 estimate, remain present through
+   area-weighted residual modes. The eight-view program is selected greedily in
+   this approximate stage.
+2. The screening leaders are sent to the runtime refinement API. Previously seen
+   pose results stay in the causal planner cache, so the second screening pass
+   evaluates only newly generated poses.
+3. The best four poses are always evaluated exactly. A score tie can expand that
+   set to at most eight, while a small spatial-diversity term keeps non-colocated
+   alternatives. Only these poses use the complete spectrum, all allowed shield
+   pairs, nuisance Schur complement, and eight-level beam search described below.
+
+Screening does not change the MLE, observation physics, or exact evaluation of the
+shortlist. Its approximation can only change whether the globally best runtime
+candidate survives into that shortlist. Planning artifacts record both stages,
+the exact candidate indices, cache reuse, and separate response/Fisher/beam times.
+
 ## Local source parameterization
 
 The complete fitted surface can contain many patch/isotope coordinates. Directly

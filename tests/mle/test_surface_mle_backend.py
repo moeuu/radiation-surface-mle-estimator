@@ -225,6 +225,8 @@ class SurfaceMLEBackendTests(unittest.TestCase):
         self.assertIsInstance(backend, EstimatorBackend)
         self.assertIsInstance(backend, StationCompleteEstimatorBackend)
         _initialize_with_test_kernel(backend, _context())
+        self.assertEqual(backend._kernel.gpu_device, backend.config.gpu_device)
+        self.assertEqual(backend._kernel.gpu_dtype, backend.config.gpu_dtype)
         empty = backend.snapshot()
         self.assertEqual(empty.step_id, -1)
         self.assertEqual(empty.diagnostics["fit_kind"], "not_fitted")
